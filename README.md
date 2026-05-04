@@ -20,7 +20,8 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
 3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol using Cursor's newer `requestedModel` request field
 4. **Image input** — forwards OpenAI-style `image_url` data URLs as Cursor `SelectedImage` entries in `UserMessage.selectedContext`
-5. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
+5. **Tool-result images** — forwards image blocks returned by pi tools as Cursor MCP image result content
+6. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
 
 ## Install
 
@@ -133,6 +134,10 @@ The HTTP/2 bridge sends Cursor's CLI client-version header. Override it when tes
 PI_CURSOR_CLIENT_VERSION=cli-2026.05.01-eea359f pi
 ```
 
+## Image Support
+
+Drag-and-dropped/user-attached images are forwarded to Cursor as selected images. Image blocks returned by pi tools are forwarded as MCP image result content, enabling screenshot-driven debugging, browser/tool visual feedback, generated image review, and visual regression analysis. Tool-result images are validated against Cursor CLI's supported formats and post-processing cap: jpeg/png/gif/webp magic bytes and a maximum payload size of 5,242,880 bytes. Oversized tool-result images are rejected rather than downscaled.
+
 ## Session Management
 
 The proxy maintains conversation state per pi session, enabling multi-turn conversations with Cursor models while preserving forks, tool continuations, and interruptions correctly.
@@ -170,7 +175,7 @@ That reconstruction preserves:
 - user image attachments
 - assistant messages
 - tool calls
-- tool results
+- tool results, including image result content
 - final assistant text after tool results
 
 ## Requirements

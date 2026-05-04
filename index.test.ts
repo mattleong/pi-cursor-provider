@@ -909,9 +909,11 @@ const toolStep = (
   toolCallId: string,
   toolName: string,
   args: Record<string, unknown>,
-  result?: { content: string; isError: boolean },
+  result?: { content: string; isError: boolean; images?: Array<{ data: Uint8Array; mimeType: string }> },
 ) => ({ kind: "toolCall", toolCallId, toolName, arguments: args, ...(result ? { result } : {}) } as const);
 const turn = (userText: string, steps: ParsedTurn["steps"] = []): ParsedTurn => ({ userText, steps });
+const pngBytes = () => new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+const pngBase64 = () => Buffer.from(pngBytes()).toString("base64");
 
 describe("deriveBridgeKey", () => {
   test("uses sessionId when provided", () => {
@@ -1344,6 +1346,24 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(userAction.userMessage.text).toBe("fix it");
   });
 
+  test("no checkpoint, reconstructs tool-call image result content", () => {
+    const turns = [
+      turn("capture screenshot", [
+        toolStep("tc1", "screenshot", {}, { content: "", isError: false, images: [{ data: pngBytes(), mimeType: "image/png" }] }),
+      ]),
+    ];
+    const payload = buildCursorRequest("gpt-5", "system", "what do you see?", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
+    const toolCallStep = decoded[0].steps[0]!;
+    expect(toolCallStep.message.case).toBe("toolCall");
+    const success = toolCallStep.message.value.tool.value.result.result.value;
+    expect(success.content).toHaveLength(1);
+    expect(success.content[0].content.case).toBe("image");
+    expect(success.content[0].content.value.mimeType).toBe("image/png");
+    expect(Array.from(success.content[0].content.value.data)).toEqual(Array.from(pngBytes()));
+  });
+
   test("no checkpoint, turn with no steps — no reconstructed steps", () => {
     const turns = [turn("hello")];
     const payload = buildCursorRequest("gpt-5", "system", "follow up", turns, "conv-1", null);
@@ -1448,6 +1468,49 @@ describe("parseMessages — structured tool turns", () => {
     expect(parsed.turns[0].userImages).toHaveLength(1);
     expect(parsed.turns[0].userImages?.[0].mimeType).toBe("image/jpeg");
     expect(Array.from(parsed.turns[0].userImages![0].data)).toEqual([9, 8, 7]);
+  });
+
+  test("extracts tool result images from inline tool content", () => {
+    const parsed = parseMessages([
+      { role: "user" as const, content: "capture screenshot" },
+      {
+        role: "assistant" as const,
+        content: null,
+        tool_calls: [{ id: "tc1", type: "function" as const, function: { name: "screenshot", arguments: "{}" } }],
+      },
+      { role: "tool" as const, tool_call_id: "tc1", content: [
+        { type: "text", text: "screenshot attached" },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+      ] },
+    ]);
+
+    expect(parsed.toolResults).toHaveLength(1);
+    expect(parsed.toolResults[0].content).toBe("screenshot attached");
+    expect(parsed.toolResults[0].images).toHaveLength(1);
+    expect(parsed.toolResults[0].images?.[0].mimeType).toBe("image/png");
+    expect(Array.from(parsed.toolResults[0].images![0].data)).toEqual(Array.from(pngBytes()));
+  });
+
+  test("reattaches pi-ai synthetic tool-result image messages to the tool result", () => {
+    const parsed = parseMessages([
+      { role: "user" as const, content: "capture screenshot" },
+      {
+        role: "assistant" as const,
+        content: null,
+        tool_calls: [{ id: "tc1", type: "function" as const, function: { name: "screenshot", arguments: "{}" } }],
+      },
+      { role: "tool" as const, tool_call_id: "tc1", content: "(see attached image)" },
+      { role: "user" as const, content: [
+        { type: "text", text: "Attached image(s) from tool result:" },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+      ] },
+    ]);
+
+    expect(parsed.userText).toBe("capture screenshot");
+    expect(parsed.toolResults).toHaveLength(1);
+    expect(parsed.toolResults[0].content).toBe("");
+    expect(parsed.toolResults[0].images).toHaveLength(1);
+    expect(Array.from(parsed.toolResults[0].images![0].data)).toEqual(Array.from(pngBytes()));
   });
 
   test("preserves tool call, tool result, and final assistant text in a completed turn", () => {
@@ -1810,6 +1873,59 @@ describe("proxy integration — session handling", () => {
     const stored = __testInternals.conversationStates.get(convKey);
     expect(stored?.checkpoint).toBeTruthy();
 
+  });
+
+  test("tool-call continuation forwards tool result images as MCP image content", async () => {
+    const execClientMessages: any[] = [];
+    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
+      if (clientMessage.message.case === "runRequest") {
+        fake.emitServerMessage(makeMcpExecMessage("tc1", "screenshot", {}));
+        return;
+      }
+      if (clientMessage.message.case === "execClientMessage") {
+        execClientMessages.push(clientMessage.message.value);
+        setTimeout(() => {
+          fake.emitServerMessage(makeTextDeltaMessage("I can see it."));
+          fake.emitServerMessage(makeCheckpointMessage());
+          fake.close(0);
+        }, 0);
+      }
+    }));
+
+    const port = await startProxy(async () => "test-token");
+    const sessionId = "session-tool-image";
+    const first = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "capture screenshot" }],
+      tools: [{ type: "function", function: { name: "screenshot" } }],
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.body).toContain("\"finish_reason\":\"tool_calls\"");
+
+    const second = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      cursor_tool_result_images: [{ toolCallId: "tc1", images: [{ data: pngBase64(), mimeType: "image/png" }] }],
+      messages: [
+        { role: "user", content: "capture screenshot" },
+        { role: "assistant", content: null, tool_calls: [{ id: "tc1", type: "function", function: { name: "screenshot", arguments: "{}" } }] },
+        { role: "tool", content: "(see attached image)", tool_call_id: "tc1" },
+        { role: "user", content: [
+          { type: "text", text: "Attached image(s) from tool result:" },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+        ] },
+      ],
+    });
+
+    expect(second.statusCode).toBe(200);
+    expect(second.body).toContain("I can see it.");
+    expect(execClientMessages).toHaveLength(1);
+    const result = execClientMessages[0].message.value.result.value;
+    expect(result.content).toHaveLength(1);
+    expect(result.content[0].content.case).toBe("image");
+    expect(result.content[0].content.value.mimeType).toBe("image/png");
+    expect(Array.from(result.content[0].content.value.data)).toEqual(Array.from(pngBytes()));
   });
 
   test("partial tool-result batches stay in-flight until all pending tool results arrive", async () => {

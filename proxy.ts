@@ -41,6 +41,7 @@ import {
   LsResultSchema,
   McpArgsSchema,
   McpErrorSchema,
+  McpImageContentSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
@@ -80,6 +81,10 @@ import {
 
 const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
+// Cursor CLI's local-image path scales/compresses images to <= 5 MiB
+// and accepts only jpeg/png/gif/webp by magic bytes.
+const CURSOR_CLI_MAX_IMAGE_BYTES = 5_242_880;
+const CURSOR_SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 // Use import.meta.url for bridge path resolution (jiti supports this)
 const BRIDGE_PATH = pathResolve(dirname(fileURLToPath(import.meta.url)), "h2-bridge.mjs");
 
@@ -115,6 +120,11 @@ interface OpenAIToolDef {
   };
 }
 
+interface CursorToolResultImagePayload {
+  toolCallId: string;
+  images: Array<{ data: string; mimeType: string }>;
+}
+
 interface ChatCompletionRequest {
   model: string;
   messages: OpenAIMessage[];
@@ -128,6 +138,7 @@ interface ChatCompletionRequest {
   pi_session_id?: string;
   cursor_model_id?: string;
   cursor_model_parameters?: CursorModelParameter[];
+  cursor_tool_result_images?: CursorToolResultImagePayload[];
   cursor_requires_max_mode?: boolean;
   cursor_model_max_mode?: boolean;
 }
@@ -211,11 +222,13 @@ interface StreamState {
 interface ToolResultInfo {
   toolCallId: string;
   content: string;
+  images?: ParsedImageContent[];
 }
 
 export interface ParsedToolResult {
   content: string;
   isError: boolean;
+  images?: ParsedImageContent[];
 }
 
 export interface ParsedImageContent {
@@ -882,7 +895,16 @@ async function handleChatCompletion(
   res: ServerResponse,
   requestId: string,
 ): Promise<void> {
-  const { systemPrompt, userText, userImages, turns, toolResults } = parseMessages(body.messages);
+  let parsedMessages: ParsedMessages;
+  try {
+    parsedMessages = parseMessages(body.messages, body.cursor_tool_result_images);
+  } catch (error) {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ error: { message: error instanceof Error ? error.message : String(error), type: "invalid_request_error" } }));
+    return;
+  }
+  const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
   const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
   if (body.reasoning_effort && !body.cursor_model_id && !body.cursor_model_parameters) {
     debugLog("model_routing.fallback_suffix_generation", {
@@ -914,7 +936,7 @@ async function handleChatCompletion(
     maxMode,
   });
 
-  if (!userText && toolResults.length === 0) {
+  if (!userText && userImages.length === 0 && toolResults.length === 0) {
     debugLog("chat.no_user_message", { requestId, messages: body.messages });
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: "No user message found", type: "invalid_request_error" } }));
@@ -1011,35 +1033,137 @@ function textContent(content: OpenAIMessage["content"]): string {
   return content.filter((p) => p.type === "text" && p.text).map((p) => p.text!).join("\n");
 }
 
-function decodeBase64Image(data: string, mimeType: string): ParsedImageContent | undefined {
-  const normalizedMimeType = mimeType.trim().toLowerCase();
+interface ImageDecodeOptions {
+  enforceCursorCliLimits?: boolean;
+}
+
+function normalizeImageMimeType(mimeType: string): string {
+  const normalized = mimeType.trim().toLowerCase();
+  return normalized === "image/jpg" ? "image/jpeg" : normalized;
+}
+
+function sniffCursorImageMimeType(bytes: Uint8Array): string | undefined {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
+  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+  return undefined;
+}
+
+function validateCursorCliImageLimits(bytes: Uint8Array, mimeType: string): string {
+  if (bytes.length > CURSOR_CLI_MAX_IMAGE_BYTES) {
+    throw new Error(`Image exceeds Cursor CLI's ${CURSOR_CLI_MAX_IMAGE_BYTES} byte limit after processing.`);
+  }
+  const sniffedMimeType = sniffCursorImageMimeType(bytes);
+  if (!sniffedMimeType || !CURSOR_SUPPORTED_IMAGE_MIME_TYPES.has(sniffedMimeType)) {
+    throw new Error("Unsupported image type: supported formats are jpeg, png, gif, or webp.");
+  }
+  return sniffedMimeType;
+}
+
+function decodeBase64Image(data: string, mimeType: string, options: ImageDecodeOptions = {}): ParsedImageContent | undefined {
+  const normalizedMimeType = normalizeImageMimeType(mimeType);
   if (!normalizedMimeType.startsWith("image/")) return undefined;
   const base64 = data.replace(/\s/g, "");
   if (!base64) return undefined;
-  const bytes = Buffer.from(base64, "base64");
+  const bytes = new Uint8Array(Buffer.from(base64, "base64"));
   if (bytes.length === 0) return undefined;
-  return { data: new Uint8Array(bytes), mimeType: normalizedMimeType };
+  const finalMimeType = options.enforceCursorCliLimits
+    ? validateCursorCliImageLimits(bytes, normalizedMimeType)
+    : normalizedMimeType;
+  return { data: bytes, mimeType: finalMimeType };
 }
 
-function parseImageDataUrl(url: string): ParsedImageContent | undefined {
+function parseImageDataUrl(url: string, options: ImageDecodeOptions = {}): ParsedImageContent | undefined {
   const match = url.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
   if (!match) return undefined;
-  return decodeBase64Image(match[2]!, match[1]!);
+  return decodeBase64Image(match[2]!, match[1]!, options);
 }
 
-function imageContent(content: OpenAIMessage["content"]): ParsedImageContent[] {
+function contentHasImageParts(content: OpenAIMessage["content"]): boolean {
+  return Array.isArray(content) && content.some((part) =>
+    (part.type === "image_url" && !!part.image_url?.url) ||
+    (part.type === "image" && !!part.data && !!part.mimeType),
+  );
+}
+
+function imageContent(content: OpenAIMessage["content"], options: ImageDecodeOptions = {}): ParsedImageContent[] {
   if (content == null || typeof content === "string") return [];
   const images: ParsedImageContent[] = [];
   for (const part of content) {
     if (part.type === "image_url" && part.image_url?.url) {
-      const image = parseImageDataUrl(part.image_url.url);
+      const image = parseImageDataUrl(part.image_url.url, options);
       if (image) images.push(image);
     } else if (part.type === "image" && part.data && part.mimeType) {
-      const image = decodeBase64Image(part.data, part.mimeType);
+      const image = decodeBase64Image(part.data, part.mimeType, options);
       if (image) images.push(image);
     }
   }
   return images;
+}
+
+function imageKey(image: ParsedImageContent): string {
+  return `${image.mimeType}:${createHash("sha256").update(image.data).digest("hex")}`;
+}
+
+function mergeImages(...groups: Array<ParsedImageContent[] | undefined>): ParsedImageContent[] | undefined {
+  const merged: ParsedImageContent[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const image of group ?? []) {
+      const key = imageKey(image);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(image);
+    }
+  }
+  return merged.length > 0 ? merged : undefined;
+}
+
+function parseToolResultImagePayloads(payloads: CursorToolResultImagePayload[] | undefined): Map<string, ParsedImageContent[]> {
+  const byToolCallId = new Map<string, ParsedImageContent[]>();
+  for (const payload of payloads ?? []) {
+    if (!payload?.toolCallId || !Array.isArray(payload.images)) continue;
+    const images = payload.images
+      .map((image) => decodeBase64Image(image.data, image.mimeType, { enforceCursorCliLimits: true }))
+      .filter((image): image is ParsedImageContent => !!image);
+    if (images.length === 0) continue;
+    byToolCallId.set(payload.toolCallId, mergeImages(byToolCallId.get(payload.toolCallId), images) ?? []);
+  }
+  return byToolCallId;
+}
+
+function isSyntheticToolResultImageMessage(msg: OpenAIMessage): boolean {
+  return msg.role === "user"
+    && textContent(msg.content).trim() === "Attached image(s) from tool result:"
+    && contentHasImageParts(msg.content);
+}
+
+function attachSyntheticToolResultImages(turn: ParsedTurn, images: ParsedImageContent[]): void {
+  if (images.length === 0) return;
+  const resultSteps = turn.steps
+    .filter((step): step is ParsedToolCallStep => step.kind === "toolCall" && !!step.result)
+    .filter((step) => !step.result!.images?.length);
+  if (resultSteps.length === 0) return;
+
+  const imageOnlySteps = resultSteps.filter((step) => step.result!.content.trim() === "(see attached image)");
+  if (imageOnlySteps.length === images.length) {
+    imageOnlySteps.forEach((step, index) => {
+      step.result = { ...step.result!, content: "", images: [images[index]!] };
+    });
+    return;
+  }
+
+  const target = imageOnlySteps.length === 1 ? imageOnlySteps[0]! : resultSteps.at(-1)!;
+  target.result = {
+    ...target.result!,
+    content: target.result!.content.trim() === "(see attached image)" ? "" : target.result!.content,
+    images: mergeImages(target.result!.images, images),
+  };
+}
+
+function normalizeToolResultText(content: string, images: ParsedImageContent[] | undefined): string {
+  return images?.length && content.trim() === "(see attached image)" ? "" : content;
 }
 
 function parseToolCallArguments(raw: string): Record<string, unknown> {
@@ -1088,9 +1212,10 @@ function stripTurnRuntimeState(turn: ParsedTurn & {
   };
 }
 
-export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
+export function parseMessages(messages: OpenAIMessage[], toolResultImagePayloads?: CursorToolResultImagePayload[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const turns: ParsedTurn[] = [];
+  const toolResultImagesById = parseToolResultImagePayloads(toolResultImagePayloads);
 
   debugLog("parse_messages.start", { messages });
 
@@ -1111,6 +1236,14 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   };
 
   for (const msg of nonSystem) {
+    if (currentTurn && isSyntheticToolResultImageMessage(msg)) {
+      const hasMetadataImages = currentTurn.steps.some((step) => step.kind === "toolCall" && step.result?.images?.length);
+      if (!hasMetadataImages) {
+        attachSyntheticToolResultImages(currentTurn, imageContent(msg.content, { enforceCursorCliLimits: true }));
+      }
+      continue;
+    }
+
     if (msg.role === "user") {
       finalizeCurrentTurn();
       const userImages = imageContent(msg.content);
@@ -1149,17 +1282,19 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
     if (msg.role === "tool") {
       const toolCallId = msg.tool_call_id ?? "";
-      const content = textContent(msg.content);
+      const inlineImages = imageContent(msg.content, { enforceCursorCliLimits: true });
+      const images = mergeImages(inlineImages, toolResultImagesById.get(toolCallId));
+      const content = normalizeToolResultText(textContent(msg.content), images);
       const existing = toolCallId ? currentTurn.toolCallById.get(toolCallId) : undefined;
       if (existing) {
-        existing.result = { content, isError: false };
+        existing.result = { content, images, isError: false };
       } else {
         const step: ParsedToolCallStep = {
           kind: "toolCall",
           toolCallId,
           toolName: "",
           arguments: {},
-          result: { content, isError: false },
+          result: { content, images, isError: false },
         };
         currentTurn.steps.push(step);
         if (toolCallId) currentTurn.toolCallById.set(toolCallId, step);
@@ -1184,7 +1319,11 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       if (hasAnyToolResults) {
         toolResults = toolCallSteps
           .filter((step) => step.result)
-          .map((step) => ({ toolCallId: step.toolCallId, content: step.result!.content }));
+          .map((step) => ({
+            toolCallId: step.toolCallId,
+            content: step.result!.content,
+            ...(step.result!.images?.length ? { images: step.result!.images } : {}),
+          }));
       }
     } else {
       turns.push(stripTurnRuntimeState(currentTurn));
@@ -1292,6 +1431,32 @@ function createUserMessage(text: string, selectedContextBlob: Uint8Array, images
   });
 }
 
+function buildMcpSuccessContent(result: ParsedToolResult) {
+  const content = [];
+  if (result.content.length > 0) {
+    content.push(create(McpToolResultContentItemSchema, {
+      content: {
+        case: "text",
+        value: create(McpTextContentSchema, { text: result.content }),
+      },
+    }));
+  }
+  for (const image of result.images ?? []) {
+    content.push(create(McpToolResultContentItemSchema, {
+      content: {
+        case: "image",
+        value: create(McpImageContentSchema, { data: image.data, mimeType: image.mimeType }),
+      },
+    }));
+  }
+  if (content.length === 0) {
+    content.push(create(McpToolResultContentItemSchema, {
+      content: { case: "text", value: create(McpTextContentSchema, { text: "" }) },
+    }));
+  }
+  return content;
+}
+
 function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
   if (step.kind === "assistantText") {
     return toBinary(ConversationStepSchema, create(ConversationStepSchema, {
@@ -1321,14 +1486,7 @@ function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
           : {
               case: "success",
               value: create(McpSuccessSchema, {
-                content: [
-                  create(McpToolResultContentItemSchema, {
-                    content: {
-                      case: "text",
-                      value: create(McpTextContentSchema, { text: step.result.content }),
-                    },
-                  }),
-                ],
+                content: buildMcpSuccessContent(step.result),
                 isError: false,
               }),
             },
@@ -2191,7 +2349,7 @@ function handleToolResultResume(
   for (const result of toolResults) {
     const turnToolStep = currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === result.toolCallId);
     if (turnToolStep) {
-      turnToolStep.result = { content: result.content, isError: false };
+      turnToolStep.result = { content: result.content, images: result.images, isError: false };
     }
   }
 
@@ -2218,11 +2376,7 @@ function handleToolResultResume(
       result: {
         case: "success",
         value: create(McpSuccessSchema, {
-          content: [
-            create(McpToolResultContentItemSchema, {
-              content: { case: "text", value: create(McpTextContentSchema, { text: result.content }) },
-            }),
-          ],
+          content: buildMcpSuccessContent(result),
           isError: false,
         }),
       },

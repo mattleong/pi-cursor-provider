@@ -133,10 +133,26 @@ function summarizeProviderPayload(payload: unknown): unknown {
   if (!payload || typeof payload !== "object") return payload;
   const typed = payload as Record<string, unknown>;
   const messages = Array.isArray(typed.messages) ? typed.messages.map((message) => summarizeMessage(message)).slice(-8) : undefined;
+  const toolResultImages = Array.isArray(typed.cursor_tool_result_images)
+    ? typed.cursor_tool_result_images.map((entry) => {
+        if (!entry || typeof entry !== "object") return entry;
+        const e = entry as Record<string, unknown>;
+        return {
+          toolCallId: e.toolCallId,
+          images: Array.isArray(e.images)
+            ? e.images.map((image) => {
+                const img = image as Record<string, unknown>;
+                return { mimeType: img.mimeType, data: `<redacted base64 ${String(img.data ?? "").length} chars>` };
+              })
+            : undefined,
+        };
+      })
+    : undefined;
   return {
     model: typed.model,
     cursor_model_id: typed.cursor_model_id,
     cursor_model_parameters: typed.cursor_model_parameters,
+    cursor_tool_result_images: toolResultImages,
     cursor_requires_max_mode: typed.cursor_requires_max_mode,
     cursor_model_max_mode: typed.cursor_model_max_mode,
     reasoning_effort: typed.reasoning_effort,
@@ -146,6 +162,54 @@ function summarizeProviderPayload(payload: unknown): unknown {
     messages,
     toolCount: Array.isArray(typed.tools) ? typed.tools.length : undefined,
   };
+}
+
+interface CursorToolResultImagePayload {
+  toolCallId: string;
+  images: Array<{ data: string; mimeType: string }>;
+}
+
+function payloadToolCallIds(payload: Record<string, unknown>): Set<string> {
+  const ids = new Set<string>();
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const typed = message as Record<string, unknown>;
+    if (typed.role === "tool" && typeof typed.tool_call_id === "string" && typed.tool_call_id) ids.add(typed.tool_call_id);
+  }
+  return ids;
+}
+
+function extractToolResultImagePayloads(
+  ctx: { sessionManager?: { getBranch?: () => unknown[] } },
+  payload: Record<string, unknown>,
+): CursorToolResultImagePayload[] {
+  const idsInPayload = payloadToolCallIds(payload);
+  if (idsInPayload.size === 0) return [];
+  const branch = ctx.sessionManager?.getBranch?.();
+  if (!Array.isArray(branch)) return [];
+
+  const byToolCallId = new Map<string, CursorToolResultImagePayload>();
+  for (const entry of branch) {
+    if (!entry || typeof entry !== "object") continue;
+    const message = (entry as Record<string, unknown>).message;
+    if (!message || typeof message !== "object") continue;
+    const typed = message as Record<string, unknown>;
+    const toolCallId = typeof typed.toolCallId === "string" ? typed.toolCallId : "";
+    if (typed.role !== "toolResult" || !toolCallId || !idsInPayload.has(toolCallId)) continue;
+    const content = Array.isArray(typed.content) ? typed.content : [];
+    const images = content.flatMap((block) => {
+      if (!block || typeof block !== "object") return [];
+      const image = block as Record<string, unknown>;
+      if (image.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string") return [];
+      return [{ data: image.data, mimeType: image.mimeType }];
+    });
+    if (images.length === 0) continue;
+    const existing = byToolCallId.get(toolCallId);
+    if (existing) existing.images.push(...images);
+    else byToolCallId.set(toolCallId, { toolCallId, images });
+  }
+  return [...byToolCallId.values()];
 }
 
 function debugExtensionLog(event: string, data?: Record<string, unknown>): void {
@@ -917,6 +981,8 @@ export default async function (pi: ExtensionAPI) {
     const payload = event.payload as Record<string, unknown> | undefined;
     if (payload && ctx.model?.provider === "cursor") {
       payload.pi_session_id = ctx.sessionManager.getSessionId();
+      const toolResultImagePayloads = extractToolResultImagePayloads(ctx, payload);
+      if (toolResultImagePayloads.length > 0) payload.cursor_tool_result_images = toolResultImagePayloads;
       applyNoReasoningEffort(payload, pi.getThinkingLevel(), noReasoningEffortByModelId);
       applyRawCursorModelId(payload, rawModelByEffortByModelId);
       debugExtensionLog("before_provider_request", {
