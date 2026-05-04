@@ -47,7 +47,8 @@ import {
   McpToolCallSchema,
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
-  ModelDetailsSchema,
+  RequestedModelSchema,
+  RequestedModel_ModelParameterbytesSchema,
   ReadRejectedSchema,
   ReadResultSchema,
   RequestContextResultSchema,
@@ -120,6 +121,15 @@ interface ChatCompletionRequest {
   reasoning_effort?: string;
   user?: string;
   pi_session_id?: string;
+  cursor_model_id?: string;
+  cursor_model_parameters?: CursorModelParameter[];
+  cursor_requires_max_mode?: boolean;
+  cursor_model_max_mode?: boolean;
+}
+
+export interface CursorModelParameter {
+  id: string;
+  value: string;
 }
 
 interface CursorRequestPayload {
@@ -434,6 +444,10 @@ export interface CursorModel {
   reasoning: boolean;
   contextWindow: number;
   maxTokens: number;
+  requestedModelId?: string;
+  parameters?: CursorModelParameter[];
+  requiresMaxMode?: boolean;
+  requestedMaxMode?: boolean;
 }
 
 let cachedModels: CursorModel[] | null = null;
@@ -490,6 +504,13 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
   return null;
 }
 
+export function inferCursorContextWindow(id: string, name: string): number {
+  const text = `${id} ${name}`.toLowerCase();
+  if (/\b1\s*m\b|(?:^|-)1m(?:-|$)/.test(text)) return 1_000_000;
+  if (/\b272\s*k\b|(?:^|-)272k(?:-|$)/.test(text)) return 272_000;
+  return 200_000;
+}
+
 function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
   const byId = new Map<string, CursorModel>();
   for (const model of models) {
@@ -501,7 +522,7 @@ function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
       id,
       name,
       reasoning: Boolean(m.thinkingDetails),
-      contextWindow: 200_000,
+      contextWindow: inferCursorContextWindow(id, name),
       maxTokens: 64_000,
     });
   }
@@ -628,6 +649,16 @@ export function resolveModelId(model: string, reasoningEffort?: string): string 
   return `${base}-${reasoningEffort}${suffix}`;
 }
 
+export function resolveRequestedModelId(
+  model: string,
+  reasoningEffort?: string,
+  cursorModelId?: string,
+): string {
+  const trimmedCursorModelId = cursorModelId?.trim();
+  if (trimmedCursorModelId) return trimmedCursorModelId;
+  return resolveModelId(model, reasoningEffort);
+}
+
 async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
@@ -636,7 +667,10 @@ async function handleChatCompletion(
   requestId: string,
 ): Promise<void> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
-  const modelId = resolveModelId(body.model, body.reasoning_effort);
+  const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
+  const maxMode = typeof body.cursor_model_max_mode === "boolean"
+    ? body.cursor_model_max_mode
+    : body.cursor_requires_max_mode === true;
   const tools = body.tools ?? [];
 
   debugLog("chat.parsed_messages", {
@@ -647,8 +681,13 @@ async function handleChatCompletion(
     toolResults,
     messageCount: body.messages.length,
     model: body.model,
+    cursorModelId: body.cursor_model_id,
+    cursorModelParameters: body.cursor_model_parameters,
+    cursorRequiresMaxMode: body.cursor_requires_max_mode,
+    cursorModelMaxMode: body.cursor_model_max_mode,
     resolvedModelId: modelId,
     stream: body.stream !== false,
+    maxMode,
   });
 
   if (!userText && toolResults.length === 0) {
@@ -712,7 +751,7 @@ async function handleChatCompletion(
   }
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
-    stored.conversationId, stored.checkpoint, stored.blobStore,
+    stored.conversationId, stored.checkpoint, stored.blobStore, maxMode, body.cursor_model_parameters,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -1041,6 +1080,8 @@ export function buildCursorRequest(
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
+  maxMode = false,
+  cursorModelParameters: CursorModelParameter[] = [],
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -1050,6 +1091,8 @@ export function buildCursorRequest(
     conversationId,
     checkpoint,
     existingBlobStore,
+    maxMode,
+    cursorModelParameters,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
@@ -1102,8 +1145,13 @@ export function buildCursorRequest(
   const action = create(ConversationActionSchema, {
     action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) },
   });
-  const modelDetails = create(ModelDetailsSchema, { modelId, displayModelId: modelId, displayName: modelId });
-  const runRequest = create(AgentRunRequestSchema, { conversationState, action, modelDetails, conversationId });
+  // Cursor's newer request path uses requestedModel instead of legacy modelDetails.
+  // Some Cursor models (for example GPT-5.5) use requestedModel.parameters
+  // for context/reasoning/fast instead of encoding everything in the model ID.
+  // Max Mode is routed from model metadata for parameterized variants.
+  const parameters = cursorModelParameters.map((parameter) => create(RequestedModel_ModelParameterbytesSchema, parameter));
+  const requestedModel = create(RequestedModelSchema, { modelId, maxMode, parameters });
+  const runRequest = create(AgentRunRequestSchema, { conversationState, action, requestedModel, conversationId });
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "runRequest", value: runRequest },
   });

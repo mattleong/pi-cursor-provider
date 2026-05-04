@@ -84,6 +84,356 @@
     "maxTokens": 64000
   },
   {
+    "id": "gpt-5.5-none",
+    "name": "GPT-5.5 272K None",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "none"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-low",
+    "name": "GPT-5.5 272K Low",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "low"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-medium",
+    "name": "GPT-5.5 272K",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "medium"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-high",
+    "name": "GPT-5.5 272K High",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "high"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-extra-high",
+    "name": "GPT-5.5 272K Extra High",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "extra-high"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-none-fast",
+    "name": "GPT-5.5 272K None Fast",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "none"
+      },
+      {
+        "id": "fast",
+        "value": "true"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-low-fast",
+    "name": "GPT-5.5 272K Low Fast",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "low"
+      },
+      {
+        "id": "fast",
+        "value": "true"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-medium-fast",
+    "name": "GPT-5.5 272K Fast",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "medium"
+      },
+      {
+        "id": "fast",
+        "value": "true"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-high-fast",
+    "name": "GPT-5.5 272K High Fast",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "high"
+      },
+      {
+        "id": "fast",
+        "value": "true"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-extra-high-fast",
+    "name": "GPT-5.5 272K Extra High Fast",
+    "reasoning": false,
+    "contextWindow": 272000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "272k"
+      },
+      {
+        "id": "reasoning",
+        "value": "extra-high"
+      },
+      {
+        "id": "fast",
+        "value": "true"
+      }
+    ],
+    "requestedMaxMode": false
+  },
+  {
+    "id": "gpt-5.5-1m-none",
+    "name": "GPT-5.5 1M None",
+    "reasoning": false,
+    "contextWindow": 1000000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "1m"
+      },
+      {
+        "id": "reasoning",
+        "value": "none"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requiresMaxMode": true,
+    "requestedMaxMode": true
+  },
+  {
+    "id": "gpt-5.5-1m-low",
+    "name": "GPT-5.5 1M Low",
+    "reasoning": false,
+    "contextWindow": 1000000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "1m"
+      },
+      {
+        "id": "reasoning",
+        "value": "low"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requiresMaxMode": true,
+    "requestedMaxMode": true
+  },
+  {
+    "id": "gpt-5.5-1m-medium",
+    "name": "GPT-5.5 1M",
+    "reasoning": false,
+    "contextWindow": 1000000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "1m"
+      },
+      {
+        "id": "reasoning",
+        "value": "medium"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requiresMaxMode": true,
+    "requestedMaxMode": true
+  },
+  {
+    "id": "gpt-5.5-1m-high",
+    "name": "GPT-5.5 1M High",
+    "reasoning": false,
+    "contextWindow": 1000000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "1m"
+      },
+      {
+        "id": "reasoning",
+        "value": "high"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requiresMaxMode": true,
+    "requestedMaxMode": true
+  },
+  {
+    "id": "gpt-5.5-1m-extra-high",
+    "name": "GPT-5.5 1M Extra High",
+    "reasoning": false,
+    "contextWindow": 1000000,
+    "maxTokens": 64000,
+    "requestedModelId": "gpt-5.5",
+    "parameters": [
+      {
+        "id": "context",
+        "value": "1m"
+      },
+      {
+        "id": "reasoning",
+        "value": "extra-high"
+      },
+      {
+        "id": "fast",
+        "value": "false"
+      }
+    ],
+    "requiresMaxMode": true,
+    "requestedMaxMode": true
+  },
+  {
     "id": "claude-4.6-sonnet-medium",
     "name": "Sonnet 4.6 1M",
     "reasoning": false,
@@ -444,7 +794,7 @@
     "id": "gpt-5.4-high",
     "name": "GPT-5.4 1M High",
     "reasoning": false,
-    "contextWindow": 200000,
+    "contextWindow": 1000000,
     "maxTokens": 64000
   },
   {
@@ -458,14 +808,14 @@
     "id": "gpt-5.4-low",
     "name": "GPT-5.4 1M Low",
     "reasoning": false,
-    "contextWindow": 200000,
+    "contextWindow": 1000000,
     "maxTokens": 64000
   },
   {
     "id": "gpt-5.4-medium",
     "name": "GPT-5.4 1M",
     "reasoning": false,
-    "contextWindow": 200000,
+    "contextWindow": 1000000,
     "maxTokens": 64000
   },
   {
@@ -549,7 +899,7 @@
     "id": "gpt-5.4-xhigh",
     "name": "GPT-5.4 1M Extra High",
     "reasoning": false,
-    "contextWindow": 200000,
+    "contextWindow": 1000000,
     "maxTokens": 64000
   },
   {
@@ -557,118 +907,6 @@
     "name": "GPT-5.4 Extra High Fast",
     "reasoning": false,
     "contextWindow": 200000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-low",
-    "name": "GPT-5.5 Low",
-    "reasoning": false,
-    "contextWindow": 272000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-medium",
-    "name": "GPT-5.5",
-    "reasoning": false,
-    "contextWindow": 272000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-high",
-    "name": "GPT-5.5 High",
-    "reasoning": false,
-    "contextWindow": 272000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-xhigh",
-    "name": "GPT-5.5 Extra High",
-    "reasoning": false,
-    "contextWindow": 272000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-low",
-    "name": "GPT-5.5 1M Low",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-medium",
-    "name": "GPT-5.5 1M",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-high",
-    "name": "GPT-5.5 1M High",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-xhigh",
-    "name": "GPT-5.5 1M Extra High",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-low-fast",
-    "name": "GPT-5.5 1M Low Fast",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-medium-fast",
-    "name": "GPT-5.5 1M Fast",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-high-fast",
-    "name": "GPT-5.5 1M High Fast",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-1m-xhigh-fast",
-    "name": "GPT-5.5 1M Extra High Fast",
-    "reasoning": false,
-    "contextWindow": 1000000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-low-fast",
-    "name": "GPT-5.5 Low Fast",
-    "reasoning": false,
-    "contextWindow": 272000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-medium-fast",
-    "name": "GPT-5.5 Fast",
-    "reasoning": false,
-    "contextWindow": 272000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-high-fast",
-    "name": "GPT-5.5 High Fast",
-    "reasoning": false,
-    "contextWindow": 272000,
-    "maxTokens": 64000
-  },
-  {
-    "id": "gpt-5.5-xhigh-fast",
-    "name": "GPT-5.5 Extra High Fast",
-    "reasoning": false,
-    "contextWindow": 272000,
     "maxTokens": 64000
   },
   {

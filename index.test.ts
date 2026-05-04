@@ -6,6 +6,9 @@ import {
   applyNoReasoningEffort,
   buildEffortMap,
   buildNoReasoningEffortLookup,
+  buildRawModelLookup,
+  applyRawCursorModelId,
+  augmentCursorModels,
   FALLBACK_MODELS,
   parseModelId,
   processModels,
@@ -14,6 +17,8 @@ import {
 } from "./index.ts";
 import {
   resolveModelId,
+  resolveRequestedModelId,
+  inferCursorContextWindow,
   __testInternals,
   cleanupAllSessionState,
   cleanupSessionState,
@@ -64,6 +69,16 @@ function m(id: string, name?: string): CursorModel {
   return { id, name: name ?? id, reasoning: true, contextWindow: 200_000, maxTokens: 64_000 };
 }
 
+// ── model metadata ──
+
+describe("inferCursorContextWindow", () => {
+  test("detects 1M and 272K context labels from Cursor names and IDs", () => {
+    expect(inferCursorContextWindow("gpt-5.5", "GPT-5.5 272K Medium")).toBe(272_000);
+    expect(inferCursorContextWindow("gpt-5.5-1m-medium", "GPT-5.5 1M")).toBe(1_000_000);
+    expect(inferCursorContextWindow("gpt-5.3-codex", "Codex 5.3")).toBe(200_000);
+  });
+});
+
 // ── parseModelId ──
 
 describe("parseModelId", () => {
@@ -93,6 +108,22 @@ describe("parseModelId", () => {
 
   test("max effort + thinking", () => {
     expect(parseModelId("claude-4.6-opus-max-thinking")).toEqual({ base: "claude-4.6-opus", effort: "max", fast: false, thinking: true });
+  });
+
+  test("thinking + max effort order used by newer Cursor models", () => {
+    expect(parseModelId("claude-opus-4-7-thinking-max")).toEqual({ base: "claude-opus-4-7", effort: "max", fast: false, thinking: true });
+  });
+
+  test("thinking + high effort + fast order used by newer Cursor models", () => {
+    expect(parseModelId("claude-opus-4-7-thinking-high-fast")).toEqual({ base: "claude-opus-4-7", effort: "high", fast: true, thinking: true });
+  });
+
+  test("extra-high Cursor suffix normalizes to xhigh effort", () => {
+    expect(parseModelId("gpt-5.5-extra-high")).toEqual({ base: "gpt-5.5", effort: "xhigh", fast: false, thinking: false });
+  });
+
+  test("extra-high Cursor suffix + fast normalizes to xhigh effort", () => {
+    expect(parseModelId("gpt-5.5-extra-high-fast")).toEqual({ base: "gpt-5.5", effort: "xhigh", fast: true, thinking: false });
   });
 
   test("none effort level", () => {
@@ -229,20 +260,30 @@ describe("processModels", () => {
     expect(result[0].supportsEffort).toBe(true);
   });
 
-  test("gpt-5.5 — deduped from effort variants", () => {
+  test("augmentCursorModels adds GPT-5.5 context parameter choices to discovered models", () => {
+    const augmented = augmentCursorModels([m("gpt-5.5-medium", "GPT-5.5 1M")]);
+    const result = processModels(augmented);
+    expect(result.find(r => r.id === "gpt-5.5")?.contextWindow).toBe(272_000);
+    expect(result.find(r => r.id === "gpt-5.5-1m")?.contextWindow).toBe(1_000_000);
+  });
+
+  test("gpt-5.5 — deduped from 272K effort variants", () => {
     const result = processModels([
-      m("gpt-5.5-low"), m("gpt-5.5-medium"), m("gpt-5.5-high"), m("gpt-5.5-xhigh"),
+      m("gpt-5.5-none"), m("gpt-5.5-low"), m("gpt-5.5-medium", "GPT-5.5 272K"),
+      m("gpt-5.5-high"), m("gpt-5.5-extra-high"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.5");
+    expect(result[0].name).toBe("GPT-5.5 272K");
     expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.minimal).toBe("none");
     expect(result[0].effortMap!.medium).toBe("medium");
     expect(result[0].effortMap!.xhigh).toBe("xhigh");
   });
 
   test("gpt-5.5-fast — deduped from effort+fast variants including low", () => {
     const result = processModels([
-      m("gpt-5.5-low-fast"), m("gpt-5.5-medium-fast"), m("gpt-5.5-high-fast"), m("gpt-5.5-xhigh-fast"),
+      m("gpt-5.5-low-fast"), m("gpt-5.5-medium-fast"), m("gpt-5.5-high-fast"), m("gpt-5.5-extra-high-fast"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.5-fast");
@@ -257,7 +298,7 @@ describe("processModels", () => {
       m("gpt-5.5-1m-low", "GPT-5.5 1M Low"),
       m("gpt-5.5-1m-medium", "GPT-5.5 1M"),
       m("gpt-5.5-1m-high", "GPT-5.5 1M High"),
-      m("gpt-5.5-1m-xhigh", "GPT-5.5 1M Extra High"),
+      m("gpt-5.5-1m-extra-high", "GPT-5.5 1M Extra High"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.5-1m");
@@ -267,19 +308,13 @@ describe("processModels", () => {
     expect(result[0].effortMap!.xhigh).toBe("xhigh");
   });
 
-  test("gpt-5.5-1m-fast — deduped from 1M effort+fast variants", () => {
-    const result = processModels([
-      m("gpt-5.5-1m-low-fast", "GPT-5.5 1M Low Fast"),
-      m("gpt-5.5-1m-medium-fast", "GPT-5.5 1M Fast"),
-      m("gpt-5.5-1m-high-fast", "GPT-5.5 1M High Fast"),
-      m("gpt-5.5-1m-xhigh-fast", "GPT-5.5 1M Extra High Fast"),
-    ]);
-    expect(result).toHaveLength(1);
-    expect(result[0].id).toBe("gpt-5.5-1m-fast");
-    expect(result[0].name).toBe("GPT-5.5 1M Fast");
-    expect(result[0].supportsEffort).toBe(true);
-    expect(result[0].effortMap!.medium).toBe("medium");
-    expect(result[0].effortMap!.xhigh).toBe("xhigh");
+  test("GPT-5.5 augmentation does not synthesize impossible 1M fast variants", () => {
+    const augmented = augmentCursorModels([m("gpt-5.5", "GPT-5.5")]);
+    const processed = processModels(augmented);
+    expect(processed.some(model => model.id === "gpt-5.5-fast")).toBe(true);
+    expect(processed.some(model => model.id === "gpt-5.5-1m")).toBe(true);
+    expect(processed.some(model => model.id === "gpt-5.5-1m-fast")).toBe(false);
+    expect(augmented.some(model => /^gpt-5\.5-1m-.*-fast$/.test(model.id))).toBe(false);
   });
 
   test("gpt-5.2 — deduped from default + effort variants", () => {
@@ -338,6 +373,112 @@ describe("processModels", () => {
     expect(result[0].supportsEffort).toBe(true);
     expect(result[0].effortMap!.high).toBe("high");
     expect(result[0].effortMap!.xhigh).toBe("max");
+  });
+
+  test("claude-opus-4-7-thinking — newer thinking-effort order deduped with exact raw IDs", () => {
+    const result = processModels([
+      m("claude-opus-4-7-thinking-low"),
+      m("claude-opus-4-7-thinking-high"),
+      m("claude-opus-4-7-thinking-max"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("claude-opus-4-7-thinking");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.xhigh).toBe("max");
+    expect(result[0].rawModelByEffort!.max).toBe("claude-opus-4-7-thinking-max");
+  });
+
+  test("raw model lookup applies exact Cursor IDs for deduped effort variants", () => {
+    const processed = processModels([
+      m("claude-opus-4-7-thinking-high"),
+      m("claude-opus-4-7-thinking-max"),
+    ]);
+    const payload: Record<string, unknown> = { model: "claude-opus-4-7-thinking", reasoning_effort: "max" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("claude-opus-4-7-thinking-max");
+  });
+
+  test("raw model lookup routes suffix-style fast models through exact Cursor IDs", () => {
+    const processed = processModels([
+      m("gpt-5.4-medium-fast"),
+      m("gpt-5.4-high-fast"),
+    ]);
+    const payload: Record<string, unknown> = { model: "gpt-5.4-fast", reasoning_effort: "high" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("gpt-5.4-high-fast");
+    expect(payload.cursor_model_parameters).toBeUndefined();
+  });
+
+  test("raw model lookup routes GPT-5.5 1M through requestedModel parameters", () => {
+    const processed = processModels([
+      {
+        ...m("gpt-5.5-1m-high", "GPT-5.5 1M High"),
+        requestedModelId: "gpt-5.5",
+        requiresMaxMode: true,
+        requestedMaxMode: true,
+        parameters: [
+          { id: "context", value: "1m" },
+          { id: "reasoning", value: "high" },
+          { id: "fast", value: "false" },
+        ],
+      },
+      {
+        ...m("gpt-5.5-1m-medium", "GPT-5.5 1M"),
+        requestedModelId: "gpt-5.5",
+        requiresMaxMode: true,
+        requestedMaxMode: true,
+        parameters: [
+          { id: "context", value: "1m" },
+          { id: "reasoning", value: "medium" },
+          { id: "fast", value: "false" },
+        ],
+      },
+    ]);
+    const payload: Record<string, unknown> = { model: "gpt-5.5-1m", reasoning_effort: "high" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("gpt-5.5");
+    expect(payload.cursor_model_parameters).toEqual([
+      { id: "context", value: "1m" },
+      { id: "reasoning", value: "high" },
+      { id: "fast", value: "false" },
+    ]);
+    expect(payload.cursor_requires_max_mode).toBe(true);
+    expect(payload.cursor_model_max_mode).toBe(true);
+  });
+
+  test("raw model lookup routes GPT-5.5 272K fast mode through fast=true requestedModel parameter", () => {
+    const processed = processModels([
+      {
+        ...m("gpt-5.5-medium-fast", "GPT-5.5 Fast"),
+        requestedModelId: "gpt-5.5",
+        requestedMaxMode: false,
+        parameters: [
+          { id: "context", value: "272k" },
+          { id: "reasoning", value: "medium" },
+          { id: "fast", value: "true" },
+        ],
+      },
+      {
+        ...m("gpt-5.5-high-fast", "GPT-5.5 High Fast"),
+        requestedModelId: "gpt-5.5",
+        requestedMaxMode: false,
+        parameters: [
+          { id: "context", value: "272k" },
+          { id: "reasoning", value: "high" },
+          { id: "fast", value: "true" },
+        ],
+      },
+    ]);
+    const payload: Record<string, unknown> = { model: "gpt-5.5-fast", reasoning_effort: "high" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("gpt-5.5");
+    expect(payload.cursor_model_parameters).toEqual([
+      { id: "context", value: "272k" },
+      { id: "reasoning", value: "high" },
+      { id: "fast", value: "true" },
+    ]);
+    expect(payload.cursor_requires_max_mode).toBeUndefined();
+    expect(payload.cursor_model_max_mode).toBe(false);
   });
 
   test("claude-4.5-opus-high — single effort variant, deduped to base", () => {
@@ -424,27 +565,40 @@ describe("processModels", () => {
     const gpt54 = result.find(r => r.id === "gpt-5.4");
     expect(gpt54).toBeDefined();
     expect(gpt54!.supportsEffort).toBe(true);
+    expect(gpt54!.name).toBe("GPT-5.4 1M");
+    expect(gpt54!.contextWindow).toBe(1_000_000);
 
     const gpt55 = result.find(r => r.id === "gpt-5.5");
     expect(gpt55).toBeDefined();
     expect(gpt55!.supportsEffort).toBe(true);
+    expect(gpt55!.name).toBe("GPT-5.5 272K");
     expect(gpt55!.contextWindow).toBe(272_000);
+    expect(gpt55!.effortMap!.minimal).toBe("none");
+    expect(gpt55!.effortMap!.xhigh).toBe("xhigh");
+    expect(gpt55!.rawModelByEffort!.xhigh).toBe("gpt-5.5-extra-high");
+
+    const gpt55OneMillion = result.find(r => r.id === "gpt-5.5-1m");
+    expect(gpt55OneMillion).toBeDefined();
+    expect(gpt55OneMillion!.supportsEffort).toBe(true);
+    expect(gpt55OneMillion!.name).toBe("GPT-5.5 1M");
+    expect(gpt55OneMillion!.contextWindow).toBe(1_000_000);
+    expect(gpt55OneMillion!.rawRoutingByEffort!.high).toEqual({
+      modelId: "gpt-5.5",
+      requiresMaxMode: true,
+      requestedMaxMode: true,
+      parameters: [
+        { id: "context", value: "1m" },
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "false" },
+      ],
+    });
 
     const gpt55Fast = result.find(r => r.id === "gpt-5.5-fast");
     expect(gpt55Fast).toBeDefined();
     expect(gpt55Fast!.contextWindow).toBe(272_000);
+    expect(gpt55Fast!.rawRoutingByEffort!.high!.requestedMaxMode).toBe(false);
 
-    const gpt55OneMillion = result.find(r => r.id === "gpt-5.5-1m");
-    expect(gpt55OneMillion).toBeDefined();
-    expect(gpt55OneMillion!.name).toBe("GPT-5.5 1M");
-    expect(gpt55OneMillion!.supportsEffort).toBe(true);
-    expect(gpt55OneMillion!.contextWindow).toBe(1_000_000);
-
-    const gpt55OneMillionFast = result.find(r => r.id === "gpt-5.5-1m-fast");
-    expect(gpt55OneMillionFast).toBeDefined();
-    expect(gpt55OneMillionFast!.name).toBe("GPT-5.5 1M Fast");
-    expect(gpt55OneMillionFast!.supportsEffort).toBe(true);
-    expect(gpt55OneMillionFast!.contextWindow).toBe(1_000_000);
+    expect(result.find(r => r.id === "gpt-5.5-1m-fast")).toBeUndefined();
 
     // Opus should be deduped too
     const opus46 = result.find(r => r.id === "claude-4.6-opus");
@@ -458,11 +612,10 @@ describe("processModels", () => {
     expect(result.find(r => r.id === "gpt-5.4-high")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-medium")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-high")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-extra-high")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-1m-medium")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-1m-high")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-1m-medium-fast")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-1m-high-fast")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-low-fast")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-1m-extra-high")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.2-low")).toBeUndefined();
   });
 });
@@ -509,7 +662,7 @@ describe("resolveModelId", () => {
   test("fast model + effort — inserts before -fast", () => {
     expect(resolveModelId("gpt-5.4-fast", "medium")).toBe("gpt-5.4-medium-fast");
     expect(resolveModelId("gpt-5.4-fast", "high")).toBe("gpt-5.4-high-fast");
-    expect(resolveModelId("gpt-5.5-1m-fast", "high")).toBe("gpt-5.5-1m-high-fast");
+    expect(resolveModelId("gpt-5.5-fast", "high")).toBe("gpt-5.5-high-fast");
   });
 
   test("thinking model + effort — inserts before -thinking", () => {
@@ -528,6 +681,14 @@ describe("resolveModelId", () => {
 
   test("spark-preview model + effort", () => {
     expect(resolveModelId("gpt-5.3-codex-spark-preview", "xhigh")).toBe("gpt-5.3-codex-spark-preview-xhigh");
+  });
+
+  test("exact cursor model id override wins over suffix insertion", () => {
+    expect(resolveRequestedModelId(
+      "claude-opus-4-7-thinking",
+      "max",
+      "claude-opus-4-7-thinking-max",
+    )).toBe("claude-opus-4-7-thinking-max");
   });
 });
 
@@ -828,6 +989,50 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(req.conversationState.turns).toHaveLength(0);
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toBe("hello");
+  });
+
+  test("uses requestedModel instead of legacy modelDetails", () => {
+    const payload = buildCursorRequest("gpt-5", "system", "hello", [], "conv-1", null);
+    const req = decodeRunRequest(payload);
+    expect(req.modelDetails).toBeUndefined();
+    expect(req.requestedModel.modelId).toBe("gpt-5");
+    expect(req.requestedModel.maxMode).toBe(false);
+    expect(req.requestedModel.parameters).toEqual([]);
+  });
+
+  test("max mode flag is sent without changing the model ID", () => {
+    const payload = buildCursorRequest("gpt-5.3-codex", "system", "hello", [], "conv-1", null, undefined, true);
+    const req = decodeRunRequest(payload);
+    expect(req.modelDetails).toBeUndefined();
+    expect(req.requestedModel.modelId).toBe("gpt-5.3-codex");
+    expect(req.requestedModel.maxMode).toBe(true);
+    expect(req.requestedModel.parameters).toEqual([]);
+  });
+
+  test("required max mode flag is sent for 1M parameterized models", () => {
+    const payload = buildCursorRequest("gpt-5.5", "system", "hello", [], "conv-1", null, undefined, true, [
+      { id: "context", value: "1m" },
+      { id: "reasoning", value: "high" },
+      { id: "fast", value: "true" },
+    ]);
+    const req = decodeRunRequest(payload);
+    expect(req.requestedModel.modelId).toBe("gpt-5.5");
+    expect(req.requestedModel.maxMode).toBe(true);
+  });
+
+  test("requestedModel includes Cursor parameterized model settings", () => {
+    const payload = buildCursorRequest("gpt-5.5", "system", "hello", [], "conv-1", null, undefined, false, [
+      { id: "context", value: "1m" },
+      { id: "reasoning", value: "high" },
+      { id: "fast", value: "true" },
+    ]);
+    const req = decodeRunRequest(payload);
+    expect(req.requestedModel.modelId).toBe("gpt-5.5");
+    expect(req.requestedModel.parameters.map((parameter: any) => ({ id: parameter.id, value: parameter.value }))).toEqual([
+      { id: "context", value: "1m" },
+      { id: "reasoning", value: "high" },
+      { id: "fast", value: "true" },
+    ]);
   });
 
   test("no checkpoint, with assistant-text turns — reconstructs protobuf turns without inline fallback", () => {

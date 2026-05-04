@@ -24,7 +24,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.js";
-import { cleanupSessionState, getCursorModels, startProxy, type CursorModel } from "./proxy.js";
+import { cleanupSessionState, getCursorModels, startProxy, type CursorModel, type CursorModelParameter } from "./proxy.js";
 
 // ── Cost estimation ──
 
@@ -129,6 +129,11 @@ function summarizeProviderPayload(payload: unknown): unknown {
   const messages = Array.isArray(typed.messages) ? typed.messages.map((message) => summarizeMessage(message)).slice(-8) : undefined;
   return {
     model: typed.model,
+    cursor_model_id: typed.cursor_model_id,
+    cursor_model_parameters: typed.cursor_model_parameters,
+    cursor_requires_max_mode: typed.cursor_requires_max_mode,
+    cursor_model_max_mode: typed.cursor_model_max_mode,
+    reasoning_effort: typed.reasoning_effort,
     stream: typed.stream,
     pi_session_id: typed.pi_session_id,
     messageCount: Array.isArray(typed.messages) ? typed.messages.length : undefined,
@@ -210,7 +215,15 @@ function estimateModelCost(modelId: string): ModelCost {
 
 // ── Effort-level dedup ──
 
-const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max", "none"]);
+const CURSOR_EFFORT_SUFFIXES: Array<{ suffix: string; effort: string }> = [
+  { suffix: "extra-high", effort: "xhigh" },
+  { suffix: "xhigh", effort: "xhigh" },
+  { suffix: "medium", effort: "medium" },
+  { suffix: "high", effort: "high" },
+  { suffix: "low", effort: "low" },
+  { suffix: "max", effort: "max" },
+  { suffix: "none", effort: "none" },
+];
 
 interface ParsedModelId {
   base: string;       // model ID with effort stripped
@@ -219,34 +232,61 @@ interface ParsedModelId {
   thinking: boolean;  // has -thinking suffix
 }
 
+function stripEffortSuffix(id: string): { remaining: string; effort: string } {
+  for (const { suffix, effort } of CURSOR_EFFORT_SUFFIXES) {
+    const marker = `-${suffix}`;
+    if (id.endsWith(marker)) {
+      return { remaining: id.slice(0, -marker.length), effort };
+    }
+  }
+  return { remaining: id, effort: "" };
+}
+
 export function parseModelId(id: string): ParsedModelId {
   let remaining = id;
   let fast = false;
   let thinking = false;
+  let effort = "";
 
   if (remaining.endsWith("-fast")) {
     fast = true;
     remaining = remaining.slice(0, -5);
   }
+
+  // Cursor has used both orders for thinking effort variants:
+  //   claude-4.6-opus-max-thinking       (effort before -thinking)
+  //   claude-opus-4-7-thinking-max       (effort after -thinking)
   if (remaining.endsWith("-thinking")) {
     thinking = true;
     remaining = remaining.slice(0, -9);
-  }
-
-  const lastDash = remaining.lastIndexOf("-");
-  if (lastDash >= 0) {
-    const suffix = remaining.slice(lastDash + 1);
-    if (EFFORT_LEVELS.has(suffix)) {
-      return { base: remaining.slice(0, lastDash), effort: suffix, fast, thinking };
+    const parsed = stripEffortSuffix(remaining);
+    remaining = parsed.remaining;
+    effort = parsed.effort;
+  } else {
+    const parsed = stripEffortSuffix(remaining);
+    remaining = parsed.remaining;
+    effort = parsed.effort;
+    if (remaining.endsWith("-thinking")) {
+      thinking = true;
+      remaining = remaining.slice(0, -9);
     }
   }
 
-  return { base: remaining, effort: "", fast, thinking };
+  return { base: remaining, effort, fast, thinking };
+}
+
+export interface CursorModelRouting {
+  modelId: string;
+  parameters?: CursorModelParameter[];
+  requiresMaxMode?: boolean;
+  requestedMaxMode?: boolean;
 }
 
 export interface ProcessedModel extends CursorModel {
   supportsEffort: boolean;
   effortMap?: Record<string, string>;
+  rawModelByEffort?: Record<string, string>;
+  rawRoutingByEffort?: Record<string, CursorModelRouting>;
 }
 
 export function buildNoReasoningEffortLookup(models: ProcessedModel[]): Map<string, string> {
@@ -257,6 +297,30 @@ export function buildNoReasoningEffortLookup(models: ProcessedModel[]): Map<stri
     }
   }
   return lookup;
+}
+
+export function buildRawModelLookup(models: ProcessedModel[]): Map<string, Record<string, CursorModelRouting>> {
+  const lookup = new Map<string, Record<string, CursorModelRouting>>();
+  for (const model of models) {
+    if (model.supportsEffort && model.rawRoutingByEffort) {
+      lookup.set(model.id, model.rawRoutingByEffort);
+    }
+  }
+  return lookup;
+}
+
+export function applyRawCursorModelId(
+  payload: Record<string, unknown>,
+  rawRoutingByEffortByModelId: Map<string, Record<string, CursorModelRouting>>,
+): void {
+  if (typeof payload.model !== "string" || typeof payload.reasoning_effort !== "string") return;
+  const rawRoutingByEffort = rawRoutingByEffortByModelId.get(payload.model);
+  const routing = rawRoutingByEffort?.[payload.reasoning_effort];
+  if (!routing) return;
+  payload.cursor_model_id = routing.modelId;
+  if (routing.parameters?.length) payload.cursor_model_parameters = routing.parameters;
+  if (routing.requiresMaxMode) payload.cursor_requires_max_mode = true;
+  if (typeof routing.requestedMaxMode === "boolean") payload.cursor_model_max_mode = routing.requestedMaxMode;
 }
 
 export function applyNoReasoningEffort(
@@ -346,8 +410,19 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
       if (g.fast) id += "-fast";
 
       const effortMap = buildEffortMap(effortNames);
+      const rawModelByEffort = Object.fromEntries(
+        [...g.efforts.entries()].map(([effort, model]) => [effort, model.id]),
+      );
+      const rawRoutingByEffort = Object.fromEntries(
+        [...g.efforts.entries()].map(([effort, model]) => [effort, {
+          modelId: model.requestedModelId ?? model.id,
+          ...(model.parameters?.length ? { parameters: model.parameters } : {}),
+          ...(model.requiresMaxMode ? { requiresMaxMode: true } : {}),
+          ...(typeof model.requestedMaxMode === "boolean" ? { requestedMaxMode: model.requestedMaxMode } : {}),
+        }]),
+      );
 
-      result.push({ ...rep, id, supportsEffort: true, effortMap });
+      result.push({ ...rep, id, supportsEffort: true, effortMap, rawModelByEffort, rawRoutingByEffort });
     } else {
       // Keep single entries as-is (base model without effort variants)
       for (const model of g.efforts.values()) {
@@ -383,7 +458,69 @@ function modelConfig(m: ProcessedModel) {
 }
 
 
-export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[]).map((model) => ({
+const GPT55_CONTEXTS = [
+  { idPart: "", label: "272K", value: "272k", contextWindow: 272_000 },
+  { idPart: "-1m", label: "1M", value: "1m", contextWindow: 1_000_000 },
+] as const;
+
+const GPT55_REASONING_LEVELS = [
+  { suffix: "none", label: "None", value: "none" },
+  { suffix: "low", label: "Low", value: "low" },
+  { suffix: "medium", label: "", value: "medium" },
+  { suffix: "high", label: "High", value: "high" },
+  { suffix: "extra-high", label: "Extra High", value: "extra-high" },
+] as const;
+
+function gpt55ParameterizedModels(): CursorModel[] {
+  const models: CursorModel[] = [];
+  for (const context of GPT55_CONTEXTS) {
+    // Cursor's parameter metadata only allows fast=true with 272K context.
+    // The 1M variants are Max Mode variants and all have fast=false; sending
+    // context=1m plus fast=true is sanitized by Cursor to the default 1M medium
+    // configuration, so do not expose impossible 1M-fast rows.
+    const fastOptions = context.value === "1m" ? [false] : [false, true];
+    for (const fast of fastOptions) {
+      for (const reasoning of GPT55_REASONING_LEVELS) {
+        const id = `gpt-5.5${context.idPart}-${reasoning.suffix}${fast ? "-fast" : ""}`;
+        const nameParts = ["GPT-5.5", context.label, reasoning.label, fast ? "Fast" : ""].filter(Boolean);
+        models.push({
+          id,
+          name: nameParts.join(" "),
+          reasoning: true,
+          contextWindow: context.contextWindow,
+          maxTokens: 64_000,
+          requestedModelId: "gpt-5.5",
+          requiresMaxMode: context.value === "1m",
+          requestedMaxMode: context.value === "1m",
+          parameters: [
+            { id: "context", value: context.value },
+            { id: "reasoning", value: reasoning.value },
+            { id: "fast", value: String(fast) },
+          ],
+        });
+      }
+    }
+  }
+  return models;
+}
+
+export function augmentCursorModels(raw: CursorModel[]): CursorModel[] {
+  const byId = new Map<string, CursorModel>();
+  for (const model of raw) byId.set(model.id, model);
+
+  // Cursor CLI exposes GPT-5.5 context as a parameter (272K vs 1M), not as
+  // distinct base model names. Pi's model picker cannot edit Cursor parameters,
+  // so synthesize separate selectable rows while routing both through
+  // requestedModel.modelId="gpt-5.5" with explicit parameters. Only do this
+  // when Cursor/fallback discovery already says GPT-5.5 is available.
+  if (raw.some((model) => /^gpt-5\.5(?:-|$)/.test(model.id))) {
+    for (const model of gpt55ParameterizedModels()) byId.set(model.id, model);
+  }
+
+  return [...byId.values()];
+}
+
+export const FALLBACK_MODELS: CursorModel[] = augmentCursorModels(rawFallbackModels as CursorModel[]).map((model) => ({
   ...model,
   reasoning: supportsReasoningModelId(model.id),
 }));
@@ -484,6 +621,7 @@ export default async function (pi: ExtensionAPI) {
   // Current access token, updated by login/refresh/getApiKey
   let currentToken = "";
   let noReasoningEffortByModelId = new Map<string, string>();
+  let rawModelByEffortByModelId = new Map<string, Record<string, CursorModelRouting>>();
 
   // Start proxy eagerly — it just binds a port, no auth needed until a request arrives.
   // The getAccessToken callback reads currentToken at request time.
@@ -505,6 +643,7 @@ export default async function (pi: ExtensionAPI) {
     if (payload && ctx.model?.provider === "cursor") {
       payload.pi_session_id = ctx.sessionManager.getSessionId();
       applyNoReasoningEffort(payload, pi.getThinkingLevel(), noReasoningEffortByModelId);
+      applyRawCursorModelId(payload, rawModelByEffortByModelId);
       debugExtensionLog("before_provider_request", {
         sessionId: ctx.sessionManager.getSessionId(),
         leafId: ctx.sessionManager.getLeafId?.(),
@@ -522,10 +661,12 @@ export default async function (pi: ExtensionAPI) {
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
+    const augmentedModels = augmentCursorModels(rawModels);
     const processed = skipDedup
-      ? rawModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
-      : processModels(rawModels);
+      ? augmentedModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
+      : processModels(augmentedModels);
     noReasoningEffortByModelId = buildNoReasoningEffortLookup(processed);
+    rawModelByEffortByModelId = buildRawModelLookup(processed);
 
     pi.registerProvider("cursor", {
       baseUrl,

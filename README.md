@@ -18,7 +18,7 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 
 1. **PKCE OAuth** — browser-based login to Cursor, no client secret needed
 2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
-3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol
+3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol using Cursor's newer `requestedModel` request field
 4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
 
 ## Install
@@ -46,10 +46,11 @@ Cursor exposes many model variants that encode **effort level** (`low`, `medium`
 
 ### How it works
 
-Each raw Cursor model ID is parsed into components:
+Each raw Cursor model ID is parsed into components. Cursor has used both thinking/effort orders, and this extension preserves the exact raw ID returned by Cursor when dispatching requests:
 
 ```
-{base}-{effort}[-fast|-thinking]
+{base}-{effort}[-thinking][-fast]
+{base}-thinking-{effort}[-fast]
 ```
 
 Examples:
@@ -59,6 +60,7 @@ Examples:
 | `gpt-5.4-medium` | `gpt-5.4` | `medium` | — |
 | `gpt-5.4-high-fast` | `gpt-5.4` | `high` | `-fast` |
 | `claude-4.6-opus-max-thinking` | `claude-4.6-opus` | `max` | `-thinking` |
+| `claude-opus-4-7-thinking-max` | `claude-opus-4-7` | `max` | `-thinking` |
 | `gpt-5.1-codex-max-high` | `gpt-5.1-codex-max` | `high` | — |
 | `composer-2` | `composer-2` | — | — |
 
@@ -72,12 +74,26 @@ Models sharing the same `(base, variant)` with **≥2 effort levels** and a sens
 | `high` | `high` |
 | `xhigh` | `max` (Claude) or `xhigh` (GPT) |
 
-The proxy inserts the effort before `-fast`/`-thinking`:
+### Parameterized Cursor models
+
+Cursor CLI exposes some choices as model parameters rather than standalone model IDs. For example, GPT-5.5 has separate **Context** settings (`272K` and `1M`), **Reasoning** settings, and a **Fast** toggle for 272K variants. Pi's model picker cannot edit those Cursor-specific parameters directly, so this extension exposes them as separate selectable rows:
+
+| Pi model | Cursor `requestedModel` |
+|---|---|
+| `gpt-5.5` | `modelId: "gpt-5.5"`, `context: "272k"` |
+| `gpt-5.5-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"` |
+| `gpt-5.5-1m` | `modelId: "gpt-5.5"`, `context: "1m"`, `fast: "false"`, `maxMode: true` |
+
+Pi's thinking level supplies the Cursor `reasoning` parameter for those rows (`none`, `low`, `medium`, `high`, or `extra-high`). The 1M rows internally send Cursor `maxMode: true` because Cursor only returns a 1M `tokenDetails.maxTokens` window when `maxMode` is true. There is no separate `/max` toggle: Cursor-specific flags like `maxMode` and `fast` are determined by the selected model row so invalid combinations are not created. Cursor's own model metadata does not include any `context=1m` + `fast=true` GPT-5.5 variant; sending that invalid combination is sanitized by Cursor to the default 1M medium configuration, so this extension intentionally does not expose `gpt-5.5-1m-fast`.
+
+For deduped models, the extension keeps an exact map from `(displayed model, effort)` back to the raw Cursor model ID or parameter set returned/derived from Cursor. That avoids guessing where the effort segment belongs:
 
 ```
-pi selects: gpt-5.4-fast  +  effort: high  →  Cursor receives: gpt-5.4-high-fast
-pi selects: gpt-5.4       +  effort: medium  →  Cursor receives: gpt-5.4-medium
-pi selects: composer-2     +  (no effort)     →  Cursor receives: composer-2
+pi selects: gpt-5.4-fast              + effort: high   → Cursor receives: gpt-5.4-high-fast
+pi selects: gpt-5.4                   + effort: medium → Cursor receives: gpt-5.4-medium
+pi selects: gpt-5.5-1m                + effort: high   → Cursor receives: gpt-5.5 + context=1m + reasoning=high
+pi selects: claude-opus-4-7-thinking  + effort: max    → Cursor receives: claude-opus-4-7-thinking-max
+pi selects: composer-2                + no effort      → Cursor receives: composer-2
 ```
 
 When a group is **collapsed**, the proxy registers one model with `supportsReasoningEffort: true` and an internal effort map (see table above).
