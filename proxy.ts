@@ -47,6 +47,7 @@ import {
   McpToolCallSchema,
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
+  McpToolsSchema,
   RequestedModelSchema,
   RequestedModel_ModelParameterbytesSchema,
   ReadRejectedSchema,
@@ -476,11 +477,16 @@ export interface CursorModel {
   requestedMaxMode?: boolean;
 }
 
-let cachedModels: CursorModel[] | null = null;
-let cachedParameterizedModels: CursorParameterizedModel[] | null = null;
+let cachedModels: { tokenHash: string; models: CursorModel[] } | null = null;
+let cachedParameterizedModels: { tokenHash: string; models: CursorParameterizedModel[] } | null = null;
+
+function tokenCacheHash(apiKey: string): string {
+  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+}
 
 export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
-  if (cachedModels) return cachedModels;
+  const tokenHash = tokenCacheHash(apiKey);
+  if (cachedModels?.tokenHash === tokenHash) return cachedModels.models;
   try {
     const requestPayload = create(GetUsableModelsRequestSchema, {});
     const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
@@ -503,7 +509,7 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
       if (decoded?.models?.length) {
         const models = normalizeCursorModels(decoded.models);
         if (models.length > 0) {
-          cachedModels = models;
+          cachedModels = { tokenHash, models };
           return models;
         }
       }
@@ -678,7 +684,8 @@ function decodeAvailableModelsResponse(bytes: Uint8Array): CursorParameterizedMo
 }
 
 export async function getCursorParameterizedModels(apiKey: string): Promise<CursorParameterizedModel[]> {
-  if (cachedParameterizedModels) return cachedParameterizedModels;
+  const tokenHash = tokenCacheHash(apiKey);
+  if (cachedParameterizedModels?.tokenHash === tokenHash) return cachedParameterizedModels.models;
   try {
     const response = await callCursorUnaryRpc({
       accessToken: apiKey,
@@ -688,7 +695,7 @@ export async function getCursorParameterizedModels(apiKey: string): Promise<Curs
     if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) return [];
     const body = decodeConnectUnaryBody(response.body) ?? response.body;
     const models = decodeAvailableModelsResponse(body);
-    cachedParameterizedModels = models;
+    cachedParameterizedModels = { tokenHash, models };
     return models;
   } catch (err) {
     console.error("[cursor-provider] Parameterized model discovery failed:", err instanceof Error ? err.message : err);
@@ -951,7 +958,7 @@ async function handleChatCompletion(
   }
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
-    stored.conversationId, stored.checkpoint, stored.blobStore, maxMode, body.cursor_model_parameters,
+    stored.conversationId, stored.checkpoint, stored.blobStore, maxMode, body.cursor_model_parameters, mcpTools,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -1282,6 +1289,7 @@ export function buildCursorRequest(
   existingBlobStore?: Map<string, Uint8Array>,
   maxMode = false,
   cursorModelParameters: CursorModelParameter[] = [],
+  mcpTools: McpToolDefinition[] = [],
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -1293,6 +1301,7 @@ export function buildCursorRequest(
     existingBlobStore,
     maxMode,
     cursorModelParameters,
+    mcpToolCount: mcpTools.length,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
@@ -1356,12 +1365,18 @@ export function buildCursorRequest(
   });
   const parameters = cursorModelParameters.map((parameter) => create(RequestedModel_ModelParameterbytesSchema, parameter));
   const requestedModel = create(RequestedModelSchema, { modelId, maxMode, parameters });
-  const runRequest = create(AgentRunRequestSchema, { conversationState, action, requestedModel, conversationId });
+  const runRequest = create(AgentRunRequestSchema, {
+    conversationState,
+    action,
+    requestedModel,
+    conversationId,
+    mcpTools: create(McpToolsSchema, { mcpTools }),
+  });
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "runRequest", value: runRequest },
   });
 
-  const payload = { requestBytes: toBinary(AgentClientMessageSchema, clientMessage), blobStore, mcpTools: [] };
+  const payload = { requestBytes: toBinary(AgentClientMessageSchema, clientMessage), blobStore, mcpTools };
   debugLog("cursor_request.build.end", payload);
   return payload;
 }

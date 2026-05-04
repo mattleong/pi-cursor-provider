@@ -55,6 +55,7 @@ import {
   InteractionUpdateSchema,
   KvServerMessageSchema,
   McpArgsSchema,
+  McpToolDefinitionSchema,
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   UserMessageSchema,
@@ -605,6 +606,33 @@ describe("processModels", () => {
     ]);
     expect(payload.cursor_requires_max_mode).toBeUndefined();
     expect(payload.cursor_model_max_mode).toBe(false);
+  });
+
+  test("raw model lookup routes non-effort parameterized rows", () => {
+    const processed = processModels([
+      {
+        ...m("composer-2-max-mode-fast", "Composer 2 Max Mode Fast"),
+        requestedModelId: "composer-2",
+        requestedMaxMode: true,
+        parameters: [{ id: "fast", value: "true" }],
+      },
+    ]);
+    const payload: Record<string, unknown> = { model: "composer-2-max-mode-fast" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("composer-2");
+    expect(payload.cursor_model_parameters).toEqual([{ id: "fast", value: "true" }]);
+    expect(payload.cursor_model_max_mode).toBe(true);
+  });
+
+  test("raw model lookup has a safe default route when no reasoning_effort is present", () => {
+    const processed = processModels([
+      m("gpt-5.4-low"),
+      m("gpt-5.4-medium"),
+      m("gpt-5.4-high"),
+    ]);
+    const payload: Record<string, unknown> = { model: "gpt-5.4" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("gpt-5.4-medium");
   });
 
   test("claude-4.5-opus-high — single effort variant, deduped to base", () => {
@@ -1172,6 +1200,22 @@ describe("buildCursorRequest — turn reconstruction", () => {
       { id: "reasoning", value: "high" },
       { id: "fast", value: "true" },
     ]);
+  });
+
+  test("includes MCP tools in the initial AgentRunRequest like Cursor CLI", () => {
+    const tool = create(McpToolDefinitionSchema, {
+      name: "read_file",
+      providerIdentifier: "pi",
+      toolName: "read_file",
+      description: "Read a file",
+      inputSchema: new Uint8Array([1, 2, 3]),
+    });
+    const payload = buildCursorRequest("gpt-5", "system", "hello", [], "conv-1", null, undefined, false, [], [tool]);
+    const req = decodeRunRequest(payload);
+    expect(payload.mcpTools).toHaveLength(1);
+    expect(req.mcpTools.mcpTools).toHaveLength(1);
+    expect(req.mcpTools.mcpTools[0].name).toBe("read_file");
+    expect(req.mcpTools.mcpTools[0].providerIdentifier).toBe("pi");
   });
 
   test("no checkpoint, with assistant-text turns — reconstructs protobuf turns without inline fallback", () => {

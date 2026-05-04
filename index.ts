@@ -300,12 +300,46 @@ export function buildNoReasoningEffortLookup(models: ProcessedModel[]): Map<stri
   return lookup;
 }
 
+function routingForModel(model: CursorModel): CursorModelRouting | undefined {
+  if (
+    !model.requestedModelId &&
+    !model.parameters?.length &&
+    !model.requiresMaxMode &&
+    typeof model.requestedMaxMode !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    modelId: model.requestedModelId ?? model.id,
+    ...(model.parameters?.length ? { parameters: model.parameters } : {}),
+    ...(model.requiresMaxMode ? { requiresMaxMode: true } : {}),
+    ...(typeof model.requestedMaxMode === "boolean" ? { requestedMaxMode: model.requestedMaxMode } : {}),
+  };
+}
+
+function defaultRoutingEffort(model: ProcessedModel): string | undefined {
+  const routes = model.rawRoutingByEffort;
+  if (!routes) return undefined;
+  const mappedMedium = model.effortMap?.medium;
+  for (const effort of [mappedMedium, "medium", "", "low", "high", "none", "xhigh", "max"]) {
+    if (effort !== undefined && routes[effort]) return effort;
+  }
+  return Object.keys(routes)[0];
+}
+
 export function buildRawModelLookup(models: ProcessedModel[]): Map<string, Record<string, CursorModelRouting>> {
   const lookup = new Map<string, Record<string, CursorModelRouting>>();
   for (const model of models) {
     if (model.supportsEffort && model.rawRoutingByEffort) {
-      lookup.set(model.id, model.rawRoutingByEffort);
+      const routes = { ...model.rawRoutingByEffort };
+      const defaultEffort = defaultRoutingEffort(model);
+      if (defaultEffort !== undefined && !routes[""]) routes[""] = model.rawRoutingByEffort[defaultEffort]!;
+      lookup.set(model.id, routes);
+      continue;
     }
+
+    const routing = routingForModel(model);
+    if (routing) lookup.set(model.id, { "": routing });
   }
   return lookup;
 }
@@ -314,9 +348,10 @@ export function applyRawCursorModelId(
   payload: Record<string, unknown>,
   rawRoutingByEffortByModelId: Map<string, Record<string, CursorModelRouting>>,
 ): void {
-  if (typeof payload.model !== "string" || typeof payload.reasoning_effort !== "string") return;
+  if (typeof payload.model !== "string") return;
   const rawRoutingByEffort = rawRoutingByEffortByModelId.get(payload.model);
-  const routing = rawRoutingByEffort?.[payload.reasoning_effort];
+  const effort = typeof payload.reasoning_effort === "string" ? payload.reasoning_effort : "";
+  const routing = rawRoutingByEffort?.[effort];
   if (!routing) return;
   payload.cursor_model_id = routing.modelId;
   if (routing.parameters?.length) payload.cursor_model_parameters = routing.parameters;
