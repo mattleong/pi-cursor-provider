@@ -136,7 +136,14 @@ PI_CURSOR_CLIENT_VERSION=cli-2026.05.01-eea359f pi
 
 ## Image Support
 
-Drag-and-dropped/user-attached images are forwarded to Cursor as selected images. Image blocks returned by pi tools are forwarded as MCP image result content, enabling screenshot-driven debugging, browser/tool visual feedback, generated image review, and visual regression analysis. Tool-result images are validated against Cursor CLI's supported formats and post-processing cap: jpeg/png/gif/webp magic bytes and a maximum payload size of 5,242,880 bytes. Oversized tool-result images are rejected rather than downscaled.
+Drag-and-dropped/user-attached images are forwarded to Cursor as selected images. Image blocks returned by pi tools are forwarded as MCP image result content, enabling screenshot-driven debugging, browser/tool visual feedback, generated image review, and visual regression analysis.
+
+Image constraints are grounded in the Cursor CLI local-image path:
+
+- Supported formats are detected by magic bytes: jpeg, png, gif, or webp.
+- Maximum processed image payload is 5,242,880 bytes.
+- Cursor CLI downscales/compresses local files to fit that cap; this provider receives inline image bytes from Pi, so oversized inline images are rejected rather than resized.
+- Remote structured `image_url` attachments are rejected with a clear error; attach the image or provide an inline `data:image/...;base64,...` URL instead. Plain text URLs remain plain text.
 
 ## Session Management
 

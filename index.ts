@@ -16,6 +16,7 @@ import rawFallbackModels from "./cursor-models-raw.json";
 import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
 import { appendFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import {
@@ -59,6 +60,35 @@ function truncateDebugValue(value: string, max = 240): string {
   return value.length > max ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>` : value;
 }
 
+function summarizeBase64ImageData(data: string): { base64Length: number; byteLength?: number; sha256?: string } {
+  const summary: { base64Length: number; byteLength?: number; sha256?: string } = { base64Length: data.length };
+  try {
+    const bytes = Buffer.from(data.replace(/\s/g, ""), "base64");
+    if (bytes.length > 0) {
+      summary.byteLength = bytes.length;
+      summary.sha256 = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+    }
+  } catch {}
+  return summary;
+}
+
+function summarizeImageBlock(type: unknown, mimeType: unknown, data: unknown): unknown {
+  return {
+    type,
+    mimeType,
+    ...(typeof data === "string" ? summarizeBase64ImageData(data) : { data: `<redacted base64 ${String(data ?? "").length} chars>` }),
+  };
+}
+
+function summarizeDataImageUrl(url: string): unknown {
+  const match = url.trim().match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
+  if (!match) return { url: url.startsWith("data:image/") ? `<redacted data image ${url.length} chars>` : truncateDebugValue(url) };
+  return {
+    mimeType: match[1]?.toLowerCase(),
+    ...summarizeBase64ImageData(match[2]!),
+  };
+}
+
 function summarizeContent(content: unknown): unknown {
   if (typeof content === "string") return truncateDebugValue(content);
   if (!Array.isArray(content)) return content;
@@ -78,11 +108,11 @@ function summarizeContent(content: unknown): unknown {
           arguments: typed.arguments,
         };
       case "image":
-        return { type: "image", mimeType: typed.mimeType, data: `<redacted base64 ${String(typed.data ?? "").length} chars>` };
+        return summarizeImageBlock("image", typed.mimeType, typed.data);
       case "image_url": {
         const url = (typed.image_url as Record<string, unknown> | undefined)?.url;
         const text = typeof url === "string" ? url : "";
-        return { type: "image_url", image_url: { url: text.startsWith("data:image/") ? `<redacted data image ${text.length} chars>` : truncateDebugValue(text) } };
+        return { type: "image_url", image_url: summarizeDataImageUrl(text) };
       }
       default:
         return typed;
@@ -142,7 +172,7 @@ function summarizeProviderPayload(payload: unknown): unknown {
           images: Array.isArray(e.images)
             ? e.images.map((image) => {
                 const img = image as Record<string, unknown>;
-                return { mimeType: img.mimeType, data: `<redacted base64 ${String(img.data ?? "").length} chars>` };
+                return summarizeImageBlock("image", img.mimeType, img.data);
               })
             : undefined,
         };
@@ -164,7 +194,7 @@ function summarizeProviderPayload(payload: unknown): unknown {
   };
 }
 
-interface CursorToolResultImagePayload {
+export interface CursorToolResultImagePayload {
   toolCallId: string;
   images: Array<{ data: string; mimeType: string }>;
 }
@@ -180,7 +210,7 @@ function payloadToolCallIds(payload: Record<string, unknown>): Set<string> {
   return ids;
 }
 
-function extractToolResultImagePayloads(
+export function extractToolResultImagePayloads(
   ctx: { sessionManager?: { getBranch?: () => unknown[] } },
   payload: Record<string, unknown>,
 ): CursorToolResultImagePayload[] {

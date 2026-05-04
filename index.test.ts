@@ -10,6 +10,7 @@ import {
   buildRawModelLookup,
   applyRawCursorModelId,
   augmentCursorModels,
+  extractToolResultImagePayloads,
   FALLBACK_MODELS,
   modelsFromParameterizedMetadata,
   parseModelId,
@@ -914,6 +915,64 @@ const toolStep = (
 const turn = (userText: string, steps: ParsedTurn["steps"] = []): ParsedTurn => ({ userText, steps });
 const pngBytes = () => new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
 const pngBase64 = () => Buffer.from(pngBytes()).toString("base64");
+const jpegBytes = () => new Uint8Array([0xff, 0xd8, 0xff, 1, 2, 3, 4]);
+const jpegBase64 = () => Buffer.from(jpegBytes()).toString("base64");
+
+describe("extractToolResultImagePayloads", () => {
+  test("extracts image blocks from matching tool-result messages in the Pi branch", () => {
+    const ctx = {
+      sessionManager: {
+        getBranch: () => [
+          {
+            message: {
+              role: "toolResult",
+              toolCallId: "tc1",
+              content: [
+                { type: "text", text: "screenshot" },
+                { type: "image", data: pngBase64(), mimeType: "image/png" },
+              ],
+            },
+          },
+          {
+            message: {
+              role: "toolResult",
+              toolCallId: "tc2",
+              content: [{ type: "image", data: jpegBase64(), mimeType: "image/jpeg" }],
+            },
+          },
+        ],
+      },
+    };
+
+    const extracted = extractToolResultImagePayloads(ctx, {
+      messages: [
+        { role: "tool", tool_call_id: "tc1", content: "(see attached image)" },
+      ],
+    });
+
+    expect(extracted).toEqual([
+      { toolCallId: "tc1", images: [{ data: pngBase64(), mimeType: "image/png" }] },
+    ]);
+  });
+
+  test("ignores branch images whose toolCallId is not in the provider payload", () => {
+    const extracted = extractToolResultImagePayloads({
+      sessionManager: {
+        getBranch: () => [{
+          message: {
+            role: "toolResult",
+            toolCallId: "tc-other",
+            content: [{ type: "image", data: pngBase64(), mimeType: "image/png" }],
+          },
+        }],
+      },
+    }, {
+      messages: [{ role: "tool", tool_call_id: "tc1", content: "result" }],
+    });
+
+    expect(extracted).toEqual([]);
+  });
+});
 
 describe("deriveBridgeKey", () => {
   test("uses sessionId when provided", () => {
@@ -1263,7 +1322,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
   });
 
   test("adds inline images to the current user message selected context", () => {
-    const image = { data: new Uint8Array([1, 2, 3, 4]), mimeType: "image/png" };
+    const image = { data: pngBytes(), mimeType: "image/png" };
     const payload = buildCursorRequest("gpt-5", "system", "describe this", [], "conv-1", null, undefined, false, [], [], [image]);
     const req = decodeRunRequest(payload);
     const userAction = req.action.action.value as any;
@@ -1272,12 +1331,12 @@ describe("buildCursorRequest — turn reconstruction", () => {
     const selectedImage = userAction.userMessage.selectedContext.selectedImages[0];
     expect(selectedImage.mimeType).toBe("image/png");
     expect(selectedImage.dataOrBlobId.case).toBe("data");
-    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual([1, 2, 3, 4]);
+    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(pngBytes()));
     expect(selectedImage.uuid).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
   test("preserves images when reconstructing prior user turns", () => {
-    const image = { data: new Uint8Array([9, 8, 7]), mimeType: "image/jpeg" };
+    const image = { data: jpegBytes(), mimeType: "image/jpeg" };
     const turns = [{ ...turn("what is this?", [assistantStep("a photo")]), userImages: [image] }];
     const payload = buildCursorRequest("gpt-5", "system", "thanks", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
@@ -1286,7 +1345,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     const selectedImage = decoded[0].userMsg.selectedContext.selectedImages[0];
     expect(selectedImage.mimeType).toBe("image/jpeg");
     expect(selectedImage.dataOrBlobId.case).toBe("data");
-    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual([9, 8, 7]);
+    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(jpegBytes()));
   });
 
   test("no checkpoint, with assistant-text turns — reconstructs protobuf turns without inline fallback", () => {
@@ -1443,21 +1502,61 @@ describe("parseMessages — structured tool turns", () => {
     const parsed = parseMessages([
       { role: "user", content: [
         { type: "text", text: "describe this" },
-        { type: "image_url", image_url: { url: "data:image/png;base64,AQIDBA==" } },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
       ] },
     ]);
 
     expect(parsed.userText).toBe("describe this");
     expect(parsed.userImages).toHaveLength(1);
     expect(parsed.userImages[0].mimeType).toBe("image/png");
-    expect(Array.from(parsed.userImages[0].data)).toEqual([1, 2, 3, 4]);
+    expect(Array.from(parsed.userImages[0].data)).toEqual(Array.from(pngBytes()));
+  });
+
+  test("accepts image-only user prompts", () => {
+    const parsed = parseMessages([
+      { role: "user", content: [
+        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+      ] },
+    ]);
+
+    expect(parsed.userText).toBe("");
+    expect(parsed.userImages).toHaveLength(1);
+    expect(parsed.userImages[0].mimeType).toBe("image/png");
+  });
+
+  test("rejects remote OpenAI image_url values with an explicit error", () => {
+    expect(() => parseMessages([
+      { role: "user", content: [
+        { type: "text", text: "describe this" },
+        { type: "image_url", image_url: { url: "https://example.com/image.png" } },
+      ] },
+    ])).toThrow(/Remote image URLs are not supported/);
+  });
+
+  test("rejects user images that do not match Cursor CLI supported magic bytes", () => {
+    expect(() => parseMessages([
+      { role: "user", content: [
+        { type: "text", text: "describe this" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AQIDBA==" } },
+      ] },
+    ])).toThrow(/Unsupported image type/);
+  });
+
+  test("rejects oversized user images using Cursor CLI's processed payload cap", () => {
+    const bytes = new Uint8Array(5_242_881);
+    bytes.set([0xff, 0xd8, 0xff]);
+    expect(() => parseMessages([
+      { role: "user", content: [
+        { type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: "image/jpeg" },
+      ] },
+    ])).toThrow(/exceeds Cursor CLI's 5242880 byte limit/);
   });
 
   test("preserves images on completed prior turns", () => {
     const parsed = parseMessages([
       { role: "user", content: [
         { type: "text", text: "look" },
-        { type: "image_url", image_url: { url: "data:image/jpeg;base64,CQgH" } },
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${jpegBase64()}` } },
       ] },
       { role: "assistant", content: "done" },
       { role: "user", content: "next" },
@@ -1467,7 +1566,7 @@ describe("parseMessages — structured tool turns", () => {
     expect(parsed.turns).toHaveLength(1);
     expect(parsed.turns[0].userImages).toHaveLength(1);
     expect(parsed.turns[0].userImages?.[0].mimeType).toBe("image/jpeg");
-    expect(Array.from(parsed.turns[0].userImages![0].data)).toEqual([9, 8, 7]);
+    expect(Array.from(parsed.turns[0].userImages![0].data)).toEqual(Array.from(jpegBytes()));
   });
 
   test("extracts tool result images from inline tool content", () => {
@@ -1806,6 +1905,40 @@ async function postChatCompletion(port: number, body: Record<string, unknown>) {
 }
 
 describe("proxy integration — session handling", () => {
+  test("image-only user request forwards selected images through the HTTP proxy", async () => {
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
+      if (clientMessage.message.case === "runRequest") {
+        runRequests.push(clientMessage.message.value);
+        setTimeout(() => {
+          fake.emitServerMessage(makeTextDeltaMessage("image received"));
+          fake.emitServerMessage(makeCheckpointMessage());
+          fake.close(0);
+        }, 0);
+      }
+    }));
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: "session-user-image",
+      messages: [{ role: "user", content: [
+        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+      ] }],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("image received");
+    expect(runRequests).toHaveLength(1);
+    const userMessage = runRequests[0].action.action.value.userMessage;
+    expect(userMessage.text).toBe("");
+    expect(userMessage.selectedContext.selectedImages).toHaveLength(1);
+    const selectedImage = userMessage.selectedContext.selectedImages[0];
+    expect(selectedImage.mimeType).toBe("image/png");
+    expect(selectedImage.dataOrBlobId.case).toBe("data");
+    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(pngBytes()));
+  });
+
   test("tool-call continuation reuses the live bridge and commits a checkpoint when the turn completes", async () => {
     const runRequests: any[] = [];
     const execClientMessages: any[] = [];

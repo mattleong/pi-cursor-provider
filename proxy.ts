@@ -283,6 +283,54 @@ function truncateDebugString(value: string, max = 4000): string {
   return value.length > max ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>` : value;
 }
 
+function debugByteSummary(bytes: Uint8Array): { byteLength: number; sha256: string } {
+  return {
+    byteLength: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex").slice(0, 16),
+  };
+}
+
+function debugBase64ImageSummary(data: string): { base64Length: number; byteLength?: number; sha256?: string } {
+  const summary: { base64Length: number; byteLength?: number; sha256?: string } = { base64Length: data.length };
+  try {
+    const bytes = Buffer.from(data.replace(/\s/g, ""), "base64");
+    if (bytes.length > 0) Object.assign(summary, debugByteSummary(new Uint8Array(bytes)));
+  } catch {}
+  return summary;
+}
+
+function summarizeDebugImageUrl(url: string): unknown {
+  const trimmed = url.trim();
+  const match = trimmed.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
+  if (match) {
+    return {
+      mimeType: normalizeImageMimeType(match[1]!),
+      ...debugBase64ImageSummary(match[2]!),
+    };
+  }
+  return { url: trimmed.startsWith("data:image/") ? `<redacted data image ${trimmed.length} chars>` : truncateDebugString(trimmed) };
+}
+
+function summarizeDebugImageObject(value: Record<string, unknown>): unknown | undefined {
+  const imageUrl = value.image_url;
+  if (imageUrl && typeof imageUrl === "object") {
+    const url = (imageUrl as Record<string, unknown>).url;
+    if (typeof url === "string") return { type: value.type ?? "image_url", image_url: summarizeDebugImageUrl(url) };
+  }
+
+  const mimeType = typeof value.mimeType === "string" ? normalizeImageMimeType(value.mimeType) : undefined;
+  if (!mimeType?.startsWith("image/")) return undefined;
+  const data = value.data;
+  if (typeof data === "string") {
+    return { type: value.type, mimeType, ...debugBase64ImageSummary(data) };
+  }
+  if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    return { type: value.type, mimeType, ...debugByteSummary(bytes) };
+  }
+  return undefined;
+}
+
 function sanitizeForDebug(value: unknown): unknown {
   if (value == null) return value;
   if (typeof value === "string") return truncateDebugString(value);
@@ -291,8 +339,7 @@ function sanitizeForDebug(value: unknown): unknown {
     const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
     return {
       __type: value instanceof Uint8Array ? "Uint8Array" : "Buffer",
-      byteLength: bytes.length,
-      sha256: createHash("sha256").update(bytes).digest("hex").slice(0, 16),
+      ...debugByteSummary(bytes),
     };
   }
   if (Array.isArray(value)) return value.map((item) => sanitizeForDebug(item));
@@ -304,6 +351,8 @@ function sanitizeForDebug(value: unknown): unknown {
     };
   }
   if (typeof value === "object") {
+    const imageSummary = summarizeDebugImageObject(value as Record<string, unknown>);
+    if (imageSummary) return imageSummary;
     const entries = Object.entries(value as Record<string, unknown>).map(([key, inner]) => {
       if (key === "accessToken") return [key, "<redacted>"] as const;
       if (key === "data" && typeof inner === "string") return [key, `<redacted base64 ${inner.length} chars>`] as const;
@@ -1075,9 +1124,22 @@ function decodeBase64Image(data: string, mimeType: string, options: ImageDecodeO
 }
 
 function parseImageDataUrl(url: string, options: ImageDecodeOptions = {}): ParsedImageContent | undefined {
-  const match = url.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
-  if (!match) return undefined;
-  return decodeBase64Image(match[2]!, match[1]!, options);
+  const trimmed = url.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    throw new Error("Remote image URLs are not supported by pi-cursor-provider. Attach the image or send an inline data:image/...;base64,... URL.");
+  }
+  if (!trimmed.startsWith("data:")) {
+    throw new Error("Only inline data:image/...;base64,... image_url values are supported by pi-cursor-provider.");
+  }
+  const match = trimmed.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
+  if (!match) {
+    throw new Error("Unsupported image_url format. Expected data:image/...;base64,...");
+  }
+  const image = decodeBase64Image(match[2]!, match[1]!, options);
+  if (!image) {
+    throw new Error("Unsupported image_url MIME type. Expected data:image/...;base64,...");
+  }
+  return image;
 }
 
 function contentHasImageParts(content: OpenAIMessage["content"]): boolean {
@@ -1246,7 +1308,7 @@ export function parseMessages(messages: OpenAIMessage[], toolResultImagePayloads
 
     if (msg.role === "user") {
       finalizeCurrentTurn();
-      const userImages = imageContent(msg.content);
+      const userImages = imageContent(msg.content, { enforceCursorCliLimits: true });
       currentTurn = {
         userText: textContent(msg.content),
         steps: [],
