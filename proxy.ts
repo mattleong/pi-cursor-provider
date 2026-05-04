@@ -7,12 +7,11 @@
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { join as pathJoin } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -25,7 +24,6 @@ import {
   AgentConversationTurnStructureSchema,
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
-
   BackgroundShellSpawnResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
@@ -40,13 +38,14 @@ import {
   LsRejectedSchema,
   LsResultSchema,
   McpArgsSchema,
-  McpErrorSchema,
   McpImageContentSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
   McpToolCallSchema,
   McpToolDefinitionSchema,
+  McpToolErrorSchema,
+  McpToolResultSchema,
   McpToolResultContentItemSchema,
   McpToolsSchema,
   RequestedModelSchema,
@@ -78,16 +77,37 @@ import {
   type McpToolDefinition,
   type UserMessage,
 } from "./proto/agent_pb.js";
+import {
+  createConnectFrameParser,
+  frameConnectMessage,
+  parseConnectEndStream,
+  spawnBridge,
+  type BridgeFactory,
+  type BridgeHandle,
+} from "./bridge.js";
+import {
+  buildSelectedContextBlob,
+  decodeAvailableModelsResponse,
+  encodeAvailableModelsRequest,
+  type CursorModelParameter,
+  type CursorParameterizedModel,
+} from "./cursor-wire.js";
+export type {
+  CursorModelParameter,
+  CursorParameterizedModel,
+  CursorParameterizedVariant,
+} from "./cursor-wire.js";
 
-const CURSOR_API_URL = "https://api2.cursor.sh";
-const CONNECT_END_STREAM_FLAG = 0b00000010;
 // Cursor CLI's local-image path scales/compresses images to <= 5 MiB
 // and accepts only jpeg/png/gif/webp by magic bytes.
 const CURSOR_CLI_MAX_IMAGE_BYTES = 5_242_880;
-const CURSOR_SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const CURSOR_SUPPORTED_IMAGE_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
 const MAX_OPENAI_REQUEST_BODY_BYTES = 25 * 1024 * 1024;
-// Use import.meta.url for bridge path resolution (jiti supports this)
-const BRIDGE_PATH = pathResolve(dirname(fileURLToPath(import.meta.url)), "h2-bridge.mjs");
 
 // ── Types ──
 
@@ -132,6 +152,7 @@ interface ChatCompletionRequest {
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
   reasoning_effort?: string;
@@ -142,33 +163,6 @@ interface ChatCompletionRequest {
   cursor_tool_result_images?: CursorToolResultImagePayload[];
   cursor_requires_max_mode?: boolean;
   cursor_model_max_mode?: boolean;
-}
-
-export interface CursorModelParameter {
-  id: string;
-  value: string;
-}
-
-export interface CursorParameterizedVariant {
-  parameters: CursorModelParameter[];
-  isMaxMode: boolean;
-  isDefaultMaxConfig?: boolean;
-  isDefaultNonMaxConfig?: boolean;
-  displayName?: string;
-  displayNameOutsidePicker?: string;
-  variantStringRepresentation?: string;
-}
-
-export interface CursorParameterizedModel {
-  name: string;
-  clientDisplayName?: string;
-  serverModelName?: string;
-  supportsMaxMode?: boolean;
-  supportsNonMaxMode?: boolean;
-  supportsImages?: boolean;
-  contextTokenLimit?: number;
-  contextTokenLimitForMaxMode?: number;
-  variants: CursorParameterizedVariant[];
 }
 
 interface CursorRequestPayload {
@@ -185,20 +179,10 @@ interface PendingExec {
   decodedArgs: string;
 }
 
-interface BridgeHandle {
-  proc: Pick<ChildProcess, "kill">;
-  readonly alive: boolean;
-  write(data: Uint8Array): void;
-  end(): void;
-  onData(cb: (chunk: Buffer) => void): void;
-  onClose(cb: (code: number) => void): void;
-}
-
-export type BridgeFactory = (options: SpawnBridgeOptions) => BridgeHandle;
-
 interface ActiveBridge {
   bridge: BridgeHandle;
   heartbeatTimer: ReturnType<typeof setInterval>;
+  toolTimeoutTimer?: ReturnType<typeof setTimeout>;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
@@ -272,8 +256,17 @@ interface ParsedMessages {
 
 const activeBridges = new Map<string, ActiveBridge>();
 const conversationStates = new Map<string, StoredConversation>();
+const sessionLocks = new Map<string, Promise<void>>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
-let bridgeFactory: BridgeFactory = spawnBridge;
+const DEFAULT_ACTIVE_BRIDGE_TTL_MS = 15 * 60 * 1000;
+const configuredActiveBridgeTtlMs = Number(
+  process.env.PI_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? DEFAULT_ACTIVE_BRIDGE_TTL_MS,
+);
+const ACTIVE_BRIDGE_TTL_MS = Number.isFinite(configuredActiveBridgeTtlMs)
+  ? Math.max(1_000, configuredActiveBridgeTtlMs)
+  : DEFAULT_ACTIVE_BRIDGE_TTL_MS;
+const defaultBridgeFactory: BridgeFactory = (options) => spawnBridge(options, debugLog);
+let bridgeFactory: BridgeFactory = defaultBridgeFactory;
 let debugRequestCounter = 0;
 let debugLogFilePath: string | undefined;
 
@@ -283,7 +276,9 @@ function isProxyDebugEnabled(): boolean {
 }
 
 function truncateDebugString(value: string, max = 4000): string {
-  return value.length > max ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>` : value;
+  return value.length > max
+    ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>`
+    : value;
 }
 
 function debugByteSummary(bytes: Uint8Array): { byteLength: number; sha256: string } {
@@ -293,8 +288,14 @@ function debugByteSummary(bytes: Uint8Array): { byteLength: number; sha256: stri
   };
 }
 
-function debugBase64ImageSummary(data: string): { base64Length: number; byteLength?: number; sha256?: string } {
-  const summary: { base64Length: number; byteLength?: number; sha256?: string } = { base64Length: data.length };
+function debugBase64ImageSummary(data: string): {
+  base64Length: number;
+  byteLength?: number;
+  sha256?: string;
+} {
+  const summary: { base64Length: number; byteLength?: number; sha256?: string } = {
+    base64Length: data.length,
+  };
   try {
     const bytes = Buffer.from(data.replace(/\s/g, ""), "base64");
     if (bytes.length > 0) Object.assign(summary, debugByteSummary(new Uint8Array(bytes)));
@@ -311,17 +312,23 @@ function summarizeDebugImageUrl(url: string): unknown {
       ...debugBase64ImageSummary(match[2]!),
     };
   }
-  return { url: trimmed.startsWith("data:image/") ? `<redacted data image ${trimmed.length} chars>` : truncateDebugString(trimmed) };
+  return {
+    url: trimmed.startsWith("data:image/")
+      ? `<redacted data image ${trimmed.length} chars>`
+      : truncateDebugString(trimmed),
+  };
 }
 
 function summarizeDebugImageObject(value: Record<string, unknown>): unknown | undefined {
   const imageUrl = value.image_url;
   if (imageUrl && typeof imageUrl === "object") {
     const url = (imageUrl as Record<string, unknown>).url;
-    if (typeof url === "string") return { type: value.type ?? "image_url", image_url: summarizeDebugImageUrl(url) };
+    if (typeof url === "string")
+      return { type: value.type ?? "image_url", image_url: summarizeDebugImageUrl(url) };
   }
 
-  const mimeType = typeof value.mimeType === "string" ? normalizeImageMimeType(value.mimeType) : undefined;
+  const mimeType =
+    typeof value.mimeType === "string" ? normalizeImageMimeType(value.mimeType) : undefined;
   if (!mimeType?.startsWith("image/")) return undefined;
   const data = value.data;
   if (typeof data === "string") {
@@ -350,7 +357,9 @@ function sanitizeForDebug(value: unknown): unknown {
     return {
       __type: "Map",
       size: value.size,
-      entries: Array.from(value.entries()).slice(0, 20).map(([k, v]) => [sanitizeForDebug(k), sanitizeForDebug(v)]),
+      entries: Array.from(value.entries())
+        .slice(0, 20)
+        .map(([k, v]) => [sanitizeForDebug(k), sanitizeForDebug(v)]),
     };
   }
   if (typeof value === "object") {
@@ -358,7 +367,8 @@ function sanitizeForDebug(value: unknown): unknown {
     if (imageSummary) return imageSummary;
     const entries = Object.entries(value as Record<string, unknown>).map(([key, inner]) => {
       if (key === "accessToken") return [key, "<redacted>"] as const;
-      if (key === "data" && typeof inner === "string") return [key, `<redacted base64 ${inner.length} chars>`] as const;
+      if (key === "data" && typeof inner === "string")
+        return [key, `<redacted base64 ${inner.length} chars>`] as const;
       if (key === "url" && typeof inner === "string" && inner.startsWith("data:image/")) {
         return [key, `<redacted data image ${inner.length} chars>`] as const;
       }
@@ -384,7 +394,7 @@ function debugLog(event: string, data?: Record<string, unknown>): void {
     ts: new Date().toISOString(),
     pid: process.pid,
     event,
-    ...(data ? sanitizeForDebug(data) : {}),
+    ...(data ? (sanitizeForDebug(data) as Record<string, unknown>) : {}),
   });
   const file = getDebugLogFilePath();
   try {
@@ -407,105 +417,12 @@ export const __testInternals = {
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
-  bridgeFactory = factory ?? spawnBridge;
+  bridgeFactory = factory ?? defaultBridgeFactory;
 }
 
 let proxyServer: ReturnType<typeof createServer> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
-
-// ── Bridge spawn ──
-
-function lpEncode(data: Uint8Array): Buffer {
-  const buf = Buffer.alloc(4 + data.length);
-  buf.writeUInt32BE(data.length, 0);
-  buf.set(data, 4);
-  return buf;
-}
-
-function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
-  const frame = Buffer.alloc(5 + data.length);
-  frame[0] = flags;
-  frame.writeUInt32BE(data.length, 1);
-  frame.set(data, 5);
-  return frame;
-}
-
-interface SpawnBridgeOptions {
-  accessToken: string;
-  rpcPath: string;
-  url?: string;
-  unary?: boolean;
-}
-
-function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
-  debugLog("bridge.spawn", {
-    rpcPath: options.rpcPath,
-    url: options.url ?? CURSOR_API_URL,
-    unary: options.unary ?? false,
-    cursorClientVersion: process.env.PI_CURSOR_CLIENT_VERSION || "cli-2026.05.01-eea359f",
-  });
-  const proc = spawn(process.execPath, [BRIDGE_PATH], {
-    stdio: ["pipe", "pipe", "ignore"],
-  });
-
-  const config = JSON.stringify({
-    accessToken: options.accessToken,
-    url: options.url ?? CURSOR_API_URL,
-    path: options.rpcPath,
-    unary: options.unary ?? false,
-  });
-  proc.stdin!.write(lpEncode(new TextEncoder().encode(config)));
-
-  const cbs = {
-    data: null as ((chunk: Buffer) => void) | null,
-    close: null as ((code: number) => void) | null,
-  };
-
-  let exited = false;
-  let exitCode = 1;
-
-  let pending = Buffer.alloc(0);
-  proc.stdout!.on("data", (chunk: Buffer) => {
-    pending = Buffer.concat([pending, chunk]);
-    while (pending.length >= 4) {
-      const len = pending.readUInt32BE(0);
-      if (pending.length < 4 + len) break;
-      const payload = pending.subarray(4, 4 + len);
-      pending = pending.subarray(4 + len);
-      cbs.data?.(Buffer.from(payload));
-    }
-  });
-
-  proc.on("exit", (code) => {
-    exited = true;
-    exitCode = code ?? 1;
-    debugLog("bridge.exit", { rpcPath: options.rpcPath, exitCode });
-    cbs.close?.(exitCode);
-  });
-
-  return {
-    proc,
-    get alive() { return !exited; },
-    write(data: Uint8Array) {
-      try { proc.stdin!.write(lpEncode(data)); } catch {}
-    },
-    end() {
-      try {
-        proc.stdin!.write(lpEncode(new Uint8Array(0)));
-        proc.stdin!.end();
-      } catch {}
-    },
-    onData(cb: (chunk: Buffer) => void) { cbs.data = cb; },
-    onClose(cb: (code: number) => void) {
-      if (exited) {
-        queueMicrotask(() => cb(exitCode));
-      } else {
-        cbs.close = cb;
-      }
-    },
-  };
-}
 
 // ── Unary RPC (for model discovery) ──
 
@@ -526,14 +443,19 @@ export async function callCursorUnaryRpc(options: {
   return new Promise((resolve) => {
     let timedOut = false;
     const timeoutMs = options.timeoutMs ?? 5_000;
-    const timeout = timeoutMs > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          try { bridge.proc.kill(); } catch {}
-        }, timeoutMs)
-      : undefined;
+    const timeout =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            try {
+              bridge.proc.kill();
+            } catch {}
+          }, timeoutMs)
+        : undefined;
 
-    bridge.onData((chunk) => { chunks.push(Buffer.from(chunk)); });
+    bridge.onData((chunk) => {
+      chunks.push(Buffer.from(chunk));
+    });
     bridge.onClose((exitCode) => {
       if (timeout) clearTimeout(timeout);
       resolve({ body: Buffer.concat(chunks), exitCode, timedOut });
@@ -560,7 +482,8 @@ export interface CursorModel {
 }
 
 let cachedModels: { tokenHash: string; models: CursorModel[] } | null = null;
-let cachedParameterizedModels: { tokenHash: string; models: CursorParameterizedModel[] } | null = null;
+let cachedParameterizedModels: { tokenHash: string; models: CursorParameterizedModel[] } | null =
+  null;
 
 function tokenCacheHash(apiKey: string): string {
   return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
@@ -585,7 +508,9 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
         // Try Connect framing
         const body = decodeConnectUnaryBody(response.body);
         if (body) {
-          try { decoded = fromBinary(GetUsableModelsResponseSchema, body); } catch {}
+          try {
+            decoded = fromBinary(GetUsableModelsResponseSchema, body);
+          } catch {}
         }
       }
       if (decoded?.models?.length) {
@@ -597,7 +522,10 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
       }
     }
   } catch (err) {
-    console.error("[cursor-provider] Model discovery failed:", err instanceof Error ? err.message : err);
+    console.error(
+      "[cursor-provider] Model discovery failed:",
+      err instanceof Error ? err.message : err,
+    );
   }
   console.warn("[cursor-provider] Model discovery returned no models");
   return [];
@@ -608,7 +536,11 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
   let offset = 0;
   while (offset + 5 <= payload.length) {
     const flags = payload[offset]!;
-    const view = new DataView(payload.buffer, payload.byteOffset + offset, payload.byteLength - offset);
+    const view = new DataView(
+      payload.buffer,
+      payload.byteOffset + offset,
+      payload.byteLength - offset,
+    );
     const messageLength = view.getUint32(1, false);
     const frameEnd = offset + 5 + messageLength;
     if (frameEnd > payload.length) return null;
@@ -619,154 +551,9 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
   return null;
 }
 
-function encodeVarint(value: number): number[] {
-  const out: number[] = [];
-  let v = value >>> 0;
-  while (v >= 0x80) {
-    out.push((v & 0x7f) | 0x80);
-    v >>>= 7;
-  }
-  out.push(v);
-  return out;
-}
-
-function encodeBoolField(fieldNo: number, value: boolean): number[] {
-  return [...encodeVarint(fieldNo << 3), value ? 1 : 0];
-}
-
-function encodeAvailableModelsRequest(): Uint8Array {
-  // aiserver.v1.AvailableModelsRequest {
-  //   optional bool use_model_parameters = 5;
-  //   optional bool do_not_use_markdown = 7;
-  // }
-  return new Uint8Array([
-    ...encodeBoolField(5, true),
-    ...encodeBoolField(7, true),
-  ]);
-}
-
-interface WireReader {
-  bytes: Uint8Array;
-  offset: number;
-}
-
-function readVarint(reader: WireReader): number {
-  let result = 0;
-  let shift = 0;
-  while (reader.offset < reader.bytes.length) {
-    const byte = reader.bytes[reader.offset++]!;
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) return result >>> 0;
-    shift += 7;
-    if (shift > 35) throw new Error("varint too long");
-  }
-  throw new Error("unexpected EOF while reading varint");
-}
-
-function readLengthDelimited(reader: WireReader): Uint8Array {
-  const length = readVarint(reader);
-  const end = reader.offset + length;
-  if (end > reader.bytes.length) throw new Error("length-delimited field exceeds buffer");
-  const value = reader.bytes.subarray(reader.offset, end);
-  reader.offset = end;
-  return value;
-}
-
-function skipWireField(reader: WireReader, wireType: number): void {
-  switch (wireType) {
-    case 0:
-      readVarint(reader);
-      return;
-    case 1:
-      reader.offset += 8;
-      return;
-    case 2:
-      readLengthDelimited(reader);
-      return;
-    case 5:
-      reader.offset += 4;
-      return;
-    default:
-      throw new Error(`unsupported wire type ${wireType}`);
-  }
-}
-
-function decodeString(bytes: Uint8Array): string {
-  return new TextDecoder().decode(bytes);
-}
-
-function decodeModelParameter(bytes: Uint8Array): CursorModelParameter {
-  const reader: WireReader = { bytes, offset: 0 };
-  const parameter: CursorModelParameter = { id: "", value: "" };
-  while (reader.offset < bytes.length) {
-    const tag = readVarint(reader);
-    const fieldNo = tag >>> 3;
-    const wireType = tag & 0x7;
-    if (fieldNo === 1 && wireType === 2) parameter.id = decodeString(readLengthDelimited(reader));
-    else if (fieldNo === 2 && wireType === 2) parameter.value = decodeString(readLengthDelimited(reader));
-    else skipWireField(reader, wireType);
-  }
-  return parameter;
-}
-
-function decodeParameterizedVariant(bytes: Uint8Array): CursorParameterizedVariant {
-  const reader: WireReader = { bytes, offset: 0 };
-  const variant: CursorParameterizedVariant = { parameters: [], isMaxMode: false };
-  while (reader.offset < bytes.length) {
-    const tag = readVarint(reader);
-    const fieldNo = tag >>> 3;
-    const wireType = tag & 0x7;
-    if (fieldNo === 1 && wireType === 2) variant.parameters.push(decodeModelParameter(readLengthDelimited(reader)));
-    else if (fieldNo === 2 && wireType === 2) variant.displayName = decodeString(readLengthDelimited(reader));
-    else if (fieldNo === 8 && wireType === 2) variant.displayNameOutsidePicker = decodeString(readLengthDelimited(reader));
-    else if (fieldNo === 3 && wireType === 0) variant.isMaxMode = readVarint(reader) !== 0;
-    else if (fieldNo === 4 && wireType === 0) variant.isDefaultMaxConfig = readVarint(reader) !== 0;
-    else if (fieldNo === 5 && wireType === 0) variant.isDefaultNonMaxConfig = readVarint(reader) !== 0;
-    else if (fieldNo === 9 && wireType === 2) variant.variantStringRepresentation = decodeString(readLengthDelimited(reader));
-    else skipWireField(reader, wireType);
-  }
-  return variant;
-}
-
-function decodeParameterizedModel(bytes: Uint8Array): CursorParameterizedModel {
-  const reader: WireReader = { bytes, offset: 0 };
-  const model: CursorParameterizedModel = { name: "", variants: [] };
-  while (reader.offset < bytes.length) {
-    const tag = readVarint(reader);
-    const fieldNo = tag >>> 3;
-    const wireType = tag & 0x7;
-    if (fieldNo === 1 && wireType === 2) model.name = decodeString(readLengthDelimited(reader));
-    else if (fieldNo === 10 && wireType === 0) model.supportsImages = readVarint(reader) !== 0;
-    else if (fieldNo === 14 && wireType === 0) model.supportsMaxMode = readVarint(reader) !== 0;
-    else if (fieldNo === 19 && wireType === 0) model.supportsNonMaxMode = readVarint(reader) !== 0;
-    else if (fieldNo === 15 && wireType === 0) model.contextTokenLimit = readVarint(reader);
-    else if (fieldNo === 16 && wireType === 0) model.contextTokenLimitForMaxMode = readVarint(reader);
-    else if (fieldNo === 17 && wireType === 2) model.clientDisplayName = decodeString(readLengthDelimited(reader));
-    else if (fieldNo === 18 && wireType === 2) model.serverModelName = decodeString(readLengthDelimited(reader));
-    else if (fieldNo === 30 && wireType === 2) model.variants.push(decodeParameterizedVariant(readLengthDelimited(reader)));
-    else skipWireField(reader, wireType);
-  }
-  return model;
-}
-
-function decodeAvailableModelsResponse(bytes: Uint8Array): CursorParameterizedModel[] {
-  const reader: WireReader = { bytes, offset: 0 };
-  const models: CursorParameterizedModel[] = [];
-  while (reader.offset < bytes.length) {
-    const tag = readVarint(reader);
-    const fieldNo = tag >>> 3;
-    const wireType = tag & 0x7;
-    if (fieldNo === 2 && wireType === 2) {
-      const model = decodeParameterizedModel(readLengthDelimited(reader));
-      if (model.name) models.push(model);
-    } else {
-      skipWireField(reader, wireType);
-    }
-  }
-  return models;
-}
-
-export async function getCursorParameterizedModels(apiKey: string): Promise<CursorParameterizedModel[]> {
+export async function getCursorParameterizedModels(
+  apiKey: string,
+): Promise<CursorParameterizedModel[]> {
   const tokenHash = tokenCacheHash(apiKey);
   if (cachedParameterizedModels?.tokenHash === tokenHash) return cachedParameterizedModels.models;
   try {
@@ -781,7 +568,10 @@ export async function getCursorParameterizedModels(apiKey: string): Promise<Curs
     cachedParameterizedModels = { tokenHash, models };
     return models;
   } catch (err) {
-    console.error("[cursor-provider] Parameterized model discovery failed:", err instanceof Error ? err.message : err);
+    console.error(
+      "[cursor-provider] Parameterized model discovery failed:",
+      err instanceof Error ? err.message : err,
+    );
     return [];
   }
 }
@@ -817,9 +607,7 @@ export function getProxyPort(): number | undefined {
   return proxyPort;
 }
 
-export async function startProxy(
-  getAccessToken: () => Promise<string>,
-): Promise<number> {
+export async function startProxy(getAccessToken: () => Promise<string>): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
   if (proxyServer && proxyPort) return proxyPort;
 
@@ -827,7 +615,12 @@ export async function startProxy(
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://localhost`);
       const requestId = nextDebugRequestId();
-      debugLog("http.request", { requestId, method: req.method, pathname: url.pathname, headers: req.headers });
+      debugLog("http.request", {
+        requestId,
+        method: req.method,
+        pathname: url.pathname,
+        headers: req.headers,
+      });
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -842,19 +635,28 @@ export async function startProxy(
           debugLog("http.chat.body", { requestId, body: parsed });
           if (!proxyAccessTokenProvider) throw new Error("No access token provider");
           const accessToken = await proxyAccessTokenProvider();
-          await handleChatCompletion(parsed, accessToken, req, res, requestId);
+          await withSessionLock(deriveRequestLockKey(parsed), () =>
+            handleChatCompletion(parsed, accessToken, req, res, requestId),
+          );
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          const invalidRequest = err instanceof SyntaxError || message.startsWith("Request body exceeds ");
-          debugLog("http.chat.error", { requestId, message, stack: err instanceof Error ? err.stack : undefined });
+          const invalidRequest =
+            err instanceof SyntaxError || message.startsWith("Request body exceeds ");
+          debugLog("http.chat.error", {
+            requestId,
+            message,
+            stack: err instanceof Error ? err.stack : undefined,
+          });
           res.writeHead(invalidRequest ? 400 : 500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            error: {
-              message,
-              type: invalidRequest ? "invalid_request_error" : "server_error",
-              code: invalidRequest ? "invalid_request" : "internal_error",
-            },
-          }));
+          res.end(
+            JSON.stringify({
+              error: {
+                message,
+                type: invalidRequest ? "invalid_request_error" : "server_error",
+                code: invalidRequest ? "invalid_request" : "internal_error",
+              },
+            }),
+          );
         }
         return;
       }
@@ -868,7 +670,10 @@ export async function startProxy(
       if (typeof addr === "object" && addr) {
         proxyPort = addr.port;
         proxyServer = server;
-        debugLog("proxy.start", { port: proxyPort, debugLogFile: isProxyDebugEnabled() ? getDebugLogFilePath() : undefined });
+        debugLog("proxy.start", {
+          port: proxyPort,
+          debugLogFile: isProxyDebugEnabled() ? getDebugLogFilePath() : undefined,
+        });
         resolve(proxyPort);
       } else {
         reject(new Error("Failed to bind proxy"));
@@ -877,8 +682,30 @@ export async function startProxy(
   });
 }
 
+function clearActiveBridgeToolTimeout(active: ActiveBridge | undefined): void {
+  if (active?.toolTimeoutTimer) clearTimeout(active.toolTimeoutTimer);
+}
+
+function removeActiveBridge(bridgeKey: string): void {
+  clearActiveBridgeToolTimeout(activeBridges.get(bridgeKey));
+  activeBridges.delete(bridgeKey);
+}
+
+function setActiveBridge(bridgeKey: string, active: Omit<ActiveBridge, "toolTimeoutTimer">): void {
+  clearActiveBridgeToolTimeout(activeBridges.get(bridgeKey));
+  const toolTimeoutTimer = setTimeout(() => {
+    debugLog("bridge.active_ttl_expired", { bridgeKey, ttlMs: ACTIVE_BRIDGE_TTL_MS });
+    cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+  }, ACTIVE_BRIDGE_TTL_MS);
+  toolTimeoutTimer.unref?.();
+  activeBridges.set(bridgeKey, { ...active, toolTimeoutTimer });
+}
+
 export function cleanupAllSessionState(): void {
-  debugLog("session.cleanup_all", { activeBridgeCount: activeBridges.size, conversationCount: conversationStates.size });
+  debugLog("session.cleanup_all", {
+    activeBridgeCount: activeBridges.size,
+    conversationCount: conversationStates.size,
+  });
   for (const [bridgeKey, active] of activeBridges) {
     cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
   }
@@ -928,7 +755,13 @@ export function evictStaleConversations(now = Date.now()): void {
 }
 
 function stableNormalizeForHash(value: unknown): unknown {
-  if (value == null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (
+    value == null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  )
+    return value;
   if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
     const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
     return { __bytes: debugByteSummary(bytes) };
@@ -983,20 +816,26 @@ function clearStoredCheckpoint(stored: StoredConversation, clearBlobStore = fals
   if (clearBlobStore) stored.blobStore.clear();
 }
 
-function discardStaleCheckpointIfNeeded(stored: StoredConversation, turns: ParsedTurn[], requestId: string, convKey: string): void {
+function discardStaleCheckpointIfNeeded(
+  stored: StoredConversation,
+  turns: ParsedTurn[],
+  requestId: string,
+  convKey: string,
+): void {
   if (!stored.checkpoint) return;
 
   const currentTurnCount = turns.length;
   const currentHistoryFingerprint = fingerprintCompletedTurns(turns);
   const storedCheckpointTurnCount = stored.checkpointTurnCount;
   const storedCheckpointHistoryFingerprint = stored.checkpointHistoryFingerprint;
-  const reason = storedCheckpointTurnCount === undefined || !storedCheckpointHistoryFingerprint
-    ? "missing_checkpoint_metadata"
-    : storedCheckpointTurnCount !== currentTurnCount
-      ? "completed_turn_count_mismatch"
-      : storedCheckpointHistoryFingerprint !== currentHistoryFingerprint
-        ? "completed_history_fingerprint_mismatch"
-        : undefined;
+  const reason =
+    storedCheckpointTurnCount === undefined || !storedCheckpointHistoryFingerprint
+      ? "missing_checkpoint_metadata"
+      : storedCheckpointTurnCount !== currentTurnCount
+        ? "completed_turn_count_mismatch"
+        : storedCheckpointHistoryFingerprint !== currentHistoryFingerprint
+          ? "completed_history_fingerprint_mismatch"
+          : undefined;
 
   if (!reason) return;
 
@@ -1063,6 +902,83 @@ export function resolveRequestedModelId(
   return resolveModelId(model, reasoningEffort);
 }
 
+function deriveRequestLockKey(body: ChatCompletionRequest): string {
+  const sessionId = derivePiSessionId(body);
+  if (sessionId) return `session:${sessionId}`;
+  return `anonymous:${deriveConversationKey(body.messages)}`;
+}
+
+async function withSessionLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = sessionLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = previous.catch(() => {}).then(() => current);
+  sessionLocks.set(key, chained);
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (sessionLocks.get(key) === chained) sessionLocks.delete(key);
+  }
+}
+
+function writeJsonError(
+  res: ServerResponse,
+  statusCode: number,
+  message: string,
+  type: string,
+  code?: string,
+): void {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: { message, type, ...(code ? { code } : {}) } }));
+}
+
+function rejectUnsupportedRequestParameters(
+  body: ChatCompletionRequest,
+  res: ServerResponse,
+  requestId: string,
+): boolean {
+  const raw = body as unknown as Record<string, unknown>;
+  // Pi's OpenAI-compatible provider sends max_tokens for normal Cursor requests.
+  // Cursor's agent protocol controls output budgeting server-side here, so accept
+  // max_tokens/max_completion_tokens as no-op compatibility fields rather than
+  // breaking every request. Sampling controls remain rejected so users are not
+  // misled into thinking they are honored.
+  const unsupported = [["temperature", raw.temperature]].filter(([, value]) => value !== undefined);
+  if (unsupported.length === 0) return false;
+
+  debugLog("chat.unsupported_parameters", {
+    requestId,
+    parameters: unsupported.map(([name]) => name),
+  });
+  writeJsonError(
+    res,
+    400,
+    `Unsupported Cursor proxy parameter(s): ${unsupported.map(([name]) => name).join(", ")}`,
+    "invalid_request_error",
+    "unsupported_parameter",
+  );
+  return true;
+}
+
+function resolveToolsForToolChoice(
+  tools: OpenAIToolDef[],
+  toolChoice: unknown,
+): { tools: OpenAIToolDef[] } | { error: string } {
+  if (toolChoice == null || toolChoice === "auto") return { tools };
+  if (toolChoice === "none") return { tools: [] };
+  if (
+    typeof toolChoice === "object" &&
+    toolChoice &&
+    (toolChoice as Record<string, unknown>).type === "none"
+  )
+    return { tools: [] };
+  return { error: "Only tool_choice 'auto' and 'none' are supported by pi-cursor-provider." };
+}
+
 async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
@@ -1076,7 +992,14 @@ async function handleChatCompletion(
   } catch (error) {
     res.statusCode = 400;
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ error: { message: error instanceof Error ? error.message : String(error), type: "invalid_request_error" } }));
+    res.end(
+      JSON.stringify({
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          type: "invalid_request_error",
+        },
+      }),
+    );
     return;
   }
   const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
@@ -1089,10 +1012,24 @@ async function handleChatCompletion(
       resolvedModelId: modelId,
     });
   }
-  const maxMode = typeof body.cursor_model_max_mode === "boolean"
-    ? body.cursor_model_max_mode
-    : body.cursor_requires_max_mode === true;
-  const tools = body.tools ?? [];
+  const maxMode =
+    typeof body.cursor_model_max_mode === "boolean"
+      ? body.cursor_model_max_mode
+      : body.cursor_requires_max_mode === true;
+  if (rejectUnsupportedRequestParameters(body, res, requestId)) return;
+  const toolResolution = resolveToolsForToolChoice(body.tools ?? [], body.tool_choice);
+  if ("error" in toolResolution) {
+    debugLog("chat.unsupported_tool_choice", { requestId, tool_choice: body.tool_choice });
+    writeJsonError(
+      res,
+      400,
+      toolResolution.error,
+      "invalid_request_error",
+      "unsupported_tool_choice",
+    );
+    return;
+  }
+  const tools = toolResolution.tools;
 
   debugLog("chat.parsed_messages", {
     requestId,
@@ -1114,20 +1051,27 @@ async function handleChatCompletion(
   if (!userText && userImages.length === 0 && toolResults.length === 0) {
     debugLog("chat.no_user_message", { requestId, messages: body.messages });
     res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "No user message found", type: "invalid_request_error" } }));
+    res.end(
+      JSON.stringify({
+        error: { message: "No user message found", type: "invalid_request_error" },
+      }),
+    );
     return;
   }
 
   if (body.stream === false && tools.length > 0) {
     debugLog("chat.nonstream_tools_unsupported", { requestId, toolCount: tools.length });
     res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      error: {
-        message: "stream:false with tools is not supported by pi-cursor-provider; use streaming tool calls instead.",
-        type: "invalid_request_error",
-        code: "nonstream_tools_unsupported",
-      },
-    }));
+    res.end(
+      JSON.stringify({
+        error: {
+          message:
+            "stream:false with tools is not supported by pi-cursor-provider; use streaming tool calls instead.",
+          type: "invalid_request_error",
+          code: "nonstream_tools_unsupported",
+        },
+      }),
+    );
     return;
   }
 
@@ -1145,10 +1089,26 @@ async function handleChatCompletion(
 
   if (toolResults.length > 0) {
     if (activeBridge) {
-      debugLog("chat.resume_tool_results", { requestId, bridgeKey, toolResults, pendingExecs: activeBridge.pendingExecs });
-      activeBridges.delete(bridgeKey);
+      debugLog("chat.resume_tool_results", {
+        requestId,
+        bridgeKey,
+        toolResults,
+        pendingExecs: activeBridge.pendingExecs,
+      });
+      removeActiveBridge(bridgeKey);
       if (activeBridge.bridge.alive) {
-        handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, body.stream !== false, requestId);
+        handleToolResultResume(
+          activeBridge,
+          toolResults,
+          modelId,
+          bridgeKey,
+          convKey,
+          turns,
+          req,
+          res,
+          body.stream !== false,
+          requestId,
+        );
         return;
       }
       clearInterval(activeBridge.heartbeatTimer);
@@ -1157,20 +1117,23 @@ async function handleChatCompletion(
 
     debugLog("chat.lost_tool_continuation", { requestId, bridgeKey, convKey, toolResults });
     res.writeHead(409, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      error: {
-        message: "Cursor tool continuation was lost because the live upstream bridge is no longer available. Retry from before the tool call or start a new turn.",
-        type: "invalid_state_error",
-        code: "tool_continuation_lost",
-      },
-    }));
+    res.end(
+      JSON.stringify({
+        error: {
+          message:
+            "Cursor tool continuation was lost because the live upstream bridge is no longer available. Retry from before the tool call or start a new turn.",
+          type: "invalid_state_error",
+          code: "tool_continuation_lost",
+        },
+      }),
+    );
     return;
   }
 
   if (activeBridge && activeBridges.has(bridgeKey)) {
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    removeActiveBridge(bridgeKey);
   }
 
   let stored = conversationStates.get(convKey);
@@ -1191,16 +1154,24 @@ async function handleChatCompletion(
   discardStaleCheckpointIfNeeded(stored, turns, requestId, convKey);
 
   const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
+  const effectiveUserText =
+    userText || (toolResults.length > 0 ? toolResults.map((r) => r.content).join("\n") : "");
   const effectiveUserImages = userText || userImages.length > 0 ? userImages : [];
   if (!stored.checkpoint) {
     debugLog("chat.no_checkpoint", { requestId, convKey, conversationId: stored.conversationId });
   }
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
-    stored.conversationId, stored.checkpoint, stored.blobStore, maxMode, body.cursor_model_parameters, mcpTools, effectiveUserImages,
+    modelId,
+    systemPrompt,
+    effectiveUserText,
+    turns,
+    stored.conversationId,
+    stored.checkpoint,
+    stored.blobStore,
+    maxMode,
+    body.cursor_model_parameters,
+    mcpTools,
+    effectiveUserImages,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -1220,10 +1191,31 @@ async function handleChatCompletion(
 
   if (body.stream === false) {
     debugLog("chat.dispatch_nonstream", { requestId, convKey });
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res, requestId);
+    await handleNonStreamingResponse(
+      payload,
+      accessToken,
+      modelId,
+      convKey,
+      turns,
+      currentTurn,
+      req,
+      res,
+      requestId,
+    );
   } else {
     debugLog("chat.dispatch_stream", { requestId, bridgeKey, convKey });
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, requestId);
+    handleStreamingResponse(
+      payload,
+      accessToken,
+      modelId,
+      bridgeKey,
+      convKey,
+      turns,
+      currentTurn,
+      req,
+      res,
+      requestId,
+    );
   }
 }
 
@@ -1232,7 +1224,10 @@ async function handleChatCompletion(
 function textContent(content: OpenAIMessage["content"]): string {
   if (content == null) return "";
   if (typeof content === "string") return content;
-  return content.filter((p) => p.type === "text" && p.text).map((p) => p.text!).join("\n");
+  return content
+    .filter((p) => p.type === "text" && p.text)
+    .map((p) => p.text!)
+    .join("\n");
 }
 
 interface ImageDecodeOptions {
@@ -1245,16 +1240,38 @@ function normalizeImageMimeType(mimeType: string): string {
 }
 
 function sniffCursorImageMimeType(bytes: Uint8Array): string | undefined {
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
-  if (bytes.length >= 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
-  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
+    return "image/jpeg";
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  )
+    return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46)
+    return "image/gif";
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  )
+    return "image/webp";
   return undefined;
 }
 
-function validateCursorCliImageLimits(bytes: Uint8Array, mimeType: string): string {
+function validateCursorCliImageLimits(bytes: Uint8Array): string {
   if (bytes.length > CURSOR_CLI_MAX_IMAGE_BYTES) {
-    throw new Error(`Image exceeds Cursor CLI's ${CURSOR_CLI_MAX_IMAGE_BYTES} byte limit after processing.`);
+    throw new Error(
+      `Image exceeds Cursor CLI's ${CURSOR_CLI_MAX_IMAGE_BYTES} byte limit after processing.`,
+    );
   }
   const sniffedMimeType = sniffCursorImageMimeType(bytes);
   if (!sniffedMimeType || !CURSOR_SUPPORTED_IMAGE_MIME_TYPES.has(sniffedMimeType)) {
@@ -1263,7 +1280,11 @@ function validateCursorCliImageLimits(bytes: Uint8Array, mimeType: string): stri
   return sniffedMimeType;
 }
 
-function decodeBase64Image(data: string, mimeType: string, options: ImageDecodeOptions = {}): ParsedImageContent | undefined {
+function decodeBase64Image(
+  data: string,
+  mimeType: string,
+  options: ImageDecodeOptions = {},
+): ParsedImageContent | undefined {
   const normalizedMimeType = normalizeImageMimeType(mimeType);
   if (!normalizedMimeType.startsWith("image/")) return undefined;
   const base64 = data.replace(/\s/g, "");
@@ -1271,18 +1292,25 @@ function decodeBase64Image(data: string, mimeType: string, options: ImageDecodeO
   const bytes = new Uint8Array(Buffer.from(base64, "base64"));
   if (bytes.length === 0) return undefined;
   const finalMimeType = options.enforceCursorCliLimits
-    ? validateCursorCliImageLimits(bytes, normalizedMimeType)
+    ? validateCursorCliImageLimits(bytes)
     : normalizedMimeType;
   return { data: bytes, mimeType: finalMimeType };
 }
 
-function parseImageDataUrl(url: string, options: ImageDecodeOptions = {}): ParsedImageContent | undefined {
+function parseImageDataUrl(
+  url: string,
+  options: ImageDecodeOptions = {},
+): ParsedImageContent | undefined {
   const trimmed = url.trim();
   if (/^https?:\/\//i.test(trimmed)) {
-    throw new Error("Remote image URLs are not supported by pi-cursor-provider. Attach the image or send an inline data:image/...;base64,... URL.");
+    throw new Error(
+      "Remote image URLs are not supported by pi-cursor-provider. Attach the image or send an inline data:image/...;base64,... URL.",
+    );
   }
   if (!trimmed.startsWith("data:")) {
-    throw new Error("Only inline data:image/...;base64,... image_url values are supported by pi-cursor-provider.");
+    throw new Error(
+      "Only inline data:image/...;base64,... image_url values are supported by pi-cursor-provider.",
+    );
   }
   const match = trimmed.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
   if (!match) {
@@ -1296,13 +1324,20 @@ function parseImageDataUrl(url: string, options: ImageDecodeOptions = {}): Parse
 }
 
 function contentHasImageParts(content: OpenAIMessage["content"]): boolean {
-  return Array.isArray(content) && content.some((part) =>
-    (part.type === "image_url" && !!part.image_url?.url) ||
-    (part.type === "image" && !!part.data && !!part.mimeType),
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (part) =>
+        (part.type === "image_url" && !!part.image_url?.url) ||
+        (part.type === "image" && !!part.data && !!part.mimeType),
+    )
   );
 }
 
-function imageContent(content: OpenAIMessage["content"], options: ImageDecodeOptions = {}): ParsedImageContent[] {
+function imageContent(
+  content: OpenAIMessage["content"],
+  options: ImageDecodeOptions = {},
+): ParsedImageContent[] {
   if (content == null || typeof content === "string") return [];
   const images: ParsedImageContent[] = [];
   for (const part of content) {
@@ -1321,7 +1356,9 @@ function imageKey(image: ParsedImageContent): string {
   return `${image.mimeType}:${createHash("sha256").update(image.data).digest("hex")}`;
 }
 
-function mergeImages(...groups: Array<ParsedImageContent[] | undefined>): ParsedImageContent[] | undefined {
+function mergeImages(
+  ...groups: Array<ParsedImageContent[] | undefined>
+): ParsedImageContent[] | undefined {
   const merged: ParsedImageContent[] = [];
   const seen = new Set<string>();
   for (const group of groups) {
@@ -1335,23 +1372,32 @@ function mergeImages(...groups: Array<ParsedImageContent[] | undefined>): Parsed
   return merged.length > 0 ? merged : undefined;
 }
 
-function parseToolResultImagePayloads(payloads: CursorToolResultImagePayload[] | undefined): Map<string, ParsedImageContent[]> {
+function parseToolResultImagePayloads(
+  payloads: CursorToolResultImagePayload[] | undefined,
+): Map<string, ParsedImageContent[]> {
   const byToolCallId = new Map<string, ParsedImageContent[]>();
   for (const payload of payloads ?? []) {
     if (!payload?.toolCallId || !Array.isArray(payload.images)) continue;
     const images = payload.images
-      .map((image) => decodeBase64Image(image.data, image.mimeType, { enforceCursorCliLimits: true }))
+      .map((image) =>
+        decodeBase64Image(image.data, image.mimeType, { enforceCursorCliLimits: true }),
+      )
       .filter((image): image is ParsedImageContent => !!image);
     if (images.length === 0) continue;
-    byToolCallId.set(payload.toolCallId, mergeImages(byToolCallId.get(payload.toolCallId), images) ?? []);
+    byToolCallId.set(
+      payload.toolCallId,
+      mergeImages(byToolCallId.get(payload.toolCallId), images) ?? [],
+    );
   }
   return byToolCallId;
 }
 
 function isSyntheticToolResultImageMessage(msg: OpenAIMessage): boolean {
-  return msg.role === "user"
-    && textContent(msg.content).trim() === "Attached image(s) from tool result:"
-    && contentHasImageParts(msg.content);
+  return (
+    msg.role === "user" &&
+    textContent(msg.content).trim() === "Attached image(s) from tool result:" &&
+    contentHasImageParts(msg.content)
+  );
 }
 
 function attachSyntheticToolResultImages(turn: ParsedTurn, images: ParsedImageContent[]): void {
@@ -1361,7 +1407,9 @@ function attachSyntheticToolResultImages(turn: ParsedTurn, images: ParsedImageCo
     .filter((step) => !step.result!.images?.length);
   if (resultSteps.length === 0) return;
 
-  const imageOnlySteps = resultSteps.filter((step) => step.result!.content.trim() === "(see attached image)");
+  const imageOnlySteps = resultSteps.filter(
+    (step) => step.result!.content.trim() === "(see attached image)",
+  );
   if (imageOnlySteps.length === images.length) {
     imageOnlySteps.forEach((step, index) => {
       step.result = { ...step.result!, content: "", images: [images[index]!] };
@@ -1377,7 +1425,10 @@ function attachSyntheticToolResultImages(turn: ParsedTurn, images: ParsedImageCo
   };
 }
 
-function normalizeToolResultText(content: string, images: ParsedImageContent[] | undefined): string {
+function normalizeToolResultText(
+  content: string,
+  images: ParsedImageContent[] | undefined,
+): string {
   return images?.length && content.trim() === "(see attached image)" ? "" : content;
 }
 
@@ -1415,11 +1466,13 @@ function appendAssistantTextToTurn(turn: ParsedTurn, text: string): void {
   }
 }
 
-function stripTurnRuntimeState(turn: ParsedTurn & {
-  toolCallById?: Map<string, ParsedToolCallStep>;
-  sawToolResult?: boolean;
-  sawAssistantAfterToolResult?: boolean;
-}): ParsedTurn {
+function stripTurnRuntimeState(
+  turn: ParsedTurn & {
+    toolCallById?: Map<string, ParsedToolCallStep>;
+    sawToolResult?: boolean;
+    sawAssistantAfterToolResult?: boolean;
+  },
+): ParsedTurn {
   return {
     userText: turn.userText,
     steps: turn.steps,
@@ -1427,22 +1480,29 @@ function stripTurnRuntimeState(turn: ParsedTurn & {
   };
 }
 
-export function parseMessages(messages: OpenAIMessage[], toolResultImagePayloads?: CursorToolResultImagePayload[]): ParsedMessages {
+export function parseMessages(
+  messages: OpenAIMessage[],
+  toolResultImagePayloads?: CursorToolResultImagePayload[],
+): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const turns: ParsedTurn[] = [];
   const toolResultImagesById = parseToolResultImagePayloads(toolResultImagePayloads);
 
   debugLog("parse_messages.start", { messages });
 
-  const systemParts = messages.filter((m) => m.role === "system").map((m) => textContent(m.content));
+  const systemParts = messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content));
   if (systemParts.length > 0) systemPrompt = systemParts.join("\n");
 
   const nonSystem = messages.filter((m) => m.role !== "system");
-  let currentTurn: (ParsedTurn & {
-    toolCallById: Map<string, ParsedToolCallStep>;
-    sawToolResult: boolean;
-    sawAssistantAfterToolResult: boolean;
-  }) | null = null;
+  let currentTurn:
+    | (ParsedTurn & {
+        toolCallById: Map<string, ParsedToolCallStep>;
+        sawToolResult: boolean;
+        sawAssistantAfterToolResult: boolean;
+      })
+    | null = null;
 
   const finalizeCurrentTurn = () => {
     if (!currentTurn) return;
@@ -1452,9 +1512,14 @@ export function parseMessages(messages: OpenAIMessage[], toolResultImagePayloads
 
   for (const msg of nonSystem) {
     if (currentTurn && isSyntheticToolResultImageMessage(msg)) {
-      const hasMetadataImages = currentTurn.steps.some((step) => step.kind === "toolCall" && step.result?.images?.length);
+      const hasMetadataImages = currentTurn.steps.some(
+        (step) => step.kind === "toolCall" && step.result?.images?.length,
+      );
       if (!hasMetadataImages) {
-        attachSyntheticToolResultImages(currentTurn, imageContent(msg.content, { enforceCursorCliLimits: true }));
+        attachSyntheticToolResultImages(
+          currentTurn,
+          imageContent(msg.content, { enforceCursorCliLimits: true }),
+        );
       }
       continue;
     }
@@ -1555,9 +1620,10 @@ export function parseMessages(messages: OpenAIMessage[], toolResultImagePayloads
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
     const fn = t.function;
-    const jsonSchema: JsonValue = fn.parameters && typeof fn.parameters === "object"
-      ? (fn.parameters as JsonValue)
-      : { type: "object", properties: {}, required: [] };
+    const jsonSchema: JsonValue =
+      fn.parameters && typeof fn.parameters === "object"
+        ? (fn.parameters as JsonValue)
+        : { type: "object", properties: {}, required: [] };
     const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
     return create(McpToolDefinitionSchema, {
       name: fn.name,
@@ -1599,23 +1665,6 @@ function encodeMcpArgsMap(args: Record<string, unknown>): Record<string, Uint8Ar
   return encoded;
 }
 
-// No generated schema for selectedContextBlob; emit raw wire format for the two
-// fields Cursor actually reads: field 1 (repeated bytes) rootPromptMessagesJson
-// refs, field 22 (string) clientName. blobId.length < 128 (SHA256 = 32 bytes).
-function buildSelectedContextBlob(rootPromptBlobIds: Uint8Array[], clientName: string): Uint8Array {
-  const parts: Uint8Array[] = [];
-  for (const blobId of rootPromptBlobIds) {
-    parts.push(new Uint8Array([0x0A, blobId.length, ...blobId]));
-  }
-  const clientBytes = new TextEncoder().encode(clientName);
-  parts.push(new Uint8Array([0xB2, 0x01, clientBytes.length, ...clientBytes]));
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const p of parts) { result.set(p, offset); offset += p.length; }
-  return result;
-}
-
 function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint8Array {
   const id = new Uint8Array(createHash("sha256").update(data).digest());
   blobStore.set(Buffer.from(id).toString("hex"), data);
@@ -1625,14 +1674,20 @@ function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint
 function createSelectedImages(images: ParsedImageContent[]) {
   // Matches Cursor CLI's ACP image path for inline image data:
   // new SelectedImage({ dataOrBlobId: { case: "data", value }, uuid, mimeType })
-  return images.map((image) => create(SelectedImageSchema, {
-    uuid: crypto.randomUUID(),
-    mimeType: image.mimeType,
-    dataOrBlobId: { case: "data", value: image.data },
-  }));
+  return images.map((image) =>
+    create(SelectedImageSchema, {
+      uuid: crypto.randomUUID(),
+      mimeType: image.mimeType,
+      dataOrBlobId: { case: "data", value: image.data },
+    }),
+  );
 }
 
-function createUserMessage(text: string, selectedContextBlob: Uint8Array, images: ParsedImageContent[] = []): UserMessage {
+function createUserMessage(
+  text: string,
+  selectedContextBlob: Uint8Array,
+  images: ParsedImageContent[] = [],
+): UserMessage {
   const messageId = crypto.randomUUID();
   return create(UserMessageSchema, {
     text,
@@ -1649,37 +1704,46 @@ function createUserMessage(text: string, selectedContextBlob: Uint8Array, images
 function buildMcpSuccessContent(result: ParsedToolResult) {
   const content = [];
   if (result.content.length > 0) {
-    content.push(create(McpToolResultContentItemSchema, {
-      content: {
-        case: "text",
-        value: create(McpTextContentSchema, { text: result.content }),
-      },
-    }));
+    content.push(
+      create(McpToolResultContentItemSchema, {
+        content: {
+          case: "text",
+          value: create(McpTextContentSchema, { text: result.content }),
+        },
+      }),
+    );
   }
   for (const image of result.images ?? []) {
-    content.push(create(McpToolResultContentItemSchema, {
-      content: {
-        case: "image",
-        value: create(McpImageContentSchema, { data: image.data, mimeType: image.mimeType }),
-      },
-    }));
+    content.push(
+      create(McpToolResultContentItemSchema, {
+        content: {
+          case: "image",
+          value: create(McpImageContentSchema, { data: image.data, mimeType: image.mimeType }),
+        },
+      }),
+    );
   }
   if (content.length === 0) {
-    content.push(create(McpToolResultContentItemSchema, {
-      content: { case: "text", value: create(McpTextContentSchema, { text: "" }) },
-    }));
+    content.push(
+      create(McpToolResultContentItemSchema, {
+        content: { case: "text", value: create(McpTextContentSchema, { text: "" }) },
+      }),
+    );
   }
   return content;
 }
 
 function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
   if (step.kind === "assistantText") {
-    return toBinary(ConversationStepSchema, create(ConversationStepSchema, {
-      message: {
-        case: "assistantMessage",
-        value: create(AssistantMessageSchema, { text: step.text }),
-      },
-    }));
+    return toBinary(
+      ConversationStepSchema,
+      create(ConversationStepSchema, {
+        message: {
+          case: "assistantMessage",
+          value: create(AssistantMessageSchema, { text: step.text }),
+        },
+      }),
+    );
   }
 
   const toolName = step.toolName || "tool";
@@ -1692,11 +1756,11 @@ function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
       toolName,
     }),
     ...(step.result && {
-      result: create(McpResultSchema, {
+      result: create(McpToolResultSchema, {
         result: step.result.isError
           ? {
               case: "error",
-              value: create(McpErrorSchema, { error: step.result.content }),
+              value: create(McpToolErrorSchema, { error: step.result.content }),
             }
           : {
               case: "success",
@@ -1709,17 +1773,20 @@ function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
     }),
   });
 
-  return toBinary(ConversationStepSchema, create(ConversationStepSchema, {
-    message: {
-      case: "toolCall",
-      value: create(ToolCallSchema, {
-        tool: {
-          case: "mcpToolCall",
-          value: mcpToolCall,
-        },
-      }),
-    },
-  }));
+  return toBinary(
+    ConversationStepSchema,
+    create(ConversationStepSchema, {
+      message: {
+        case: "toolCall",
+        value: create(ToolCallSchema, {
+          tool: {
+            case: "mcpToolCall",
+            value: mcpToolCall,
+          },
+        }),
+      },
+    }),
+  );
 }
 
 export function buildCursorRequest(
@@ -1750,11 +1817,11 @@ export function buildCursorRequest(
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
-  const systemBytes = new TextEncoder().encode(JSON.stringify({ role: "system", content: systemPrompt }));
-  const systemBlobId = storeAsBlob(systemBytes, blobStore);
-  const selectedCtxBlob = storeAsBlob(
-    buildSelectedContextBlob([systemBlobId], "pi"), blobStore,
+  const systemBytes = new TextEncoder().encode(
+    JSON.stringify({ role: "system", content: systemPrompt }),
   );
+  const systemBlobId = storeAsBlob(systemBytes, blobStore);
+  const selectedCtxBlob = storeAsBlob(buildSelectedContextBlob([systemBlobId], "pi"), blobStore);
 
   let conversationState;
   if (checkpoint) {
@@ -1764,7 +1831,7 @@ export function buildCursorRequest(
     for (const turn of turns) {
       const userMsg = createUserMessage(turn.userText, selectedCtxBlob, turn.userImages ?? []);
       const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
-      const stepBlobIds = turn.steps.map(s => storeAsBlob(buildTurnStepBytes(s), blobStore));
+      const stepBlobIds = turn.steps.map((s) => storeAsBlob(buildTurnStepBytes(s), blobStore));
 
       const agentTurn = create(AgentConversationTurnStructureSchema, {
         userMessage: userMsgBlobId,
@@ -1774,7 +1841,9 @@ export function buildCursorRequest(
       const turnStructure = create(ConversationTurnStructureSchema, {
         turn: { case: "agentConversationTurn", value: agentTurn },
       });
-      turnBlobIds.push(storeAsBlob(toBinary(ConversationTurnStructureSchema, turnStructure), blobStore));
+      turnBlobIds.push(
+        storeAsBlob(toBinary(ConversationTurnStructureSchema, turnStructure), blobStore),
+      );
     }
 
     conversationState = create(ConversationStateStructureSchema, {
@@ -1808,7 +1877,9 @@ export function buildCursorRequest(
     maxMode,
     parameters: cursorModelParameters,
   });
-  const parameters = cursorModelParameters.map((parameter) => create(RequestedModel_ModelParameterbytesSchema, parameter));
+  const parameters = cursorModelParameters.map((parameter) =>
+    create(RequestedModel_ModelParameterbytesSchema, parameter),
+  );
   const requestedModel = create(RequestedModelSchema, { modelId, maxMode, parameters });
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
@@ -1821,7 +1892,11 @@ export function buildCursorRequest(
     message: { case: "runRequest", value: runRequest },
   });
 
-  const payload = { requestBytes: toBinary(AgentClientMessageSchema, clientMessage), blobStore, mcpTools };
+  const payload = {
+    requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
+    blobStore,
+    mcpTools,
+  };
   debugLog("cursor_request.build.end", payload);
   return payload;
 }
@@ -1894,7 +1969,12 @@ function handleKvMessage(
     const blobId = (kvMsg as any).message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
-    sendKvResponse(kvMsg, "getBlobResult", create(GetBlobResultSchema, blobData ? { blobData } : {}), sendFrame);
+    sendKvResponse(
+      kvMsg,
+      "getBlobResult",
+      create(GetBlobResultSchema, blobData ? { blobData } : {}),
+      sendFrame,
+    );
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = (kvMsg as any).message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
@@ -1909,12 +1989,19 @@ function handleExecMessage(
   onMcpExec: (exec: PendingExec) => void,
 ): void {
   const execCase = (execMsg as any).message.case;
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+  const REJECT_REASON =
+    "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "requestContextArgs") {
     const requestContext = create(RequestContextSchema, {
-      rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [],
-      projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [],
+      rules: [],
+      repositoryInfo: [],
+      tools: mcpTools,
+      gitRepos: [],
+      projectLayouts: [],
+      mcpInstructions: [],
+      fileContents: {},
+      customSubagents: [],
     });
     const result = create(RequestContextResultSchema, {
       result: { case: "success", value: create(RequestContextSuccessSchema, { requestContext }) },
@@ -1939,79 +2026,162 @@ function handleExecMessage(
   // Reject native Cursor tools so model falls back to MCP tools
   if (execCase === "readArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "readResult", create(ReadResultSchema, {
-      result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "readResult",
+      create(ReadResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "lsArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "lsResult", create(LsResultSchema, {
-      result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "lsResult",
+      create(LsResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "grepArgs") {
-    sendExecResult(execMsg, "grepResult", create(GrepResultSchema, {
-      result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "grepResult",
+      create(GrepResultSchema, {
+        result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "writeArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "writeResult", create(WriteResultSchema, {
-      result: { case: "rejected", value: create(WriteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "writeResult",
+      create(WriteResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(WriteRejectedSchema, { path: args.path, reason: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "deleteArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "deleteResult", create(DeleteResultSchema, {
-      result: { case: "rejected", value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "deleteResult",
+      create(DeleteResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "shellArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "shellResult", create(ShellResultSchema, {
-      result: { case: "rejected", value: create(ShellRejectedSchema, {
-        command: args.command ?? "", workingDirectory: args.workingDirectory ?? "",
-        reason: REJECT_REASON, isReadonly: false,
-      }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "shellResult",
+      create(ShellResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(ShellRejectedSchema, {
+            command: args.command ?? "",
+            workingDirectory: args.workingDirectory ?? "",
+            reason: REJECT_REASON,
+            isReadonly: false,
+          }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "shellStreamArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "shellStream", create(ShellStreamSchema, {
-      event: { case: "rejected", value: create(ShellRejectedSchema, {
-        command: args.command ?? "", workingDirectory: args.workingDirectory ?? "",
-        reason: REJECT_REASON, isReadonly: false,
-      }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "shellStream",
+      create(ShellStreamSchema, {
+        event: {
+          case: "rejected",
+          value: create(ShellRejectedSchema, {
+            command: args.command ?? "",
+            workingDirectory: args.workingDirectory ?? "",
+            reason: REJECT_REASON,
+            isReadonly: false,
+          }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "backgroundShellSpawnArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "backgroundShellSpawnResult", create(BackgroundShellSpawnResultSchema, {
-      result: { case: "rejected", value: create(ShellRejectedSchema, {
-        command: args.command ?? "", workingDirectory: args.workingDirectory ?? "",
-        reason: REJECT_REASON, isReadonly: false,
-      }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "backgroundShellSpawnResult",
+      create(BackgroundShellSpawnResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(ShellRejectedSchema, {
+            command: args.command ?? "",
+            workingDirectory: args.workingDirectory ?? "",
+            reason: REJECT_REASON,
+            isReadonly: false,
+          }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "writeShellStdinArgs") {
-    sendExecResult(execMsg, "writeShellStdinResult", create(WriteShellStdinResultSchema, {
-      result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "writeShellStdinResult",
+      create(WriteShellStdinResultSchema, {
+        result: {
+          case: "error",
+          value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "fetchArgs") {
     const args = (execMsg as any).message.value;
-    sendExecResult(execMsg, "fetchResult", create(FetchResultSchema, {
-      result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }) },
-    }), sendFrame);
+    sendExecResult(
+      execMsg,
+      "fetchResult",
+      create(FetchResultSchema, {
+        result: {
+          case: "error",
+          value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
   if (execCase === "diagnosticsArgs") {
@@ -2060,7 +2230,9 @@ function sendExecResult(
 
 // ── Key derivation ──
 
-export function derivePiSessionId(body: Pick<ChatCompletionRequest, "pi_session_id" | "user">): string | undefined {
+export function derivePiSessionId(
+  body: Pick<ChatCompletionRequest, "pi_session_id" | "user">,
+): string | undefined {
   const raw = body.pi_session_id ?? body.user;
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
@@ -2079,14 +2251,20 @@ export function deriveBridgeKey(messages: OpenAIMessage[], sessionId?: string): 
   if (sessionId) return deriveBridgeKeyFromSessionId(sessionId);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256").update(`bridge:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+  return createHash("sha256")
+    .update(`bridge:${firstUserText.slice(0, 200)}`)
+    .digest("hex")
+    .slice(0, 16);
 }
 
 export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
   if (sessionId) return deriveConversationKeyFromSessionId(sessionId);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256").update(`conv:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+  return createHash("sha256")
+    .update(`conv:${firstUserText.slice(0, 200)}`)
+    .digest("hex")
+    .slice(0, 16);
 }
 
 export function cleanupSessionState(sessionId?: string): void {
@@ -2094,7 +2272,13 @@ export function cleanupSessionState(sessionId?: string): void {
   const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
   const convKey = deriveConversationKeyFromSessionId(sessionId);
   const active = activeBridges.get(bridgeKey);
-  debugLog("session.cleanup", { sessionId, bridgeKey, convKey, hasActiveBridge: !!active, hadConversation: conversationStates.has(convKey) });
+  debugLog("session.cleanup", {
+    sessionId,
+    bridgeKey,
+    convKey,
+    hasActiveBridge: !!active,
+    hadConversation: conversationStates.has(convKey),
+  });
   if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
   conversationStates.delete(convKey);
 }
@@ -2102,7 +2286,8 @@ export function cleanupSessionState(sessionId?: string): void {
 export function deterministicConversationId(convKey: string): string {
   const hex = createHash("sha256").update(`cursor-conv-id:${convKey}`).digest("hex").slice(0, 32);
   return [
-    hex.slice(0, 8), hex.slice(8, 12),
+    hex.slice(0, 8),
+    hex.slice(8, 12),
     `4${hex.slice(13, 16)}`,
     `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
     hex.slice(20, 32),
@@ -2111,78 +2296,55 @@ export function deterministicConversationId(convKey: string): string {
 
 // ── Thinking tag filter ──
 
-const THINKING_TAG_NAMES = ['think', 'thinking', 'reasoning', 'thought', 'think_intent'];
+const THINKING_TAG_NAMES = ["think", "thinking", "reasoning", "thought", "think_intent"];
 const MAX_THINKING_TAG_LEN = 16;
 
 function createThinkingTagFilter() {
-  let buffer = '';
+  let buffer = "";
   let inThinking = false;
   return {
     process(text: string) {
       const input = buffer + text;
-      buffer = '';
-      let content = '';
-      let reasoning = '';
+      buffer = "";
+      let content = "";
+      let reasoning = "";
       let lastIdx = 0;
-      const re = new RegExp(`<(/?)(?:${THINKING_TAG_NAMES.join('|')})\\s*>`, 'gi');
+      const re = new RegExp(`<(/?)(?:${THINKING_TAG_NAMES.join("|")})\\s*>`, "gi");
       let match: RegExpExecArray | null;
       while ((match = re.exec(input)) !== null) {
         const before = input.slice(lastIdx, match.index);
-        if (inThinking) reasoning += before; else content += before;
-        inThinking = match[1] !== '/';
+        if (inThinking) reasoning += before;
+        else content += before;
+        inThinking = match[1] !== "/";
         lastIdx = re.lastIndex;
       }
       const rest = input.slice(lastIdx);
-      const ltPos = rest.lastIndexOf('<');
-      if (ltPos >= 0 && rest.length - ltPos < MAX_THINKING_TAG_LEN && /^<\/?[a-z_]*$/i.test(rest.slice(ltPos))) {
+      const ltPos = rest.lastIndexOf("<");
+      if (
+        ltPos >= 0 &&
+        rest.length - ltPos < MAX_THINKING_TAG_LEN &&
+        /^<\/?[a-z_]*$/i.test(rest.slice(ltPos))
+      ) {
         buffer = rest.slice(ltPos);
         const before = rest.slice(0, ltPos);
-        if (inThinking) reasoning += before; else content += before;
+        if (inThinking) reasoning += before;
+        else content += before;
       } else {
-        if (inThinking) reasoning += rest; else content += rest;
+        if (inThinking) reasoning += rest;
+        else content += rest;
       }
       return { content, reasoning };
     },
     flush() {
       const b = buffer;
-      buffer = '';
-      if (!b) return { content: '', reasoning: '' };
-      return inThinking ? { content: '', reasoning: b } : { content: b, reasoning: '' };
+      buffer = "";
+      if (!b) return { content: "", reasoning: "" };
+      return inThinking ? { content: "", reasoning: b } : { content: b, reasoning: "" };
     },
   };
 }
 
-// ── Connect frame parser ──
-
-function createConnectFrameParser(
-  onMessage: (bytes: Uint8Array) => void,
-  onEndStream: (bytes: Uint8Array) => void,
-): (incoming: Buffer) => void {
-  let pending = Buffer.alloc(0);
-  return (incoming: Buffer) => {
-    pending = Buffer.concat([pending, incoming]);
-    while (pending.length >= 5) {
-      const flags = pending[0]!;
-      const msgLen = pending.readUInt32BE(1);
-      if (pending.length < 5 + msgLen) break;
-      const messageBytes = pending.subarray(5, 5 + msgLen);
-      pending = pending.subarray(5 + msgLen);
-      if (flags & CONNECT_END_STREAM_FLAG) onEndStream(messageBytes);
-      else onMessage(messageBytes);
-    }
-  };
-}
-
-function parseConnectEndStream(data: Uint8Array): Error | null {
-  try {
-    const payload = JSON.parse(new TextDecoder().decode(data));
-    const error = payload?.error;
-    if (error) return new Error(`Connect error ${error.code ?? "unknown"}: ${error.message ?? "Unknown error"}`);
-    return null;
-  } catch {
-    return new Error("Failed to parse Connect end stream");
-  }
-}
+// ── Connect frame helpers ──
 
 function makeHeartbeatBytes(): Uint8Array {
   const heartbeat = create(AgentClientMessageSchema, {
@@ -2217,42 +2379,50 @@ function respondWithPendingToolCalls(
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
+      Connection: "keep-alive",
     });
     for (const toolCall of toolCalls) {
-      res.write(`data: ${JSON.stringify({
+      res.write(
+        `data: ${JSON.stringify({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: modelId,
+          choices: [{ index: 0, delta: { tool_calls: [toolCall] }, finish_reason: null }],
+        })}\n\n`,
+      );
+    }
+    res.write(
+      `data: ${JSON.stringify({
         id: completionId,
         object: "chat.completion.chunk",
         created,
         model: modelId,
-        choices: [{ index: 0, delta: { tool_calls: [toolCall] }, finish_reason: null }],
-      })}\n\n`);
-    }
-    res.write(`data: ${JSON.stringify({
-      id: completionId,
-      object: "chat.completion.chunk",
-      created,
-      model: modelId,
-      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-    })}\n\n`);
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      })}\n\n`,
+    );
     res.write("data: [DONE]\n\n");
     res.end();
     return;
   }
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({
-    id: completionId,
-    object: "chat.completion",
-    created,
-    model: modelId,
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: null, tool_calls: toolCalls },
-      finish_reason: "tool_calls",
-    }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-  }));
+  res.end(
+    JSON.stringify({
+      id: completionId,
+      object: "chat.completion",
+      created,
+      model: modelId,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: null, tool_calls: toolCalls },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    }),
+  );
 }
 
 // ── Streaming response ──
@@ -2295,9 +2465,7 @@ function handleStreamingResponse(
   );
 }
 
-function sendCancelAction(
-  bridge: BridgeHandle,
-): void {
+function sendCancelAction(bridge: BridgeHandle): void {
   debugLog("bridge.cancel_action", {});
   const action = create(ConversationActionSchema, {
     action: { case: "cancelAction", value: create(CancelActionSchema, {}) },
@@ -2315,6 +2483,7 @@ function cleanupBridge(
 ): void {
   debugLog("bridge.cleanup", { bridgeKey, alive: bridge.alive });
   clearInterval(heartbeatTimer);
+  clearActiveBridgeToolTimeout(activeBridges.get(bridgeKey));
   if (bridge.alive) {
     sendCancelAction(bridge);
     bridge.end();
@@ -2336,14 +2505,21 @@ function writeSSEStream(
   res: ServerResponse,
   requestId?: string,
 ): void {
-  debugLog("stream.writer_start", { requestId, bridgeKey, convKey, modelId, completedTurnCount: completedTurns.length, currentTurn });
+  debugLog("stream.writer_start", {
+    requestId,
+    bridgeKey,
+    convKey,
+    modelId,
+    completedTurnCount: completedTurns.length,
+    currentTurn,
+  });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
+    Connection: "keep-alive",
   });
 
   let closed = false;
@@ -2362,23 +2538,35 @@ function writeSSEStream(
   };
 
   const makeChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => ({
-    id: completionId, object: "chat.completion.chunk", created, model: modelId,
+    id: completionId,
+    object: "chat.completion.chunk",
+    created,
+    model: modelId,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   });
 
   const makeUsageChunk = () => {
     const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
     return {
-      id: completionId, object: "chat.completion.chunk", created, model: modelId,
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: modelId,
       choices: [],
       usage: { prompt_tokens, completion_tokens, total_tokens },
     };
   };
 
-  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
+  const state: StreamState = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+  };
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
+  let streamError: Error | null = null;
   let latestCheckpoint: Uint8Array | null = null;
 
   // Detect client disconnect (e.g. user pressed Escape in pi)
@@ -2397,7 +2585,9 @@ function writeSSEStream(
       try {
         const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
         processServerMessage(
-          serverMessage, blobStore, mcpTools,
+          serverMessage,
+          blobStore,
+          mcpTools,
           (data) => bridge.write(data),
           state,
           (text, isThinking) => {
@@ -2431,17 +2621,34 @@ function writeSSEStream(
             });
 
             const toolCallIndex = state.toolCallIndex++;
-            sendSSE(makeChunk({
-              tool_calls: [{
-                index: toolCallIndex, id: exec.toolCallId, type: "function",
-                function: { name: exec.toolName, arguments: exec.decodedArgs },
-              }],
-            }));
+            sendSSE(
+              makeChunk({
+                tool_calls: [
+                  {
+                    index: toolCallIndex,
+                    id: exec.toolCallId,
+                    type: "function",
+                    function: { name: exec.toolName, arguments: exec.decodedArgs },
+                  },
+                ],
+              }),
+            );
 
-            activeBridges.set(bridgeKey, {
-              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
+            setActiveBridge(bridgeKey, {
+              bridge,
+              heartbeatTimer,
+              blobStore,
+              mcpTools,
+              pendingExecs: state.pendingExecs,
+              currentTurn,
             });
-            debugLog("stream.tool_call_pause", { requestId, bridgeKey, exec, pendingExecs: state.pendingExecs, currentTurn });
+            debugLog("stream.tool_call_pause", {
+              requestId,
+              bridgeKey,
+              exec,
+              pendingExecs: state.pendingExecs,
+              currentTurn,
+            });
 
             sendSSE(makeChunk({}, "tool_calls"));
             sendDone();
@@ -2453,14 +2660,17 @@ function writeSSEStream(
           },
         );
       } catch (err) {
-        console.error("[cursor-provider] Stream message processing error:", err instanceof Error ? err.message : err);
+        console.error(
+          "[cursor-provider] Stream message processing error:",
+          err instanceof Error ? err.message : err,
+        );
       }
     },
     (endStreamBytes) => {
       const endError = parseConnectEndStream(endStreamBytes);
       if (endError) {
+        streamError = endError;
         console.error(`[cursor-provider] Cursor stream error (${modelId}):`, endError.message);
-        conversationStates.delete(convKey);
         sendSSE(makeChunk({ content: endError.message }, "error"));
         sendSSE(makeUsageChunk());
         sendDone();
@@ -2472,12 +2682,25 @@ function writeSSEStream(
   bridge.onData(processChunk);
 
   bridge.onClose((code) => {
-    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, currentTurn, latestCheckpoint });
+    debugLog("stream.bridge_close", {
+      requestId,
+      bridgeKey,
+      convKey,
+      code,
+      cancelled,
+      mcpExecReceived,
+      currentTurn,
+      latestCheckpoint,
+    });
     clearInterval(heartbeatTimer);
     req.removeListener("close", onClientClose);
     res.removeListener("close", onClientClose);
 
     if (cancelled) return;
+    if (streamError) {
+      removeActiveBridge(bridgeKey);
+      return;
+    }
 
     const stored = conversationStates.get(convKey);
     if (code !== 0) {
@@ -2485,7 +2708,7 @@ function writeSSEStream(
       sendSSE(makeUsageChunk());
       sendDone();
       closeResponse();
-      activeBridges.delete(bridgeKey);
+      removeActiveBridge(bridgeKey);
       return;
     }
 
@@ -2509,7 +2732,7 @@ function writeSSEStream(
       sendDone();
       closeResponse();
     } else {
-      activeBridges.delete(bridgeKey);
+      removeActiveBridge(bridgeKey);
     }
   });
 }
@@ -2559,10 +2782,20 @@ function handleToolResultResume(
   requestId?: string,
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
-  debugLog("tool_resume.start", { requestId, bridgeKey, convKey, toolResults, pendingExecs, currentTurn });
+  debugLog("tool_resume.start", {
+    requestId,
+    bridgeKey,
+    convKey,
+    toolResults,
+    pendingExecs,
+    currentTurn,
+  });
 
   for (const result of toolResults) {
-    const turnToolStep = currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === result.toolCallId);
+    const turnToolStep = currentTurn.steps.find(
+      (step): step is ParsedToolCallStep =>
+        step.kind === "toolCall" && step.toolCallId === result.toolCallId,
+    );
     if (turnToolStep) {
       turnToolStep.result = { content: result.content, images: result.images, isError: false };
     }
@@ -2571,7 +2804,7 @@ function handleToolResultResume(
   const turnResults = getTurnToolCallResults(currentTurn);
   const unresolvedExecs = pendingExecs.filter((exec) => !turnResults.has(exec.toolCallId));
   if (unresolvedExecs.length > 0) {
-    activeBridges.set(bridgeKey, {
+    setActiveBridge(bridgeKey, {
       bridge,
       heartbeatTimer,
       blobStore,
@@ -2641,7 +2874,13 @@ async function handleNonStreamingResponse(
   res: ServerResponse,
   requestId?: string,
 ): Promise<void> {
-  debugLog("nonstream.start", { requestId, convKey, modelId, currentTurn, completedTurnCount: completedTurns.length });
+  debugLog("nonstream.start", {
+    requestId,
+    convKey,
+    modelId,
+    currentTurn,
+    completedTurnCount: completedTurns.length,
+  });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -2660,49 +2899,71 @@ async function handleNonStreamingResponse(
   };
   req.on("close", onClientClose);
   res.on("close", onClientClose);
-  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
+  const state: StreamState = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+  };
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
   let nonStreamError: Error | null = null;
   let latestCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
-    bridge.onData(createConnectFrameParser(
-      (messageBytes) => {
-        try {
-          const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-          processServerMessage(
-            serverMessage, payload.blobStore, payload.mcpTools,
-            (data) => bridge.write(data),
-            state,
-            (text, isThinking) => {
-              if (isThinking) return;
-              const { content } = tagFilter.process(text);
-              fullText += content;
-              appendAssistantTextToTurn(currentTurn, content);
-            },
-            () => {},
-            (checkpointBytes) => {
-              latestCheckpoint = checkpointBytes;
-              debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
-            },
-          );
-        } catch (err) {
-          console.error("[cursor-provider] Non-stream message processing error:", err instanceof Error ? err.message : err);
-        }
-      },
-      (endStreamBytes) => {
-        const endError = parseConnectEndStream(endStreamBytes);
-        if (endError) {
-          console.error(`[cursor-provider] Cursor non-stream error (${modelId}):`, endError.message);
-          conversationStates.delete(convKey);
-          nonStreamError = endError;
-        }
-      },
-    ));
+    bridge.onData(
+      createConnectFrameParser(
+        (messageBytes) => {
+          try {
+            const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+            processServerMessage(
+              serverMessage,
+              payload.blobStore,
+              payload.mcpTools,
+              (data) => bridge.write(data),
+              state,
+              (text, isThinking) => {
+                if (isThinking) return;
+                const { content } = tagFilter.process(text);
+                fullText += content;
+                appendAssistantTextToTurn(currentTurn, content);
+              },
+              () => {},
+              (checkpointBytes) => {
+                latestCheckpoint = checkpointBytes;
+                debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
+              },
+            );
+          } catch (err) {
+            console.error(
+              "[cursor-provider] Non-stream message processing error:",
+              err instanceof Error ? err.message : err,
+            );
+          }
+        },
+        (endStreamBytes) => {
+          const endError = parseConnectEndStream(endStreamBytes);
+          if (endError) {
+            console.error(
+              `[cursor-provider] Cursor non-stream error (${modelId}):`,
+              endError.message,
+            );
+            nonStreamError = endError;
+          }
+        },
+      ),
+    );
 
     bridge.onClose((code) => {
-      debugLog("nonstream.bridge_close", { requestId, convKey, code, cancelled, nonStreamError: nonStreamError?.message, currentTurn, latestCheckpoint });
+      debugLog("nonstream.bridge_close", {
+        requestId,
+        convKey,
+        code,
+        cancelled,
+        nonStreamError: nonStreamError?.message,
+        currentTurn,
+        latestCheckpoint,
+      });
       clearInterval(heartbeatTimer);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);
@@ -2710,7 +2971,11 @@ async function handleNonStreamingResponse(
       if (cancelled) {
         if (!res.headersSent) {
           res.writeHead(499, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "Client closed request", type: "aborted", code: "client_closed" } }));
+          res.end(
+            JSON.stringify({
+              error: { message: "Client closed request", type: "aborted", code: "client_closed" },
+            }),
+          );
         }
         resolve();
         return;
@@ -2722,9 +2987,15 @@ async function handleNonStreamingResponse(
 
       if (nonStreamError) {
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: { message: nonStreamError.message, type: "upstream_error", code: "cursor_error" },
-        }));
+        res.end(
+          JSON.stringify({
+            error: {
+              message: nonStreamError.message,
+              type: "upstream_error",
+              code: "cursor_error",
+            },
+          }),
+        );
         resolve();
         return;
       }
@@ -2736,7 +3007,13 @@ async function handleNonStreamingResponse(
       const stored = conversationStates.get(convKey);
       if (stored) {
         if (latestCheckpoint) {
-          commitStoredCheckpoint(stored, latestCheckpoint, payload.blobStore, completedTurns, currentTurn);
+          commitStoredCheckpoint(
+            stored,
+            latestCheckpoint,
+            payload.blobStore,
+            completedTurns,
+            currentTurn,
+          );
           debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
         } else {
           mergeBlobStore(stored, payload.blobStore);
@@ -2744,11 +3021,18 @@ async function handleNonStreamingResponse(
       }
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        id: completionId, object: "chat.completion", created, model: modelId,
-        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
-        usage,
-      }));
+      res.end(
+        JSON.stringify({
+          id: completionId,
+          object: "chat.completion",
+          created,
+          model: modelId,
+          choices: [
+            { index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" },
+          ],
+          usage,
+        }),
+      );
       resolve();
     });
   });

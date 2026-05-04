@@ -69,9 +69,7 @@ export async function pollCursorAuth(
     await new Promise((r) => setTimeout(r, delay));
 
     try {
-      const response = await fetch(
-        `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
-      );
+      const response = await fetch(`${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`);
 
       if (response.status === 404) {
         consecutiveErrors = 0;
@@ -91,12 +89,10 @@ export async function pollCursorAuth(
       }
 
       throw new Error(`Poll failed: ${response.status}`);
-    } catch (err) {
+    } catch {
       consecutiveErrors++;
       if (consecutiveErrors >= 3) {
-        throw new Error(
-          "Too many consecutive errors during Cursor auth polling",
-        );
+        throw new Error("Too many consecutive errors during Cursor auth polling");
       }
     }
   }
@@ -112,9 +108,7 @@ export interface CursorCredentials {
   expires: number;
 }
 
-export async function refreshCursorToken(
-  refreshToken: string,
-): Promise<CursorCredentials> {
+export async function refreshCursorToken(refreshToken: string): Promise<CursorCredentials> {
   const response = await fetch(CURSOR_REFRESH_URL, {
     method: "POST",
     headers: {
@@ -154,14 +148,8 @@ export function getTokenExpiry(token: string): number {
     if (parts.length !== 3 || !parts[1]) {
       return Date.now() + 3600 * 1000;
     }
-    const decoded = JSON.parse(
-      atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")),
-    );
-    if (
-      decoded &&
-      typeof decoded === "object" &&
-      typeof decoded.exp === "number"
-    ) {
+    const decoded = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (decoded && typeof decoded === "object" && typeof decoded.exp === "number") {
       return decoded.exp * 1000 - 5 * 60 * 1000;
     }
   } catch {}

@@ -10,6 +10,8 @@ const NOTABLE_EVENTS = [
   "chat.discard_checkpoint",
   "chat.lost_tool_continuation",
   "chat.nonstream_tools_unsupported",
+  "chat.unsupported_parameters",
+  "chat.unsupported_tool_choice",
   "chat.resume_tool_results",
   "stream.tool_call_pause",
   "tool_resume.start",
@@ -21,6 +23,7 @@ const NOTABLE_EVENTS = [
   "nonstream.checkpoint_committed",
   "stream.bridge_close",
   "nonstream.bridge_close",
+  "bridge.active_ttl_expired",
   "session.cleanup",
   "session.cleanup_all",
   "conversation.evict",
@@ -126,7 +129,10 @@ function parseLogFile(filePath) {
       if (!entry || typeof entry !== "object") continue;
       events.push(entry);
     } catch (error) {
-      parseErrors.push({ line: i + 1, message: error instanceof Error ? error.message : String(error) });
+      parseErrors.push({
+        line: i + 1,
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -198,13 +204,23 @@ function summarize(events, filePath) {
         processEvents.push({ ts: event.ts, tsMs, kind: eventName, detail: `port=${event.port}` });
         break;
       case "bridge.spawn":
-        processEvents.push({ ts: event.ts, tsMs, kind: eventName, detail: `${event.rpcPath ?? "rpc"} ${event.unary ? "unary" : "stream"}` });
+        processEvents.push({
+          ts: event.ts,
+          tsMs,
+          kind: eventName,
+          detail: `${event.rpcPath ?? "rpc"} ${event.unary ? "unary" : "stream"}`,
+        });
         break;
       case "bridge.start_run":
         processEvents.push({ ts: event.ts, tsMs, kind: eventName, detail: "upstream run started" });
         break;
       case "bridge.exit":
-        processEvents.push({ ts: event.ts, tsMs, kind: eventName, detail: `exitCode=${event.exitCode}` });
+        processEvents.push({
+          ts: event.ts,
+          tsMs,
+          kind: eventName,
+          detail: `exitCode=${event.exitCode}`,
+        });
         break;
       case "session.cleanup":
         processEvents.push({
@@ -223,36 +239,50 @@ function summarize(events, filePath) {
         });
         break;
       case "conversation.evict":
-        processEvents.push({ ts: event.ts, tsMs, kind: eventName, detail: `key=${event.key ?? "?"}` });
+        processEvents.push({
+          ts: event.ts,
+          tsMs,
+          kind: eventName,
+          detail: `key=${event.key ?? "?"}`,
+        });
         break;
       case "http.chat.body": {
         if (!req) break;
         req.model = event.body?.model;
         req.stream = Boolean(event.body?.stream);
         req.sessionId = event.body?.pi_session_id;
-        req.messageCount = Array.isArray(event.body?.messages) ? event.body.messages.length : undefined;
+        req.messageCount = Array.isArray(event.body?.messages)
+          ? event.body.messages.length
+          : undefined;
         if (req.sessionId) sessionIds.add(req.sessionId);
         break;
       }
       case "chat.parsed_messages":
         if (!req) break;
         req.parsedTurns = Array.isArray(event.turns) ? event.turns.length : undefined;
-        req.parsedToolResults = Array.isArray(event.toolResults) ? event.toolResults.length : undefined;
+        req.parsedToolResults = Array.isArray(event.toolResults)
+          ? event.toolResults.length
+          : undefined;
         req.parsedUserText = event.userText ?? undefined;
         break;
       case "chat.resume_tool_results":
         if (!req) break;
         req.resumeToolResults = Array.isArray(event.toolResults) ? event.toolResults : [];
-        req.pendingBeforeResume = Array.isArray(event.pendingExecs) ? event.pendingExecs.length : undefined;
+        req.pendingBeforeResume = Array.isArray(event.pendingExecs)
+          ? event.pendingExecs.length
+          : undefined;
         break;
       case "chat.discard_checkpoint":
         if (!req) break;
-        req.discardCheckpoint = shorten(JSON.stringify({
-          storedTurnCount: event.storedCheckpointTurnCount,
-          currentTurnCount: event.currentTurnCount,
-          storedFingerprint: event.storedCheckpointHistoryFingerprint,
-          currentFingerprint: event.currentHistoryFingerprint,
-        }), 120);
+        req.discardCheckpoint = shorten(
+          JSON.stringify({
+            storedTurnCount: event.storedCheckpointTurnCount,
+            currentTurnCount: event.currentTurnCount,
+            storedFingerprint: event.storedCheckpointHistoryFingerprint,
+            currentFingerprint: event.currentHistoryFingerprint,
+          }),
+          120,
+        );
         break;
       case "chat.no_user_message":
         if (!req) break;
@@ -274,7 +304,9 @@ function summarize(events, filePath) {
         break;
       case "tool_resume.partial_wait":
         if (!req) break;
-        req.partialWait = Array.isArray(event.unresolvedExecs) ? event.unresolvedExecs.map(formatTool) : [];
+        req.partialWait = Array.isArray(event.unresolvedExecs)
+          ? event.unresolvedExecs.map(formatTool)
+          : [];
         break;
       case "stream.tool_call_pause":
         if (!req) break;
@@ -324,7 +356,9 @@ function summarize(events, filePath) {
     requestCount: requestOrder.length,
     sessionIds: Array.from(sessionIds).sort(),
     counts: Object.fromEntries([...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]))),
-    notableCounts: Object.fromEntries(NOTABLE_EVENTS.map((name) => [name, counts.get(name) ?? 0]).filter(([, count]) => count > 0)),
+    notableCounts: Object.fromEntries(
+      NOTABLE_EVENTS.map((name) => [name, counts.get(name) ?? 0]).filter(([, count]) => count > 0),
+    ),
     requests: requestOrder.map((requestId) => requests.get(requestId)),
     processEvents: processEvents.sort((a, b) => a.tsMs - b.tsMs),
   };
@@ -344,7 +378,8 @@ function renderRequestLine(request, baseTsMs) {
   if (typeof request.parsedTurns === "number" || typeof request.parsedToolResults === "number") {
     const parsedBits = [];
     if (typeof request.parsedTurns === "number") parsedBits.push(`turns=${request.parsedTurns}`);
-    if (typeof request.parsedToolResults === "number") parsedBits.push(`toolResults=${request.parsedToolResults}`);
+    if (typeof request.parsedToolResults === "number")
+      parsedBits.push(`toolResults=${request.parsedToolResults}`);
     if (turnText) parsedBits.push(`turn=${JSON.stringify(shorten(turnText, 48))}`);
     pieces.push(`parsed(${parsedBits.join(", ")})`);
   } else if (turnText) {
@@ -361,12 +396,20 @@ function renderRequestLine(request, baseTsMs) {
       .filter(Boolean)
       .slice(0, 3)
       .map((id) => shortId(id));
-    const suffix = request.resumeToolResults.length > ids.length ? `,+${request.resumeToolResults.length - ids.length}` : "";
-    pieces.push(`resume(results=${request.resumeToolResults.length}, pendingBefore=${request.pendingBeforeResume ?? "?"}${ids.length ? `, ids=[${ids.join(",")}${suffix}]` : ""})`);
+    const suffix =
+      request.resumeToolResults.length > ids.length
+        ? `,+${request.resumeToolResults.length - ids.length}`
+        : "";
+    pieces.push(
+      `resume(results=${request.resumeToolResults.length}, pendingBefore=${request.pendingBeforeResume ?? "?"}${ids.length ? `, ids=[${ids.join(",")}${suffix}]` : ""})`,
+    );
   }
 
   if (request.sentResults.length > 0) {
-    const preview = request.sentResults.slice(0, 3).map((id) => shortId(id)).join(",");
+    const preview = request.sentResults
+      .slice(0, 3)
+      .map((id) => shortId(id))
+      .join(",");
     const suffix = request.sentResults.length > 3 ? `,+${request.sentResults.length - 3}` : "";
     pieces.push(`sent=${request.sentResults.length}[${preview}${suffix}]`);
   }
@@ -383,7 +426,8 @@ function renderRequestLine(request, baseTsMs) {
     pieces.push(`toolPause=[${preview}${suffix}]`);
   }
 
-  if (request.checkpointBuffered > 0) pieces.push(`checkpointBuffered=${request.checkpointBuffered}`);
+  if (request.checkpointBuffered > 0)
+    pieces.push(`checkpointBuffered=${request.checkpointBuffered}`);
   if (request.clientClosed) pieces.push("clientClosed=true");
 
   if (request.bridgeClose) {
@@ -391,12 +435,15 @@ function renderRequestLine(request, baseTsMs) {
     if (request.bridgeClose.code !== undefined) bridgeBits.push(`code=${request.bridgeClose.code}`);
     bridgeBits.push(`cancelled=${request.bridgeClose.cancelled}`);
     if (request.bridgeClose.mcpExecReceived) bridgeBits.push("mcpExecReceived=true");
-    if (request.bridgeClose.nonStreamError) bridgeBits.push(`error=${JSON.stringify(shorten(request.bridgeClose.nonStreamError, 64))}`);
+    if (request.bridgeClose.nonStreamError)
+      bridgeBits.push(`error=${JSON.stringify(shorten(request.bridgeClose.nonStreamError, 64))}`);
     pieces.push(`bridgeClose(${bridgeBits.join(", ")})`);
   }
 
   if (request.checkpointCommitted) {
-    pieces.push(`checkpointCommitted(turns=${request.checkpointCommitted.turnCount ?? "?"}, sessionScoped=${request.checkpointCommitted.sessionScoped})`);
+    pieces.push(
+      `checkpointCommitted(turns=${request.checkpointCommitted.turnCount ?? "?"}, sessionScoped=${request.checkpointCommitted.sessionScoped})`,
+    );
   }
 
   return pieces.join("  |  ");
@@ -408,9 +455,13 @@ function render(summary, lineCount, parseErrors) {
 
   output.push(`File: ${summary.filePath}`);
   output.push(`Lines: ${lineCount} JSON entries: ${summary.eventCount}`);
-  output.push(`Window: ${summary.firstTs ?? "?"} → ${summary.lastTs ?? "?"} (${formatDuration(summary.durationMs)})`);
+  output.push(
+    `Window: ${summary.firstTs ?? "?"} → ${summary.lastTs ?? "?"} (${formatDuration(summary.durationMs)})`,
+  );
   output.push(`Requests: ${summary.requestCount}`);
-  output.push(`Sessions: ${summary.sessionIds.length > 0 ? summary.sessionIds.join(", ") : "<none>"}`);
+  output.push(
+    `Sessions: ${summary.sessionIds.length > 0 ? summary.sessionIds.join(", ") : "<none>"}`,
+  );
 
   if (parseErrors.length > 0) {
     output.push(`Parse errors: ${parseErrors.length}`);
@@ -434,7 +485,9 @@ function render(summary, lineCount, parseErrors) {
     output.push("");
     output.push("Process / lifecycle:");
     for (const event of summary.processEvents) {
-      output.push(`  [${formatDelta(event.tsMs, baseTsMs)}] ${event.kind}${event.detail ? `  ${event.detail}` : ""}`);
+      output.push(
+        `  [${formatDelta(event.tsMs, baseTsMs)}] ${event.kind}${event.detail ? `  ${event.detail}` : ""}`,
+      );
     }
   }
 

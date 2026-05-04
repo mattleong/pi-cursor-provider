@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": [
+    "node_modules/**",
+    "proto/agent_pb.ts",
+    "cursor-models-raw.json",
+    "fixtures/**",
+    "package-lock.json"
+  ]
+}

@@ -32,11 +32,9 @@ import {
   deriveConversationKey,
   deriveConversationKeyFromSessionId,
   derivePiSessionId,
-  deterministicConversationId,
   buildCursorRequest,
   parseMessages,
   setBridgeFactoryForTests,
-
   startProxy,
   stopProxy,
   writeSSEStreamForTests,
@@ -47,8 +45,6 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
-  CancelActionSchema,
-  ConversationActionSchema,
   ConversationStateStructureSchema,
   ConversationTurnStructureSchema,
   ConversationStepSchema,
@@ -88,95 +84,210 @@ describe("inferCursorContextWindow", () => {
 
 describe("parseModelId", () => {
   test("plain model — no effort, no variant", () => {
-    expect(parseModelId("composer-2")).toEqual({ base: "composer-2", effort: "", fast: false, thinking: false });
+    expect(parseModelId("composer-2")).toEqual({
+      base: "composer-2",
+      effort: "",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("plain model with -fast suffix", () => {
-    expect(parseModelId("composer-2-fast")).toEqual({ base: "composer-2", effort: "", fast: true, thinking: false });
+    expect(parseModelId("composer-2-fast")).toEqual({
+      base: "composer-2",
+      effort: "",
+      fast: true,
+      thinking: false,
+    });
   });
 
   test("model with effort suffix", () => {
-    expect(parseModelId("gpt-5.4-medium")).toEqual({ base: "gpt-5.4", effort: "medium", fast: false, thinking: false });
+    expect(parseModelId("gpt-5.4-medium")).toEqual({
+      base: "gpt-5.4",
+      effort: "medium",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("model with effort + fast", () => {
-    expect(parseModelId("gpt-5.4-high-fast")).toEqual({ base: "gpt-5.4", effort: "high", fast: true, thinking: false });
+    expect(parseModelId("gpt-5.4-high-fast")).toEqual({
+      base: "gpt-5.4",
+      effort: "high",
+      fast: true,
+      thinking: false,
+    });
   });
 
   test("model with effort + thinking", () => {
-    expect(parseModelId("claude-4.6-opus-high-thinking")).toEqual({ base: "claude-4.6-opus", effort: "high", fast: false, thinking: true });
+    expect(parseModelId("claude-4.6-opus-high-thinking")).toEqual({
+      base: "claude-4.6-opus",
+      effort: "high",
+      fast: false,
+      thinking: true,
+    });
   });
 
   test("max effort level", () => {
-    expect(parseModelId("claude-4.6-opus-max")).toEqual({ base: "claude-4.6-opus", effort: "max", fast: false, thinking: false });
+    expect(parseModelId("claude-4.6-opus-max")).toEqual({
+      base: "claude-4.6-opus",
+      effort: "max",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("max effort + thinking", () => {
-    expect(parseModelId("claude-4.6-opus-max-thinking")).toEqual({ base: "claude-4.6-opus", effort: "max", fast: false, thinking: true });
+    expect(parseModelId("claude-4.6-opus-max-thinking")).toEqual({
+      base: "claude-4.6-opus",
+      effort: "max",
+      fast: false,
+      thinking: true,
+    });
   });
 
   test("thinking + max effort order used by newer Cursor models", () => {
-    expect(parseModelId("claude-opus-4-7-thinking-max")).toEqual({ base: "claude-opus-4-7", effort: "max", fast: false, thinking: true });
+    expect(parseModelId("claude-opus-4-7-thinking-max")).toEqual({
+      base: "claude-opus-4-7",
+      effort: "max",
+      fast: false,
+      thinking: true,
+    });
   });
 
   test("thinking + high effort + fast order used by newer Cursor models", () => {
-    expect(parseModelId("claude-opus-4-7-thinking-high-fast")).toEqual({ base: "claude-opus-4-7", effort: "high", fast: true, thinking: true });
+    expect(parseModelId("claude-opus-4-7-thinking-high-fast")).toEqual({
+      base: "claude-opus-4-7",
+      effort: "high",
+      fast: true,
+      thinking: true,
+    });
   });
 
   test("extra-high Cursor suffix normalizes to xhigh effort", () => {
-    expect(parseModelId("gpt-5.5-extra-high")).toEqual({ base: "gpt-5.5", effort: "xhigh", fast: false, thinking: false });
+    expect(parseModelId("gpt-5.5-extra-high")).toEqual({
+      base: "gpt-5.5",
+      effort: "xhigh",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("extra-high Cursor suffix + fast normalizes to xhigh effort", () => {
-    expect(parseModelId("gpt-5.5-extra-high-fast")).toEqual({ base: "gpt-5.5", effort: "xhigh", fast: true, thinking: false });
+    expect(parseModelId("gpt-5.5-extra-high-fast")).toEqual({
+      base: "gpt-5.5",
+      effort: "xhigh",
+      fast: true,
+      thinking: false,
+    });
   });
 
   test("none effort level", () => {
-    expect(parseModelId("gpt-5.4-mini-none")).toEqual({ base: "gpt-5.4-mini", effort: "none", fast: false, thinking: false });
+    expect(parseModelId("gpt-5.4-mini-none")).toEqual({
+      base: "gpt-5.4-mini",
+      effort: "none",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("xhigh effort", () => {
-    expect(parseModelId("gpt-5.2-xhigh")).toEqual({ base: "gpt-5.2", effort: "xhigh", fast: false, thinking: false });
+    expect(parseModelId("gpt-5.2-xhigh")).toEqual({
+      base: "gpt-5.2",
+      effort: "xhigh",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("xhigh effort + fast", () => {
-    expect(parseModelId("gpt-5.2-xhigh-fast")).toEqual({ base: "gpt-5.2", effort: "xhigh", fast: true, thinking: false });
+    expect(parseModelId("gpt-5.2-xhigh-fast")).toEqual({
+      base: "gpt-5.2",
+      effort: "xhigh",
+      fast: true,
+      thinking: false,
+    });
   });
 
   test("codex-max model — max is part of base, not effort", () => {
-    expect(parseModelId("gpt-5.1-codex-max-high")).toEqual({ base: "gpt-5.1-codex-max", effort: "high", fast: false, thinking: false });
+    expect(parseModelId("gpt-5.1-codex-max-high")).toEqual({
+      base: "gpt-5.1-codex-max",
+      effort: "high",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("codex-max + fast", () => {
-    expect(parseModelId("gpt-5.1-codex-max-medium-fast")).toEqual({ base: "gpt-5.1-codex-max", effort: "medium", fast: true, thinking: false });
+    expect(parseModelId("gpt-5.1-codex-max-medium-fast")).toEqual({
+      base: "gpt-5.1-codex-max",
+      effort: "medium",
+      fast: true,
+      thinking: false,
+    });
   });
 
   test("codex-mini model", () => {
-    expect(parseModelId("gpt-5.1-codex-mini-high")).toEqual({ base: "gpt-5.1-codex-mini", effort: "high", fast: false, thinking: false });
+    expect(parseModelId("gpt-5.1-codex-mini-high")).toEqual({
+      base: "gpt-5.1-codex-mini",
+      effort: "high",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("spark-preview model", () => {
-    expect(parseModelId("gpt-5.3-codex-spark-preview-high")).toEqual({ base: "gpt-5.3-codex-spark-preview", effort: "high", fast: false, thinking: false });
+    expect(parseModelId("gpt-5.3-codex-spark-preview-high")).toEqual({
+      base: "gpt-5.3-codex-spark-preview",
+      effort: "high",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("plain thinking model — no effort", () => {
-    expect(parseModelId("grok-4-20-thinking")).toEqual({ base: "grok-4-20", effort: "", fast: false, thinking: true });
+    expect(parseModelId("grok-4-20-thinking")).toEqual({
+      base: "grok-4-20",
+      effort: "",
+      fast: false,
+      thinking: true,
+    });
   });
 
   test("model without any suffix", () => {
-    expect(parseModelId("kimi-k2.5")).toEqual({ base: "kimi-k2.5", effort: "", fast: false, thinking: false });
+    expect(parseModelId("kimi-k2.5")).toEqual({
+      base: "kimi-k2.5",
+      effort: "",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("default model", () => {
-    expect(parseModelId("default")).toEqual({ base: "default", effort: "", fast: false, thinking: false });
+    expect(parseModelId("default")).toEqual({
+      base: "default",
+      effort: "",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("claude-4.6-sonnet-medium — effort is medium", () => {
-    expect(parseModelId("claude-4.6-sonnet-medium")).toEqual({ base: "claude-4.6-sonnet", effort: "medium", fast: false, thinking: false });
+    expect(parseModelId("claude-4.6-sonnet-medium")).toEqual({
+      base: "claude-4.6-sonnet",
+      effort: "medium",
+      fast: false,
+      thinking: false,
+    });
   });
 
   test("claude-4.6-sonnet-medium-thinking", () => {
-    expect(parseModelId("claude-4.6-sonnet-medium-thinking")).toEqual({ base: "claude-4.6-sonnet", effort: "medium", fast: false, thinking: true });
+    expect(parseModelId("claude-4.6-sonnet-medium-thinking")).toEqual({
+      base: "claude-4.6-sonnet",
+      effort: "medium",
+      fast: false,
+      thinking: true,
+    });
   });
 });
 
@@ -185,12 +296,24 @@ describe("parseModelId", () => {
 describe("buildEffortMap", () => {
   test("full range: none/low/medium/high/xhigh", () => {
     const map = buildEffortMap(new Set(["none", "low", "medium", "high", "xhigh"]));
-    expect(map).toEqual({ minimal: "none", low: "low", medium: "medium", high: "high", xhigh: "xhigh" });
+    expect(map).toEqual({
+      minimal: "none",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+    });
   });
 
   test("with default (empty) and medium", () => {
     const map = buildEffortMap(new Set(["", "low", "medium", "high"]));
-    expect(map).toEqual({ minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "high" });
+    expect(map).toEqual({
+      minimal: "low",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "high",
+    });
   });
 
   test("default without medium — medium maps to empty", () => {
@@ -200,12 +323,24 @@ describe("buildEffortMap", () => {
 
   test("high+max only — all lower levels clamp to high", () => {
     const map = buildEffortMap(new Set(["high", "max"]));
-    expect(map).toEqual({ minimal: "high", low: "high", medium: "high", high: "high", xhigh: "max" });
+    expect(map).toEqual({
+      minimal: "high",
+      low: "high",
+      medium: "high",
+      high: "high",
+      xhigh: "max",
+    });
   });
 
   test("none+low+medium+high+max", () => {
     const map = buildEffortMap(new Set(["none", "low", "medium", "high", "max"]));
-    expect(map).toEqual({ minimal: "none", low: "low", medium: "medium", high: "high", xhigh: "max" });
+    expect(map).toEqual({
+      minimal: "none",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "max",
+    });
   });
 
   test("low+high — medium falls back to low", () => {
@@ -238,8 +373,8 @@ describe("reasoning support", () => {
 describe("processModels", () => {
   test("composer-2 — no effort variants, kept as-is", () => {
     const result = processModels([m("composer-2"), m("composer-2-fast")]);
-    const c2 = result.find(r => r.id === "composer-2");
-    const c2f = result.find(r => r.id === "composer-2-fast");
+    const c2 = result.find((r) => r.id === "composer-2");
+    const c2f = result.find((r) => r.id === "composer-2-fast");
     expect(c2).toBeDefined();
     expect(c2!.supportsEffort).toBe(false);
     expect(c2f).toBeDefined();
@@ -248,7 +383,10 @@ describe("processModels", () => {
 
   test("gpt-5.4 — deduped from low/medium/high/xhigh", () => {
     const result = processModels([
-      m("gpt-5.4-low"), m("gpt-5.4-medium"), m("gpt-5.4-high"), m("gpt-5.4-xhigh"),
+      m("gpt-5.4-low"),
+      m("gpt-5.4-medium"),
+      m("gpt-5.4-high"),
+      m("gpt-5.4-xhigh"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.4");
@@ -259,7 +397,9 @@ describe("processModels", () => {
 
   test("gpt-5.4-fast — deduped from effort+fast variants", () => {
     const result = processModels([
-      m("gpt-5.4-high-fast"), m("gpt-5.4-medium-fast"), m("gpt-5.4-xhigh-fast"),
+      m("gpt-5.4-high-fast"),
+      m("gpt-5.4-medium-fast"),
+      m("gpt-5.4-xhigh-fast"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.4-fast");
@@ -269,14 +409,17 @@ describe("processModels", () => {
   test("augmentCursorModels adds GPT-5.5 context parameter choices to discovered models", () => {
     const augmented = augmentCursorModels([m("gpt-5.5-medium", "GPT-5.5 1M")]);
     const result = processModels(augmented);
-    expect(result.find(r => r.id === "gpt-5.5")?.contextWindow).toBe(272_000);
-    expect(result.find(r => r.id === "gpt-5.5-1m")?.contextWindow).toBe(1_000_000);
+    expect(result.find((r) => r.id === "gpt-5.5")?.contextWindow).toBe(272_000);
+    expect(result.find((r) => r.id === "gpt-5.5-1m")?.contextWindow).toBe(1_000_000);
   });
 
   test("gpt-5.5 — deduped from 272K effort variants", () => {
     const result = processModels([
-      m("gpt-5.5-none"), m("gpt-5.5-low"), m("gpt-5.5-medium", "GPT-5.5 272K"),
-      m("gpt-5.5-high"), m("gpt-5.5-extra-high"),
+      m("gpt-5.5-none"),
+      m("gpt-5.5-low"),
+      m("gpt-5.5-medium", "GPT-5.5 272K"),
+      m("gpt-5.5-high"),
+      m("gpt-5.5-extra-high"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.5");
@@ -289,7 +432,10 @@ describe("processModels", () => {
 
   test("gpt-5.5-fast — deduped from effort+fast variants including low", () => {
     const result = processModels([
-      m("gpt-5.5-low-fast"), m("gpt-5.5-medium-fast"), m("gpt-5.5-high-fast"), m("gpt-5.5-extra-high-fast"),
+      m("gpt-5.5-low-fast"),
+      m("gpt-5.5-medium-fast"),
+      m("gpt-5.5-high-fast"),
+      m("gpt-5.5-extra-high-fast"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.5-fast");
@@ -329,18 +475,18 @@ describe("processModels", () => {
   test("GPT-5.5 augmentation exposes max-mode rows but not impossible 1M fast variants", () => {
     const augmented = augmentCursorModels([m("gpt-5.5", "GPT-5.5")]);
     const processed = processModels(augmented);
-    expect(processed.some(model => model.id === "gpt-5.5-fast")).toBe(true);
-    expect(processed.some(model => model.id === "gpt-5.5-max")).toBe(true);
-    expect(processed.some(model => model.id === "gpt-5.5-max-fast")).toBe(true);
-    expect(processed.some(model => model.id === "gpt-5.5-1m")).toBe(true);
-    expect(processed.some(model => model.id === "gpt-5.5-1m-fast")).toBe(false);
-    expect(augmented.some(model => /^gpt-5\.5-1m-.*-fast$/.test(model.id))).toBe(false);
+    expect(processed.some((model) => model.id === "gpt-5.5-fast")).toBe(true);
+    expect(processed.some((model) => model.id === "gpt-5.5-max")).toBe(true);
+    expect(processed.some((model) => model.id === "gpt-5.5-max-fast")).toBe(true);
+    expect(processed.some((model) => model.id === "gpt-5.5-1m")).toBe(true);
+    expect(processed.some((model) => model.id === "gpt-5.5-1m-fast")).toBe(false);
+    expect(augmented.some((model) => /^gpt-5\.5-1m-.*-fast$/.test(model.id))).toBe(false);
   });
 
   test("metadata-driven GPT-5.5 generation matches Cursor parameterized fixture", () => {
     const generated = modelsFromParameterizedMetadata(gpt55ParameterizedFixture as any);
     const processed = processModels(generated);
-    const ids = processed.map(model => model.id).sort();
+    const ids = processed.map((model) => model.id).sort();
     expect(ids).toEqual([
       "gpt-5.5",
       "gpt-5.5-1m",
@@ -348,9 +494,14 @@ describe("processModels", () => {
       "gpt-5.5-max",
       "gpt-5.5-max-fast",
     ]);
-    expect(processed.find(model => model.id === "gpt-5.5")!.contextWindow).toBe(272_000);
-    expect(processed.find(model => model.id === "gpt-5.5-fast")!.rawRoutingByEffort!.high!.requestedMaxMode).toBe(false);
-    expect(processed.find(model => model.id === "gpt-5.5-max-fast")!.rawRoutingByEffort!.high).toEqual({
+    expect(processed.find((model) => model.id === "gpt-5.5")!.contextWindow).toBe(272_000);
+    expect(
+      processed.find((model) => model.id === "gpt-5.5-fast")!.rawRoutingByEffort!.high!
+        .requestedMaxMode,
+    ).toBe(false);
+    expect(
+      processed.find((model) => model.id === "gpt-5.5-max-fast")!.rawRoutingByEffort!.high,
+    ).toEqual({
       modelId: "gpt-5.5",
       requestedMaxMode: true,
       parameters: [
@@ -359,10 +510,17 @@ describe("processModels", () => {
         { id: "fast", value: "true" },
       ],
     });
-    expect(processed.find(model => model.id === "gpt-5.5-1m")!.contextWindow).toBe(1_000_000);
-    expect(processed.find(model => model.id === "gpt-5.5-1m")!.rawRoutingByEffort!.high!.parameters).toContainEqual({ id: "fast", value: "false" });
-    expect(generated.some(model => model.id.includes("1m") && model.id.endsWith("fast"))).toBe(false);
-    const reasoningValues = generated.flatMap(model => model.parameters ?? []).filter(parameter => parameter.id === "reasoning").map(parameter => parameter.value);
+    expect(processed.find((model) => model.id === "gpt-5.5-1m")!.contextWindow).toBe(1_000_000);
+    expect(
+      processed.find((model) => model.id === "gpt-5.5-1m")!.rawRoutingByEffort!.high!.parameters,
+    ).toContainEqual({ id: "fast", value: "false" });
+    expect(generated.some((model) => model.id.includes("1m") && model.id.endsWith("fast"))).toBe(
+      false,
+    );
+    const reasoningValues = generated
+      .flatMap((model) => model.parameters ?? [])
+      .filter((parameter) => parameter.id === "reasoning")
+      .map((parameter) => parameter.value);
     expect(reasoningValues).not.toContain("minimal");
     expect(reasoningValues).not.toContain("max");
   });
@@ -383,7 +541,7 @@ describe("processModels", () => {
     ] as any);
 
     expect(generated).toHaveLength(2);
-    expect(generated.every(model => model.supportsImages === false)).toBe(true);
+    expect(generated.every((model) => model.supportsImages === false)).toBe(true);
 
     const augmented = augmentCursorModels([m("plain-text-only", "Plain Text Only")], [
       {
@@ -393,7 +551,7 @@ describe("processModels", () => {
         variants: [],
       },
     ] as any);
-    expect(augmented.find(model => model.id === "plain-text-only")?.supportsImages).toBe(false);
+    expect(augmented.find((model) => model.id === "plain-text-only")?.supportsImages).toBe(false);
   });
 
   test("metadata-driven generation covers non-GPT-5.5 parameterized models", () => {
@@ -414,10 +572,34 @@ describe("processModels", () => {
         supportsMaxMode: true,
         supportsNonMaxMode: true,
         variants: [
-          { isMaxMode: false, parameters: [{ id: "reasoning", value: "low" }, { id: "fast", value: "false" }] },
-          { isMaxMode: false, parameters: [{ id: "reasoning", value: "high" }, { id: "fast", value: "false" }] },
-          { isMaxMode: false, parameters: [{ id: "reasoning", value: "low" }, { id: "fast", value: "true" }] },
-          { isMaxMode: false, parameters: [{ id: "reasoning", value: "high" }, { id: "fast", value: "true" }] },
+          {
+            isMaxMode: false,
+            parameters: [
+              { id: "reasoning", value: "low" },
+              { id: "fast", value: "false" },
+            ],
+          },
+          {
+            isMaxMode: false,
+            parameters: [
+              { id: "reasoning", value: "high" },
+              { id: "fast", value: "false" },
+            ],
+          },
+          {
+            isMaxMode: false,
+            parameters: [
+              { id: "reasoning", value: "low" },
+              { id: "fast", value: "true" },
+            ],
+          },
+          {
+            isMaxMode: false,
+            parameters: [
+              { id: "reasoning", value: "high" },
+              { id: "fast", value: "true" },
+            ],
+          },
         ],
       },
       {
@@ -426,35 +608,75 @@ describe("processModels", () => {
         supportsMaxMode: true,
         supportsNonMaxMode: true,
         variants: [
-          { isMaxMode: false, parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "high" }] },
-          { isMaxMode: false, parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "xhigh" }] },
+          {
+            isMaxMode: false,
+            parameters: [
+              { id: "thinking", value: "true" },
+              { id: "context", value: "300k" },
+              { id: "effort", value: "high" },
+            ],
+          },
+          {
+            isMaxMode: false,
+            parameters: [
+              { id: "thinking", value: "true" },
+              { id: "context", value: "300k" },
+              { id: "effort", value: "xhigh" },
+            ],
+          },
         ],
       },
     ] as any);
     const processed = processModels(generated);
-    expect(processed.some(model => model.id === "composer-2-fast")).toBe(true);
-    expect(processed.find(model => model.id === "composer-2-max-mode-fast")!.requestedMaxMode).toBe(true);
-    expect(processed.find(model => model.id === "gpt-5.3-codex-fast")!.rawRoutingByEffort!.high).toEqual({
+    expect(processed.some((model) => model.id === "composer-2-fast")).toBe(true);
+    expect(
+      processed.find((model) => model.id === "composer-2-max-mode-fast")!.requestedMaxMode,
+    ).toBe(true);
+    expect(
+      processed.find((model) => model.id === "gpt-5.3-codex-fast")!.rawRoutingByEffort!.high,
+    ).toEqual({
       modelId: "gpt-5.3-codex",
       requestedMaxMode: false,
-      parameters: [{ id: "reasoning", value: "high" }, { id: "fast", value: "true" }],
+      parameters: [
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "true" },
+      ],
     });
-    expect(processed.find(model => model.id === "gpt-5.3-codex-max-fast")!.rawRoutingByEffort!.high!.requestedMaxMode).toBe(true);
-    expect(processed.find(model => model.id === "claude-opus-4-7-thinking")!.rawRoutingByEffort!.xhigh).toEqual({
+    expect(
+      processed.find((model) => model.id === "gpt-5.3-codex-max-fast")!.rawRoutingByEffort!.high!
+        .requestedMaxMode,
+    ).toBe(true);
+    expect(
+      processed.find((model) => model.id === "claude-opus-4-7-thinking")!.rawRoutingByEffort!.xhigh,
+    ).toEqual({
       modelId: "claude-opus-4-7",
-      parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "xhigh" }],
+      parameters: [
+        { id: "thinking", value: "true" },
+        { id: "context", value: "300k" },
+        { id: "effort", value: "xhigh" },
+      ],
       requestedMaxMode: false,
     });
-    expect(processed.find(model => model.id === "claude-opus-4-7-max-thinking")!.rawRoutingByEffort!.xhigh).toEqual({
+    expect(
+      processed.find((model) => model.id === "claude-opus-4-7-max-thinking")!.rawRoutingByEffort!
+        .xhigh,
+    ).toEqual({
       modelId: "claude-opus-4-7",
-      parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "xhigh" }],
+      parameters: [
+        { id: "thinking", value: "true" },
+        { id: "context", value: "300k" },
+        { id: "effort", value: "xhigh" },
+      ],
       requestedMaxMode: true,
     });
   });
 
   test("gpt-5.2 — deduped from default + effort variants", () => {
     const result = processModels([
-      m("gpt-5.2"), m("gpt-5.2-high"), m("gpt-5.2-low"), m("gpt-5.2-xhigh"),
+      m("gpt-5.2"),
+      m("gpt-5.2-high"),
+      m("gpt-5.2-low"),
+      m("gpt-5.2-xhigh"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.2");
@@ -465,8 +687,11 @@ describe("processModels", () => {
 
   test("gpt-5.4-mini — has none effort", () => {
     const result = processModels([
-      m("gpt-5.4-mini-low"), m("gpt-5.4-mini-medium"), m("gpt-5.4-mini-high"),
-      m("gpt-5.4-mini-xhigh"), m("gpt-5.4-mini-none"),
+      m("gpt-5.4-mini-low"),
+      m("gpt-5.4-mini-medium"),
+      m("gpt-5.4-mini-high"),
+      m("gpt-5.4-mini-xhigh"),
+      m("gpt-5.4-mini-none"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.4-mini");
@@ -477,8 +702,12 @@ describe("processModels", () => {
 
   test("no-reasoning lookup tracks models with none effort", () => {
     const result = processModels([
-      m("gpt-5.4-mini-low"), m("gpt-5.4-mini-medium"), m("gpt-5.4-mini-none"),
-      m("gpt-5.4-low"), m("gpt-5.4-medium"), m("gpt-5.4-high"),
+      m("gpt-5.4-mini-low"),
+      m("gpt-5.4-mini-medium"),
+      m("gpt-5.4-mini-none"),
+      m("gpt-5.4-low"),
+      m("gpt-5.4-medium"),
+      m("gpt-5.4-high"),
     ]);
     const lookup = buildNoReasoningEffortLookup(result);
     expect(lookup.get("gpt-5.4-mini")).toBe("none");
@@ -486,9 +715,7 @@ describe("processModels", () => {
   });
 
   test("claude-4.6-opus — high+max deduped, effort clamped to lowest", () => {
-    const result = processModels([
-      m("claude-4.6-opus-high"), m("claude-4.6-opus-max"),
-    ]);
+    const result = processModels([m("claude-4.6-opus-high"), m("claude-4.6-opus-max")]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("claude-4.6-opus");
     expect(result[0].supportsEffort).toBe(true);
@@ -501,7 +728,8 @@ describe("processModels", () => {
 
   test("claude-4.6-opus-thinking — high+max thinking deduped", () => {
     const result = processModels([
-      m("claude-4.6-opus-high-thinking"), m("claude-4.6-opus-max-thinking"),
+      m("claude-4.6-opus-high-thinking"),
+      m("claude-4.6-opus-max-thinking"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("claude-4.6-opus-thinking");
@@ -528,16 +756,16 @@ describe("processModels", () => {
       m("claude-opus-4-7-thinking-high"),
       m("claude-opus-4-7-thinking-max"),
     ]);
-    const payload: Record<string, unknown> = { model: "claude-opus-4-7-thinking", reasoning_effort: "max" };
+    const payload: Record<string, unknown> = {
+      model: "claude-opus-4-7-thinking",
+      reasoning_effort: "max",
+    };
     applyRawCursorModelId(payload, buildRawModelLookup(processed));
     expect(payload.cursor_model_id).toBe("claude-opus-4-7-thinking-max");
   });
 
   test("raw model lookup routes suffix-style fast models through exact Cursor IDs", () => {
-    const processed = processModels([
-      m("gpt-5.4-medium-fast"),
-      m("gpt-5.4-high-fast"),
-    ]);
+    const processed = processModels([m("gpt-5.4-medium-fast"), m("gpt-5.4-high-fast")]);
     const payload: Record<string, unknown> = { model: "gpt-5.4-fast", reasoning_effort: "high" };
     applyRawCursorModelId(payload, buildRawModelLookup(processed));
     expect(payload.cursor_model_id).toBe("gpt-5.4-high-fast");
@@ -604,7 +832,10 @@ describe("processModels", () => {
         ],
       },
     ]);
-    const payload: Record<string, unknown> = { model: "gpt-5.5-max-fast", reasoning_effort: "high" };
+    const payload: Record<string, unknown> = {
+      model: "gpt-5.5-max-fast",
+      reasoning_effort: "high",
+    };
     applyRawCursorModelId(payload, buildRawModelLookup(processed));
     expect(payload.cursor_model_id).toBe("gpt-5.5");
     expect(payload.cursor_model_parameters).toEqual([
@@ -668,11 +899,7 @@ describe("processModels", () => {
   });
 
   test("raw model lookup has a safe default route when no reasoning_effort is present", () => {
-    const processed = processModels([
-      m("gpt-5.4-low"),
-      m("gpt-5.4-medium"),
-      m("gpt-5.4-high"),
-    ]);
+    const processed = processModels([m("gpt-5.4-low"), m("gpt-5.4-medium"), m("gpt-5.4-high")]);
     const payload: Record<string, unknown> = { model: "gpt-5.4" };
     applyRawCursorModelId(payload, buildRawModelLookup(processed));
     expect(payload.cursor_model_id).toBe("gpt-5.4-medium");
@@ -704,8 +931,10 @@ describe("processModels", () => {
 
   test("gpt-5.1-codex-max — deduped, max stays in base name", () => {
     const result = processModels([
-      m("gpt-5.1-codex-max-low"), m("gpt-5.1-codex-max-medium"),
-      m("gpt-5.1-codex-max-high"), m("gpt-5.1-codex-max-xhigh"),
+      m("gpt-5.1-codex-max-low"),
+      m("gpt-5.1-codex-max-medium"),
+      m("gpt-5.1-codex-max-high"),
+      m("gpt-5.1-codex-max-xhigh"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.1-codex-max");
@@ -714,8 +943,10 @@ describe("processModels", () => {
 
   test("gpt-5.3-codex-spark-preview — deduped", () => {
     const result = processModels([
-      m("gpt-5.3-codex-spark-preview"), m("gpt-5.3-codex-spark-preview-high"),
-      m("gpt-5.3-codex-spark-preview-low"), m("gpt-5.3-codex-spark-preview-xhigh"),
+      m("gpt-5.3-codex-spark-preview"),
+      m("gpt-5.3-codex-spark-preview-high"),
+      m("gpt-5.3-codex-spark-preview-low"),
+      m("gpt-5.3-codex-spark-preview-xhigh"),
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.3-codex-spark-preview");
@@ -724,10 +955,14 @@ describe("processModels", () => {
 
   test("standalone models pass through", () => {
     const result = processModels([
-      m("default"), m("gemini-3-flash"), m("kimi-k2.5"), m("grok-4-20"), m("grok-4-20-thinking"),
+      m("default"),
+      m("gemini-3-flash"),
+      m("kimi-k2.5"),
+      m("grok-4-20"),
+      m("grok-4-20-thinking"),
     ]);
     expect(result).toHaveLength(5);
-    expect(result.every(r => r.supportsEffort === false)).toBe(true);
+    expect(result.every((r) => r.supportsEffort === false)).toBe(true);
   });
 
   test("uses representative name from medium variant", () => {
@@ -755,17 +990,17 @@ describe("processModels", () => {
     expect(result.length).toBeGreaterThan(20);
 
     // Spot checks
-    const composer2 = result.find(r => r.id === "composer-2");
+    const composer2 = result.find((r) => r.id === "composer-2");
     expect(composer2).toBeDefined();
     expect(composer2!.supportsEffort).toBe(false);
 
-    const gpt54 = result.find(r => r.id === "gpt-5.4");
+    const gpt54 = result.find((r) => r.id === "gpt-5.4");
     expect(gpt54).toBeDefined();
     expect(gpt54!.supportsEffort).toBe(true);
     expect(gpt54!.name).toBe("GPT-5.4 1M");
     expect(gpt54!.contextWindow).toBe(1_000_000);
 
-    const gpt55 = result.find(r => r.id === "gpt-5.5");
+    const gpt55 = result.find((r) => r.id === "gpt-5.5");
     expect(gpt55).toBeDefined();
     expect(gpt55!.supportsEffort).toBe(true);
     expect(gpt55!.name).toBe("GPT-5.5 272K");
@@ -774,7 +1009,7 @@ describe("processModels", () => {
     expect(gpt55!.effortMap!.xhigh).toBe("xhigh");
     expect(gpt55!.rawModelByEffort!.xhigh).toBe("gpt-5.5-extra-high");
 
-    const gpt55OneMillion = result.find(r => r.id === "gpt-5.5-1m");
+    const gpt55OneMillion = result.find((r) => r.id === "gpt-5.5-1m");
     expect(gpt55OneMillion).toBeDefined();
     expect(gpt55OneMillion!.supportsEffort).toBe(true);
     expect(gpt55OneMillion!.name).toBe("GPT-5.5 1M");
@@ -790,12 +1025,12 @@ describe("processModels", () => {
       ],
     });
 
-    const gpt55Fast = result.find(r => r.id === "gpt-5.5-fast");
+    const gpt55Fast = result.find((r) => r.id === "gpt-5.5-fast");
     expect(gpt55Fast).toBeDefined();
     expect(gpt55Fast!.contextWindow).toBe(272_000);
     expect(gpt55Fast!.rawRoutingByEffort!.high!.requestedMaxMode).toBe(false);
 
-    const gpt55MaxFast = result.find(r => r.id === "gpt-5.5-max-fast");
+    const gpt55MaxFast = result.find((r) => r.id === "gpt-5.5-max-fast");
     expect(gpt55MaxFast).toBeDefined();
     expect(gpt55MaxFast!.contextWindow).toBe(272_000);
     expect(gpt55MaxFast!.rawRoutingByEffort!.high).toEqual({
@@ -808,25 +1043,25 @@ describe("processModels", () => {
       ],
     });
 
-    expect(result.find(r => r.id === "gpt-5.5-1m-fast")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.5-1m-fast")).toBeUndefined();
 
     // Opus should be deduped too
-    const opus46 = result.find(r => r.id === "claude-4.6-opus");
+    const opus46 = result.find((r) => r.id === "claude-4.6-opus");
     expect(opus46).toBeDefined();
     expect(opus46!.supportsEffort).toBe(true);
-    expect(result.find(r => r.id === "claude-4.6-opus-high")).toBeUndefined();
-    expect(result.find(r => r.id === "claude-4.6-opus-max")).toBeUndefined();
+    expect(result.find((r) => r.id === "claude-4.6-opus-high")).toBeUndefined();
+    expect(result.find((r) => r.id === "claude-4.6-opus-max")).toBeUndefined();
 
     // No raw effort IDs should leak through for deduped models
-    expect(result.find(r => r.id === "gpt-5.4-medium")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.4-high")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-medium")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-high")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-extra-high")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-1m-medium")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-1m-high")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.5-1m-extra-high")).toBeUndefined();
-    expect(result.find(r => r.id === "gpt-5.2-low")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.4-medium")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.4-high")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.5-medium")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.5-high")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.5-extra-high")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.5-1m-medium")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.5-1m-high")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.5-1m-extra-high")).toBeUndefined();
+    expect(result.find((r) => r.id === "gpt-5.2-low")).toBeUndefined();
   });
 });
 
@@ -876,7 +1111,9 @@ describe("resolveModelId", () => {
   });
 
   test("thinking model + effort — inserts before -thinking", () => {
-    expect(resolveModelId("claude-4.6-opus-thinking", "high")).toBe("claude-4.6-opus-high-thinking");
+    expect(resolveModelId("claude-4.6-opus-thinking", "high")).toBe(
+      "claude-4.6-opus-high-thinking",
+    );
     expect(resolveModelId("claude-4.6-opus-thinking", "max")).toBe("claude-4.6-opus-max-thinking");
   });
 
@@ -890,29 +1127,43 @@ describe("resolveModelId", () => {
   });
 
   test("spark-preview model + effort", () => {
-    expect(resolveModelId("gpt-5.3-codex-spark-preview", "xhigh")).toBe("gpt-5.3-codex-spark-preview-xhigh");
+    expect(resolveModelId("gpt-5.3-codex-spark-preview", "xhigh")).toBe(
+      "gpt-5.3-codex-spark-preview-xhigh",
+    );
   });
 
   test("exact cursor model id override wins over suffix insertion", () => {
-    expect(resolveRequestedModelId(
-      "claude-opus-4-7-thinking",
-      "max",
-      "claude-opus-4-7-thinking-max",
-    )).toBe("claude-opus-4-7-thinking-max");
+    expect(
+      resolveRequestedModelId("claude-opus-4-7-thinking", "max", "claude-opus-4-7-thinking-max"),
+    ).toBe("claude-opus-4-7-thinking-max");
   });
 });
 
 // ── Session key derivation ──
 
 const msg = (role: "user" | "assistant" | "system", content: string) => ({ role, content });
-const assistantStep = (text: string) => ({ kind: "assistantText", text } as const);
+const assistantStep = (text: string) => ({ kind: "assistantText", text }) as const;
 const toolStep = (
   toolCallId: string,
   toolName: string,
   args: Record<string, unknown>,
-  result?: { content: string; isError: boolean; images?: Array<{ data: Uint8Array; mimeType: string }> },
-) => ({ kind: "toolCall", toolCallId, toolName, arguments: args, ...(result ? { result } : {}) } as const);
-const turn = (userText: string, steps: ParsedTurn["steps"] = []): ParsedTurn => ({ userText, steps });
+  result?: {
+    content: string;
+    isError: boolean;
+    images?: Array<{ data: Uint8Array; mimeType: string }>;
+  },
+) =>
+  ({
+    kind: "toolCall",
+    toolCallId,
+    toolName,
+    arguments: args,
+    ...(result ? { result } : {}),
+  }) as const;
+const turn = (userText: string, steps: ParsedTurn["steps"] = []): ParsedTurn => ({
+  userText,
+  steps,
+});
 const pngBytes = () => new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
 const pngBase64 = () => Buffer.from(pngBytes()).toString("base64");
 const jpegBytes = () => new Uint8Array([0xff, 0xd8, 0xff, 1, 2, 3, 4]);
@@ -945,9 +1196,7 @@ describe("extractToolResultImagePayloads", () => {
     };
 
     const extracted = extractToolResultImagePayloads(ctx, {
-      messages: [
-        { role: "tool", tool_call_id: "tc1", content: "(see attached image)" },
-      ],
+      messages: [{ role: "tool", tool_call_id: "tc1", content: "(see attached image)" }],
     });
 
     expect(extracted).toEqual([
@@ -956,19 +1205,24 @@ describe("extractToolResultImagePayloads", () => {
   });
 
   test("ignores branch images whose toolCallId is not in the provider payload", () => {
-    const extracted = extractToolResultImagePayloads({
-      sessionManager: {
-        getBranch: () => [{
-          message: {
-            role: "toolResult",
-            toolCallId: "tc-other",
-            content: [{ type: "image", data: pngBase64(), mimeType: "image/png" }],
-          },
-        }],
+    const extracted = extractToolResultImagePayloads(
+      {
+        sessionManager: {
+          getBranch: () => [
+            {
+              message: {
+                role: "toolResult",
+                toolCallId: "tc-other",
+                content: [{ type: "image", data: pngBase64(), mimeType: "image/png" }],
+              },
+            },
+          ],
+        },
       },
-    }, {
-      messages: [{ role: "tool", tool_call_id: "tc1", content: "result" }],
-    });
+      {
+        messages: [{ role: "tool", tool_call_id: "tc1", content: "result" }],
+      },
+    );
 
     expect(extracted).toEqual([]);
   });
@@ -1037,9 +1291,15 @@ describe("session cleanup", () => {
     const heartbeatTimer = setInterval(() => {}, 60_000);
     __testInternals.activeBridges.set(bridgeKey, {
       bridge: {
-        get alive() { return true; },
-        write(data: Uint8Array) { writes.push(data); },
-        end() { ended++; },
+        get alive() {
+          return true;
+        },
+        write(data: Uint8Array) {
+          writes.push(data);
+        },
+        end() {
+          ended++;
+        },
         onData() {},
         onClose() {},
         proc: {} as any,
@@ -1054,12 +1314,18 @@ describe("session cleanup", () => {
       conversationId: "conv",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
-    return { bridgeKey, convKey, writes, get ended() { return ended; } };
+    return {
+      bridgeKey,
+      convKey,
+      writes,
+      get ended() {
+        return ended;
+      },
+    };
   }
 
   test("cleanupSessionState removes active bridge and conversation for the session", () => {
@@ -1099,7 +1365,9 @@ describe("session cleanup hook wiring", () => {
     const heartbeatTimer = setInterval(() => {}, 60_000);
     __testInternals.activeBridges.set(bridgeKey, {
       bridge: {
-        get alive() { return false; },
+        get alive() {
+          return false;
+        },
         write() {},
         end() {},
         onData() {},
@@ -1116,17 +1384,23 @@ describe("session cleanup hook wiring", () => {
       conversationId: "conv",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
 
     const ctx = { sessionManager: { getSessionId: () => sessionId } };
-    for (const event of ["session_before_switch", "session_before_fork", "session_before_tree", "session_shutdown"]) {
+    for (const event of [
+      "session_before_switch",
+      "session_before_fork",
+      "session_before_tree",
+      "session_shutdown",
+    ]) {
       __testInternals.activeBridges.set(bridgeKey, {
         bridge: {
-          get alive() { return false; },
+          get alive() {
+            return false;
+          },
           write() {},
           end() {},
           onData() {},
@@ -1142,8 +1416,7 @@ describe("session cleanup hook wiring", () => {
       __testInternals.conversationStates.set(convKey, {
         conversationId: "conv",
         checkpoint: null,
-  
-  
+
         sessionScoped: true,
         blobStore: new Map(),
         lastAccessMs: Date.now(),
@@ -1162,7 +1435,6 @@ describe("session-scoped eviction policy", () => {
       conversationId: "conv-session",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: 0,
@@ -1177,7 +1449,6 @@ describe("session-scoped eviction policy", () => {
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-anon",
       checkpoint: null,
-
 
       sessionScoped: false,
       blobStore: new Map(),
@@ -1194,7 +1465,6 @@ describe("session-scoped eviction policy", () => {
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-explicit",
       checkpoint: null,
-
 
       sessionScoped: true,
       blobStore: new Map(),
@@ -1229,7 +1499,7 @@ describe("derivePiSessionId", () => {
 function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>) {
   const clientMsg = fromBinary(AgentClientMessageSchema, payload.requestBytes);
   expect(clientMsg.message.case).toBe("runRequest");
-  return clientMsg.message.value as InstanceType<typeof AgentRunRequestSchema["$typeName"]> & any;
+  return clientMsg.message.value as InstanceType<(typeof AgentRunRequestSchema)["$typeName"]> & any;
 }
 
 function resolveBlob(data: Uint8Array, blobStore?: Map<string, Uint8Array>): Uint8Array {
@@ -1247,7 +1517,9 @@ function decodeTurns(state: any, blobStore?: Map<string, Uint8Array>) {
     expect(turnStruct.turn.case).toBe("agentConversationTurn");
     const agentTurn = turnStruct.turn.value as any;
     const userMsg = fromBinary(UserMessageSchema, resolveBlob(agentTurn.userMessage, blobStore));
-    const steps = (agentTurn.steps as Uint8Array[]).map((s: Uint8Array) => fromBinary(ConversationStepSchema, resolveBlob(s, blobStore)));
+    const steps = (agentTurn.steps as Uint8Array[]).map((s: Uint8Array) =>
+      fromBinary(ConversationStepSchema, resolveBlob(s, blobStore)),
+    );
     return { userMsg, steps };
   });
 }
@@ -1271,7 +1543,16 @@ describe("buildCursorRequest — turn reconstruction", () => {
   });
 
   test("max mode flag is sent without changing the model ID", () => {
-    const payload = buildCursorRequest("gpt-5.3-codex", "system", "hello", [], "conv-1", null, undefined, true);
+    const payload = buildCursorRequest(
+      "gpt-5.3-codex",
+      "system",
+      "hello",
+      [],
+      "conv-1",
+      null,
+      undefined,
+      true,
+    );
     const req = decodeRunRequest(payload);
     expect(req.modelDetails).toBeUndefined();
     expect(req.requestedModel.modelId).toBe("gpt-5.3-codex");
@@ -1280,25 +1561,50 @@ describe("buildCursorRequest — turn reconstruction", () => {
   });
 
   test("required max mode flag is sent for 1M parameterized models", () => {
-    const payload = buildCursorRequest("gpt-5.5", "system", "hello", [], "conv-1", null, undefined, true, [
-      { id: "context", value: "1m" },
-      { id: "reasoning", value: "high" },
-      { id: "fast", value: "true" },
-    ]);
+    const payload = buildCursorRequest(
+      "gpt-5.5",
+      "system",
+      "hello",
+      [],
+      "conv-1",
+      null,
+      undefined,
+      true,
+      [
+        { id: "context", value: "1m" },
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "true" },
+      ],
+    );
     const req = decodeRunRequest(payload);
     expect(req.requestedModel.modelId).toBe("gpt-5.5");
     expect(req.requestedModel.maxMode).toBe(true);
   });
 
   test("requestedModel includes Cursor parameterized model settings", () => {
-    const payload = buildCursorRequest("gpt-5.5", "system", "hello", [], "conv-1", null, undefined, false, [
-      { id: "context", value: "1m" },
-      { id: "reasoning", value: "high" },
-      { id: "fast", value: "true" },
-    ]);
+    const payload = buildCursorRequest(
+      "gpt-5.5",
+      "system",
+      "hello",
+      [],
+      "conv-1",
+      null,
+      undefined,
+      false,
+      [
+        { id: "context", value: "1m" },
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "true" },
+      ],
+    );
     const req = decodeRunRequest(payload);
     expect(req.requestedModel.modelId).toBe("gpt-5.5");
-    expect(req.requestedModel.parameters.map((parameter: any) => ({ id: parameter.id, value: parameter.value }))).toEqual([
+    expect(
+      req.requestedModel.parameters.map((parameter: any) => ({
+        id: parameter.id,
+        value: parameter.value,
+      })),
+    ).toEqual([
       { id: "context", value: "1m" },
       { id: "reasoning", value: "high" },
       { id: "fast", value: "true" },
@@ -1313,7 +1619,18 @@ describe("buildCursorRequest — turn reconstruction", () => {
       description: "Read a file",
       inputSchema: new Uint8Array([1, 2, 3]),
     });
-    const payload = buildCursorRequest("gpt-5", "system", "hello", [], "conv-1", null, undefined, false, [], [tool]);
+    const payload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "hello",
+      [],
+      "conv-1",
+      null,
+      undefined,
+      false,
+      [],
+      [tool],
+    );
     const req = decodeRunRequest(payload);
     expect(payload.mcpTools).toHaveLength(1);
     expect(req.mcpTools.mcpTools).toHaveLength(1);
@@ -1323,7 +1640,19 @@ describe("buildCursorRequest — turn reconstruction", () => {
 
   test("adds inline images to the current user message selected context", () => {
     const image = { data: pngBytes(), mimeType: "image/png" };
-    const payload = buildCursorRequest("gpt-5", "system", "describe this", [], "conv-1", null, undefined, false, [], [], [image]);
+    const payload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "describe this",
+      [],
+      "conv-1",
+      null,
+      undefined,
+      false,
+      [],
+      [],
+      [image],
+    );
     const req = decodeRunRequest(payload);
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toBe("describe this");
@@ -1376,7 +1705,12 @@ describe("buildCursorRequest — turn reconstruction", () => {
   test("no checkpoint, reconstructs tool-call steps and final assistant text", () => {
     const turns = [
       turn("inspect file", [
-        toolStep("tc1", "read", { path: "src/index.ts" }, { content: "file contents", isError: false }),
+        toolStep(
+          "tc1",
+          "read",
+          { path: "src/index.ts" },
+          { content: "file contents", isError: false },
+        ),
         assistantStep("I found the issue."),
       ]),
     ];
@@ -1394,8 +1728,12 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(toolCallStep.message.value.tool.value.args?.toolCallId).toBe("tc1");
     expect(toolCallStep.message.value.tool.value.args?.toolName).toBe("read");
     expect(toolCallStep.message.value.tool.value.result?.result.case).toBe("success");
-    expect(toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.case).toBe("text");
-    expect(toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.value.text).toBe("file contents");
+    expect(
+      toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.case,
+    ).toBe("text");
+    expect(
+      toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.value.text,
+    ).toBe("file contents");
 
     const finalAssistantStep = decoded[0].steps[1]!;
     expect(finalAssistantStep.message.case).toBe("assistantMessage");
@@ -1408,10 +1746,22 @@ describe("buildCursorRequest — turn reconstruction", () => {
   test("no checkpoint, reconstructs tool-call image result content", () => {
     const turns = [
       turn("capture screenshot", [
-        toolStep("tc1", "screenshot", {}, { content: "", isError: false, images: [{ data: pngBytes(), mimeType: "image/png" }] }),
+        toolStep(
+          "tc1",
+          "screenshot",
+          {},
+          { content: "", isError: false, images: [{ data: pngBytes(), mimeType: "image/png" }] },
+        ),
       ]),
     ];
-    const payload = buildCursorRequest("gpt-5", "system", "what do you see?", turns, "conv-1", null);
+    const payload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "what do you see?",
+      turns,
+      "conv-1",
+      null,
+    );
     const req = decodeRunRequest(payload);
     const decoded = decodeTurns(req.conversationState, payload.blobStore);
     const toolCallStep = decoded[0].steps[0]!;
@@ -1457,10 +1807,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
   });
 
   test("each reconstructed turn has a unique messageId", () => {
-    const turns = [
-      turn("a", [assistantStep("b")]),
-      turn("a", [assistantStep("b")]),
-    ];
+    const turns = [turn("a", [assistantStep("b")]), turn("a", [assistantStep("b")])];
     const payload = buildCursorRequest("gpt-5", "system", "c", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
     const decoded = decodeTurns(req.conversationState, payload.blobStore);
@@ -1500,10 +1847,13 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
 describe("parseMessages — structured tool turns", () => {
   test("extracts OpenAI-style data URL images from user content", () => {
     const parsed = parseMessages([
-      { role: "user", content: [
-        { type: "text", text: "describe this" },
-        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
-      ] },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe this" },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+        ],
+      },
     ]);
 
     expect(parsed.userText).toBe("describe this");
@@ -1514,9 +1864,12 @@ describe("parseMessages — structured tool turns", () => {
 
   test("accepts image-only user prompts", () => {
     const parsed = parseMessages([
-      { role: "user", content: [
-        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
-      ] },
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+        ],
+      },
     ]);
 
     expect(parsed.userText).toBe("");
@@ -1525,39 +1878,57 @@ describe("parseMessages — structured tool turns", () => {
   });
 
   test("rejects remote OpenAI image_url values with an explicit error", () => {
-    expect(() => parseMessages([
-      { role: "user", content: [
-        { type: "text", text: "describe this" },
-        { type: "image_url", image_url: { url: "https://example.com/image.png" } },
-      ] },
-    ])).toThrow(/Remote image URLs are not supported/);
+    expect(() =>
+      parseMessages([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe this" },
+            { type: "image_url", image_url: { url: "https://example.com/image.png" } },
+          ],
+        },
+      ]),
+    ).toThrow(/Remote image URLs are not supported/);
   });
 
   test("rejects user images that do not match Cursor CLI supported magic bytes", () => {
-    expect(() => parseMessages([
-      { role: "user", content: [
-        { type: "text", text: "describe this" },
-        { type: "image_url", image_url: { url: "data:image/png;base64,AQIDBA==" } },
-      ] },
-    ])).toThrow(/Unsupported image type/);
+    expect(() =>
+      parseMessages([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe this" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AQIDBA==" } },
+          ],
+        },
+      ]),
+    ).toThrow(/Unsupported image type/);
   });
 
   test("rejects oversized user images using Cursor CLI's processed payload cap", () => {
     const bytes = new Uint8Array(5_242_881);
     bytes.set([0xff, 0xd8, 0xff]);
-    expect(() => parseMessages([
-      { role: "user", content: [
-        { type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: "image/jpeg" },
-      ] },
-    ])).toThrow(/exceeds Cursor CLI's 5242880 byte limit/);
+    expect(() =>
+      parseMessages([
+        {
+          role: "user",
+          content: [
+            { type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: "image/jpeg" },
+          ],
+        },
+      ]),
+    ).toThrow(/exceeds Cursor CLI's 5242880 byte limit/);
   });
 
   test("preserves images on completed prior turns", () => {
     const parsed = parseMessages([
-      { role: "user", content: [
-        { type: "text", text: "look" },
-        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${jpegBase64()}` } },
-      ] },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "look" },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${jpegBase64()}` } },
+        ],
+      },
       { role: "assistant", content: "done" },
       { role: "user", content: "next" },
     ]);
@@ -1575,12 +1946,22 @@ describe("parseMessages — structured tool turns", () => {
       {
         role: "assistant" as const,
         content: null,
-        tool_calls: [{ id: "tc1", type: "function" as const, function: { name: "screenshot", arguments: "{}" } }],
+        tool_calls: [
+          {
+            id: "tc1",
+            type: "function" as const,
+            function: { name: "screenshot", arguments: "{}" },
+          },
+        ],
       },
-      { role: "tool" as const, tool_call_id: "tc1", content: [
-        { type: "text", text: "screenshot attached" },
-        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
-      ] },
+      {
+        role: "tool" as const,
+        tool_call_id: "tc1",
+        content: [
+          { type: "text", text: "screenshot attached" },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+        ],
+      },
     ]);
 
     expect(parsed.toolResults).toHaveLength(1);
@@ -1596,13 +1977,22 @@ describe("parseMessages — structured tool turns", () => {
       {
         role: "assistant" as const,
         content: null,
-        tool_calls: [{ id: "tc1", type: "function" as const, function: { name: "screenshot", arguments: "{}" } }],
+        tool_calls: [
+          {
+            id: "tc1",
+            type: "function" as const,
+            function: { name: "screenshot", arguments: "{}" },
+          },
+        ],
       },
       { role: "tool" as const, tool_call_id: "tc1", content: "(see attached image)" },
-      { role: "user" as const, content: [
-        { type: "text", text: "Attached image(s) from tool result:" },
-        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
-      ] },
+      {
+        role: "user" as const,
+        content: [
+          { type: "text", text: "Attached image(s) from tool result:" },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+        ],
+      },
     ]);
 
     expect(parsed.userText).toBe("capture screenshot");
@@ -1619,7 +2009,9 @@ describe("parseMessages — structured tool turns", () => {
       {
         role: "assistant",
         content: null,
-        tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"X"}' } }],
+        tool_calls: [
+          { id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"X"}' } },
+        ],
       },
       { role: "tool", content: "file contents here", tool_call_id: "tc1" },
       { role: "assistant", content: "Here is file X..." },
@@ -1629,10 +2021,12 @@ describe("parseMessages — structured tool turns", () => {
     expect(parsed.userText).toBe("now do Y");
     expect(parsed.toolResults).toEqual([]);
     expect(parsed.turns).toHaveLength(1);
-    expect(parsed.turns[0]).toEqual(turn("read file X", [
-      toolStep("tc1", "read", { path: "X" }, { content: "file contents here", isError: false }),
-      assistantStep("Here is file X..."),
-    ]));
+    expect(parsed.turns[0]).toEqual(
+      turn("read file X", [
+        toolStep("tc1", "read", { path: "X" }, { content: "file contents here", isError: false }),
+        assistantStep("Here is file X..."),
+      ]),
+    );
   });
 
   test("tool result continuation does not inflate completed turn count", () => {
@@ -1647,7 +2041,17 @@ describe("parseMessages — structured tool turns", () => {
     const toolResultMsgs = [
       { role: "system" as const, content: "system" },
       { role: "user" as const, content: "read file X" },
-      { role: "assistant" as const, content: null, tool_calls: [{ id: "tc1", type: "function" as const, function: { name: "read", arguments: '{"path":"X"}' } }] },
+      {
+        role: "assistant" as const,
+        content: null,
+        tool_calls: [
+          {
+            id: "tc1",
+            type: "function" as const,
+            function: { name: "read", arguments: '{"path":"X"}' },
+          },
+        ],
+      },
       { role: "tool" as const, content: "file contents here", tool_call_id: "tc1" },
     ];
     const toolResult = parseMessages(toolResultMsgs);
@@ -1681,7 +2085,13 @@ describe("parseMessages — structured tool turns", () => {
     const toolResultMsgs = [
       ...initialMsgs.slice(0, -1),
       { role: "user" as const, content: "u3" },
-      { role: "assistant" as const, content: null, tool_calls: [{ id: "t1", type: "function" as const, function: { name: "bash", arguments: '{}' } }] },
+      {
+        role: "assistant" as const,
+        content: null,
+        tool_calls: [
+          { id: "t1", type: "function" as const, function: { name: "bash", arguments: "{}" } },
+        ],
+      },
       { role: "tool" as const, content: "output", tool_call_id: "t1" },
     ];
     const toolResult = parseMessages(toolResultMsgs);
@@ -1709,13 +2119,25 @@ describe("parseMessages — structured tool turns", () => {
       {
         role: "assistant" as const,
         content: "starting review",
-        tool_calls: [{ id: "t1", type: "function" as const, function: { name: "read", arguments: '{"path":"package.json"}' } }],
+        tool_calls: [
+          {
+            id: "t1",
+            type: "function" as const,
+            function: { name: "read", arguments: '{"path":"package.json"}' },
+          },
+        ],
       },
       { role: "tool" as const, content: "pkg", tool_call_id: "t1" },
       {
         role: "assistant" as const,
         content: "continuing review",
-        tool_calls: [{ id: "t2", type: "function" as const, function: { name: "read", arguments: '{"path":"README.md"}' } }],
+        tool_calls: [
+          {
+            id: "t2",
+            type: "function" as const,
+            function: { name: "read", arguments: '{"path":"README.md"}' },
+          },
+        ],
       },
     ]);
 
@@ -1886,19 +2308,24 @@ function makeMcpExecMessage(toolCallId: string, toolName: string, args: Record<s
 
 async function postChatCompletion(port: number, body: Record<string, unknown>) {
   return new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
-    const req = httpRequest({
-      hostname: "127.0.0.1",
-      port,
-      path: "/v1/chat/completions",
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    }, (res) => {
-      let data = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => { data += chunk; });
-      res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body: data }));
-      res.on("error", reject);
-    });
+    const req = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      },
+      (res) => {
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          data += chunk;
+        });
+        res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body: data }));
+        res.on("error", reject);
+      },
+    );
     req.on("error", reject);
     req.end(JSON.stringify(body));
   });
@@ -1907,24 +2334,32 @@ async function postChatCompletion(port: number, body: Record<string, unknown>) {
 describe("proxy integration — session handling", () => {
   test("image-only user request forwards selected images through the HTTP proxy", async () => {
     const runRequests: any[] = [];
-    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
-      if (clientMessage.message.case === "runRequest") {
-        runRequests.push(clientMessage.message.value);
-        setTimeout(() => {
-          fake.emitServerMessage(makeTextDeltaMessage("image received"));
-          fake.emitServerMessage(makeCheckpointMessage());
-          fake.close(0);
-        }, 0);
-      }
-    }));
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("image received"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
 
     const port = await startProxy(async () => "test-token");
     const response = await postChatCompletion(port, {
       model: "gpt-5",
       pi_session_id: "session-user-image",
-      messages: [{ role: "user", content: [
-        { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
-      ] }],
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+          ],
+        },
+      ],
     });
 
     expect(response.statusCode).toBe(200);
@@ -1978,8 +2413,8 @@ describe("proxy integration — session handling", () => {
     });
 
     expect(first.statusCode).toBe(200);
-    expect(first.body).toContain("\"finish_reason\":\"tool_calls\"");
-    expect(first.body).toContain("\"id\":\"tc1\"");
+    expect(first.body).toContain('"finish_reason":"tool_calls"');
+    expect(first.body).toContain('"id":"tc1"');
     expect(bridges).toHaveLength(1);
     expect(runRequests).toHaveLength(1);
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
@@ -1989,7 +2424,17 @@ describe("proxy integration — session handling", () => {
       pi_session_id: sessionId,
       messages: [
         { role: "user", content: "inspect file" },
-        { role: "assistant", content: null, tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "tc1",
+              type: "function",
+              function: { name: "read", arguments: '{"path":"README.md"}' },
+            },
+          ],
+        },
         { role: "tool", content: "README contents", tool_call_id: "tc1" },
       ],
     });
@@ -2005,25 +2450,27 @@ describe("proxy integration — session handling", () => {
 
     const stored = __testInternals.conversationStates.get(convKey);
     expect(stored?.checkpoint).toBeTruthy();
-
   });
 
   test("tool-call continuation forwards tool result images as MCP image content", async () => {
     const execClientMessages: any[] = [];
-    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
-      if (clientMessage.message.case === "runRequest") {
-        fake.emitServerMessage(makeMcpExecMessage("tc1", "screenshot", {}));
-        return;
-      }
-      if (clientMessage.message.case === "execClientMessage") {
-        execClientMessages.push(clientMessage.message.value);
-        setTimeout(() => {
-          fake.emitServerMessage(makeTextDeltaMessage("I can see it."));
-          fake.emitServerMessage(makeCheckpointMessage());
-          fake.close(0);
-        }, 0);
-      }
-    }));
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(makeMcpExecMessage("tc1", "screenshot", {}));
+            return;
+          }
+          if (clientMessage.message.case === "execClientMessage") {
+            execClientMessages.push(clientMessage.message.value);
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("I can see it."));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
 
     const port = await startProxy(async () => "test-token");
     const sessionId = "session-tool-image";
@@ -2034,20 +2481,31 @@ describe("proxy integration — session handling", () => {
       tools: [{ type: "function", function: { name: "screenshot" } }],
     });
     expect(first.statusCode).toBe(200);
-    expect(first.body).toContain("\"finish_reason\":\"tool_calls\"");
+    expect(first.body).toContain('"finish_reason":"tool_calls"');
 
     const second = await postChatCompletion(port, {
       model: "gpt-5",
       pi_session_id: sessionId,
-      cursor_tool_result_images: [{ toolCallId: "tc1", images: [{ data: pngBase64(), mimeType: "image/png" }] }],
+      cursor_tool_result_images: [
+        { toolCallId: "tc1", images: [{ data: pngBase64(), mimeType: "image/png" }] },
+      ],
       messages: [
         { role: "user", content: "capture screenshot" },
-        { role: "assistant", content: null, tool_calls: [{ id: "tc1", type: "function", function: { name: "screenshot", arguments: "{}" } }] },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "tc1", type: "function", function: { name: "screenshot", arguments: "{}" } },
+          ],
+        },
         { role: "tool", content: "(see attached image)", tool_call_id: "tc1" },
-        { role: "user", content: [
-          { type: "text", text: "Attached image(s) from tool result:" },
-          { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
-        ] },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Attached image(s) from tool result:" },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+          ],
+        },
       ],
     });
 
@@ -2097,7 +2555,17 @@ describe("proxy integration — session handling", () => {
       pi_session_id: sessionId,
       messages: [
         { role: "user", content: "inspect file" },
-        { role: "assistant", content: null, tool_calls: [{ id: "tc-lost", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "tc-lost",
+              type: "function",
+              function: { name: "read", arguments: '{"path":"README.md"}' },
+            },
+          ],
+        },
         { role: "tool", content: "README contents", tool_call_id: "tc-lost" },
       ],
     });
@@ -2119,6 +2587,199 @@ describe("proxy integration — session handling", () => {
     expect(response.body).toContain("nonstream_tools_unsupported");
   });
 
+  test("tool_choice none suppresses exposed MCP tools", async () => {
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      messages: [{ role: "user", content: "inspect file" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+      tool_choice: "none",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+    expect(runRequests[0].mcpTools.mcpTools).toHaveLength(0);
+  });
+
+  test("max_tokens compatibility field is accepted as a no-op", async () => {
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      messages: [{ role: "user", content: "hello" }],
+      max_tokens: 10,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+  });
+
+  test("unsupported OpenAI request parameters are rejected explicitly", async () => {
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      messages: [{ role: "user", content: "hello" }],
+      temperature: 0.2,
+      max_tokens: 10,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toContain("unsupported_parameter");
+    expect(response.body).toContain("temperature");
+    expect(response.body).not.toContain("max_tokens");
+  });
+
+  test("unsupported tool_choice values are rejected explicitly", async () => {
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+      tool_choice: "required",
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toContain("unsupported_tool_choice");
+  });
+
+  test("upstream stream errors preserve the last committed conversation checkpoint", async () => {
+    const sessionId = "session-stream-error-preserve";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const priorTurns = [turn("earlier", [assistantStep("done")])];
+    const priorPayload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "next",
+      priorTurns,
+      "conv-stream-error",
+      null,
+    );
+    const priorCheckpoint = toBinary(
+      ConversationStateStructureSchema,
+      decodeRunRequest(priorPayload).conversationState,
+    );
+    const failedBlobId = new Uint8Array([9, 9, 9, 9]);
+    const failedBlobKey = Buffer.from(failedBlobId).toString("hex");
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-stream-error",
+      checkpoint: priorCheckpoint,
+      checkpointTurnCount: priorTurns.length,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(priorTurns),
+      sessionScoped: true,
+      blobStore: new Map(priorPayload.blobStore),
+      lastAccessMs: Date.now(),
+    });
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(
+              makeSetBlobMessage(failedBlobId, new TextEncoder().encode("failed blob")),
+            );
+            fake.emitEndStream({ error: { code: "internal", message: "boom" } });
+            fake.close(0);
+          }
+        }),
+    );
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "next" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("boom");
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(priorCheckpoint);
+    expect(__testInternals.conversationStates.get(convKey)?.blobStore.has(failedBlobKey)).toBe(
+      false,
+    );
+  });
+
+  test("upstream non-stream errors preserve the last committed conversation checkpoint", async () => {
+    const sessionId = "session-nonstream-error-preserve";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const priorTurns = [turn("earlier", [assistantStep("done")])];
+    const priorPayload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "next",
+      priorTurns,
+      "conv-nonstream-error",
+      null,
+    );
+    const priorCheckpoint = toBinary(
+      ConversationStateStructureSchema,
+      decodeRunRequest(priorPayload).conversationState,
+    );
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-nonstream-error",
+      checkpoint: priorCheckpoint,
+      checkpointTurnCount: priorTurns.length,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(priorTurns),
+      sessionScoped: true,
+      blobStore: new Map(priorPayload.blobStore),
+      lastAccessMs: Date.now(),
+    });
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitEndStream({ error: { code: "internal", message: "boom" } });
+            fake.close(0);
+          }
+        }),
+    );
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      stream: false,
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "next" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.body).toContain("boom");
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(priorCheckpoint);
+  });
+
   test("partial tool-result batches stay in-flight until all pending tool results arrive", async () => {
     const execClientMessages: any[] = [];
     const sessionId = "session-partial-tools";
@@ -2129,24 +2790,26 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-partial-tools",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
 
-    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
-      if (clientMessage.message.case === "execClientMessage") {
-        execClientMessages.push(clientMessage.message.value);
-        if (execClientMessages.length === 2) {
-          setTimeout(() => {
-            fake.emitServerMessage(makeTextDeltaMessage("final review"));
-            fake.emitServerMessage(makeCheckpointMessage());
-            fake.close(0);
-          }, 0);
+    const bridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "execClientMessage") {
+          execClientMessages.push(clientMessage.message.value);
+          if (execClientMessages.length === 2) {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("final review"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
         }
-      }
-    });
+      },
+    );
 
     __testInternals.activeBridges.set(bridgeKey, {
       bridge: bridge as any,
@@ -2154,8 +2817,20 @@ describe("proxy integration — session handling", () => {
       blobStore: new Map(),
       mcpTools: [],
       pendingExecs: [
-        { execId: "exec-1", execMsgId: 1, toolCallId: "tc1", toolName: "read", decodedArgs: '{"path":"package.json"}' },
-        { execId: "exec-2", execMsgId: 2, toolCallId: "tc2", toolName: "read", decodedArgs: '{"path":"README.md"}' },
+        {
+          execId: "exec-1",
+          execMsgId: 1,
+          toolCallId: "tc1",
+          toolName: "read",
+          decodedArgs: '{"path":"package.json"}',
+        },
+        {
+          execId: "exec-2",
+          execMsgId: 2,
+          toolCallId: "tc2",
+          toolName: "read",
+          decodedArgs: '{"path":"README.md"}',
+        },
       ],
       currentTurn: turn("review it", [
         assistantStep("starting review"),
@@ -2172,9 +2847,29 @@ describe("proxy integration — session handling", () => {
       pi_session_id: sessionId,
       messages: [
         { role: "user", content: "review it" },
-        { role: "assistant", content: "starting review", tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"package.json"}' } }] },
+        {
+          role: "assistant",
+          content: "starting review",
+          tool_calls: [
+            {
+              id: "tc1",
+              type: "function",
+              function: { name: "read", arguments: '{"path":"package.json"}' },
+            },
+          ],
+        },
         { role: "tool", content: "pkg", tool_call_id: "tc1" },
-        { role: "assistant", content: "continuing review", tool_calls: [{ id: "tc2", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+        {
+          role: "assistant",
+          content: "continuing review",
+          tool_calls: [
+            {
+              id: "tc2",
+              type: "function",
+              function: { name: "read", arguments: '{"path":"README.md"}' },
+            },
+          ],
+        },
       ],
     });
 
@@ -2185,17 +2880,41 @@ describe("proxy integration — session handling", () => {
     expect(execClientMessages).toHaveLength(0);
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
     const partialBridge = __testInternals.activeBridges.get(bridgeKey);
-    const partialT1 = partialBridge?.currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === "tc1");
-    expect(partialT1 && partialT1.kind === "toolCall" ? partialT1.result?.content : undefined).toBe("pkg");
+    const partialT1 = partialBridge?.currentTurn.steps.find(
+      (step) => step.kind === "toolCall" && step.toolCallId === "tc1",
+    );
+    expect(partialT1 && partialT1.kind === "toolCall" ? partialT1.result?.content : undefined).toBe(
+      "pkg",
+    );
 
     const complete = await postChatCompletion(port, {
       model: "gpt-5",
       pi_session_id: sessionId,
       messages: [
         { role: "user", content: "review it" },
-        { role: "assistant", content: "starting review", tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"package.json"}' } }] },
+        {
+          role: "assistant",
+          content: "starting review",
+          tool_calls: [
+            {
+              id: "tc1",
+              type: "function",
+              function: { name: "read", arguments: '{"path":"package.json"}' },
+            },
+          ],
+        },
         { role: "tool", content: "pkg", tool_call_id: "tc1" },
-        { role: "assistant", content: "continuing review", tool_calls: [{ id: "tc2", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+        {
+          role: "assistant",
+          content: "continuing review",
+          tool_calls: [
+            {
+              id: "tc2",
+              type: "function",
+              function: { name: "read", arguments: '{"path":"README.md"}' },
+            },
+          ],
+        },
         { role: "tool", content: "readme", tool_call_id: "tc2" },
       ],
     });
@@ -2204,12 +2923,15 @@ describe("proxy integration — session handling", () => {
     expect(complete.body).toContain("final review");
     expect(execClientMessages).toHaveLength(2);
     expect(execClientMessages.map((m) => m.execId)).toEqual(["exec-1", "exec-2"]);
-    expect(execClientMessages.every((m) => m.message.case === "mcpResult" && m.message.value.result.case === "success")).toBe(true);
+    expect(
+      execClientMessages.every(
+        (m) => m.message.case === "mcpResult" && m.message.value.result.case === "success",
+      ),
+    ).toBe(true);
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
 
     const stored = __testInternals.conversationStates.get(convKey);
     expect(stored?.checkpoint).toBeTruthy();
-
   });
 
   test("tool-call pause closes the SSE without cancelling the live bridge", async () => {
@@ -2223,19 +2945,21 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-tool-pause-close",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
 
-    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
-      if (clientMessage.message.case === "conversationAction") {
-        expect(clientMessage.message.value.action.case).toBe("cancelAction");
-        cancelCount += 1;
-        fake.close(0);
-      }
-    });
+    const bridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "conversationAction") {
+          expect(clientMessage.message.value.action.case).toBe("cancelAction");
+          cancelCount += 1;
+          fake.close(0);
+        }
+      },
+    );
 
     const req = new EventEmitter() as any;
     const res = new EventEmitter() as any;
@@ -2285,19 +3009,21 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-cancel",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
 
-    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
-      if (clientMessage.message.case === "conversationAction") {
-        expect(clientMessage.message.value.action.case).toBe("cancelAction");
-        cancelCount += 1;
-        fake.close(0);
-      }
-    });
+    const bridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "conversationAction") {
+          expect(clientMessage.message.value.action.case).toBe("cancelAction");
+          cancelCount += 1;
+          fake.close(0);
+        }
+      },
+    );
 
     const req = new EventEmitter() as any;
     const res = new EventEmitter() as any;
@@ -2351,17 +3077,19 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-interrupt-after-checkpoint",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
 
-    const interruptedBridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
-      if (clientMessage.message.case === "conversationAction") {
-        fake.close(0);
-      }
-    });
+    const interruptedBridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "conversationAction") {
+          fake.close(0);
+        }
+      },
+    );
 
     const req = new EventEmitter() as any;
     const res = new EventEmitter() as any;
@@ -2399,12 +3127,15 @@ describe("proxy integration — session handling", () => {
     expect(storedCheckpoint).toBeNull();
 
     const runRequests: any[] = [];
-    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
-      if (clientMessage.message.case === "runRequest") {
-        runRequests.push(clientMessage.message.value);
-        fake.close(0);
-      }
-    }));
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
 
     const port = await startProxy(async () => "test-token");
     const response = await postChatCompletion(port, {
@@ -2434,24 +3165,35 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-partial-assistant",
       checkpoint: null,
 
-
       sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
 
-    const interruptedBridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
-      if (clientMessage.message.case === "conversationAction") {
-        fake.close(0);
-      }
-    });
+    const interruptedBridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "conversationAction") {
+          fake.close(0);
+        }
+      },
+    );
 
     const req = new EventEmitter() as any;
     const res = new EventEmitter() as any;
     res.headersSent = false;
-    res.writeHead = () => { res.headersSent = true; return res; };
-    res.write = () => { queueMicrotask(() => res.emit("close")); return true; };
-    res.end = () => { res.headersSent = true; return res; };
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = () => {
+      queueMicrotask(() => res.emit("close"));
+      return true;
+    };
+    res.end = () => {
+      res.headersSent = true;
+      return res;
+    };
 
     writeSSEStreamForTests({
       bridge: interruptedBridge as any,
@@ -2473,12 +3215,15 @@ describe("proxy integration — session handling", () => {
     expect(storedCheckpoint).toBeNull();
 
     const runRequests: any[] = [];
-    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
-      if (clientMessage.message.case === "runRequest") {
-        runRequests.push(clientMessage.message.value);
-        fake.close(0);
-      }
-    }));
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
 
     // Pi includes the partial assistant text in the resumed message history
     const port = await startProxy(async () => "test-token");
@@ -2505,8 +3250,18 @@ describe("proxy integration — session handling", () => {
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
     const priorTurns = [turn("earlier", [assistantStep("done")])];
-    const priorPayload = buildCursorRequest("gpt-5", "system", "next", priorTurns, "conv-old", null);
-    const priorCheckpoint = toBinary(ConversationStateStructureSchema, decodeRunRequest(priorPayload).conversationState);
+    const priorPayload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "next",
+      priorTurns,
+      "conv-old",
+      null,
+    );
+    const priorCheckpoint = toBinary(
+      ConversationStateStructureSchema,
+      decodeRunRequest(priorPayload).conversationState,
+    );
 
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-old",
@@ -2518,18 +3273,30 @@ describe("proxy integration — session handling", () => {
       lastAccessMs: Date.now(),
     });
 
-    const interruptedBridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
-      if (clientMessage.message.case === "conversationAction") {
-        fake.close(0);
-      }
-    });
+    const interruptedBridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "conversationAction") {
+          fake.close(0);
+        }
+      },
+    );
 
     const req = new EventEmitter() as any;
     const res = new EventEmitter() as any;
     res.headersSent = false;
-    res.writeHead = () => { res.headersSent = true; return res; };
-    res.write = () => { queueMicrotask(() => res.emit("close")); return true; };
-    res.end = () => { res.headersSent = true; return res; };
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = () => {
+      queueMicrotask(() => res.emit("close"));
+      return true;
+    };
+    res.end = () => {
+      res.headersSent = true;
+      return res;
+    };
 
     writeSSEStreamForTests({
       bridge: interruptedBridge as any,
@@ -2550,12 +3317,15 @@ describe("proxy integration — session handling", () => {
     expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(priorCheckpoint);
 
     const runRequests: any[] = [];
-    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
-      if (clientMessage.message.case === "runRequest") {
-        runRequests.push(clientMessage.message.value);
-        fake.close(0);
-      }
-    }));
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
 
     const port = await startProxy(async () => "test-token");
     const response = await postChatCompletion(port, {
@@ -2573,7 +3343,9 @@ describe("proxy integration — session handling", () => {
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
     expect(runRequests[0].conversationId).toBe("conv-old");
-    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).not.toEqual(priorCheckpoint);
+    expect(
+      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
+    ).not.toEqual(priorCheckpoint);
     expect(runRequests[0].conversationState.turns).toHaveLength(2);
     expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
   });
@@ -2583,24 +3355,33 @@ describe("proxy integration — session handling", () => {
     // completed-history fingerprints so stale checkpoints are not reused.
     const runRequests: any[] = [];
 
-    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
-      if (clientMessage.message.case === "runRequest") {
-        runRequests.push(clientMessage.message.value);
-        fake.close(0);
-      }
-    }));
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
 
     const sessionId = "session-branch";
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const storedTurns = [turn("first", [assistantStep("branch-a")])];
-    const priorPayload = buildCursorRequest("gpt-5", "system", "next", storedTurns, "conv-branch", null);
+    const priorPayload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "next",
+      storedTurns,
+      "conv-branch",
+      null,
+    );
     const priorRequest = decodeRunRequest(priorPayload);
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-branch",
       checkpoint: toBinary(ConversationStateStructureSchema, priorRequest.conversationState),
       checkpointTurnCount: storedTurns.length,
       checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(storedTurns),
-
 
       sessionScoped: true,
       blobStore: new Map(),
@@ -2623,17 +3404,21 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).not.toEqual(storedCheckpoint);
+    expect(
+      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
+    ).not.toEqual(storedCheckpoint);
     expect(runRequests[0].conversationState.turns).toHaveLength(1);
   });
-
 });
 
-
-const liveCursorMetadataTest = process.env.LIVE_CURSOR_METADATA && process.env.CURSOR_ACCESS_TOKEN ? test : test.skip;
+const liveCursorMetadataTest =
+  process.env.LIVE_CURSOR_METADATA && process.env.CURSOR_ACCESS_TOKEN ? test : test.skip;
 
 function normalizedParameterKey(parameters: { id: string; value: string }[] = []): string {
-  return parameters.map(parameter => `${parameter.id}=${parameter.value}`).sort().join(";");
+  return parameters
+    .map((parameter) => `${parameter.id}=${parameter.value}`)
+    .sort()
+    .join(";");
 }
 
 function expectedContextWindowForParameter(context: string | undefined): number | undefined {
@@ -2644,41 +3429,69 @@ function expectedContextWindowForParameter(context: string | undefined): number 
   return undefined;
 }
 
-liveCursorMetadataTest("live Cursor metadata validates every generated parameterized route", async () => {
-  const metadata = await getCursorParameterizedModels(process.env.CURSOR_ACCESS_TOKEN!);
-  const generated = modelsFromParameterizedMetadata(metadata);
-  const processed = processModels(generated);
-  const parameterizedModelIds = metadata
-    .filter(model => model.variants.some(variant => variant.parameters.length > 0))
-    .map(model => model.name);
-  const generatedRequestedIds = new Set(generated.map(model => model.requestedModelId));
-  for (const modelId of parameterizedModelIds) {
-    expect(generatedRequestedIds.has(modelId), `no generated rows for parameterized model ${modelId}`).toBe(true);
-  }
-  expect(generated.length).toBeGreaterThan(25);
-  expect(new Set(processed.map(model => model.id)).size).toBe(processed.length);
-  expect(processed.some(model => model.id === "gpt-5.5-max-fast")).toBe(true);
-  expect(processed.some(model => model.id === "gpt-5.5-1m-fast")).toBe(false);
-  expect(processed.some(model => model.id === "claude-opus-4-7")).toBe(true);
-  expect(processed.some(model => model.id === "claude-opus-4-7-max")).toBe(true);
-  expect(processed.some(model => model.id === "claude-opus-4-7-max-thinking")).toBe(true);
-
-  for (const source of metadata.filter(model => model.supportsMaxMode && model.variants.some(variant => variant.parameters.length > 0))) {
-    expect(generated.some(route => route.requestedModelId === source.name && route.requestedMaxMode === true), `no max-mode rows generated for ${source.name}`).toBe(true);
-  }
-
-  for (const route of generated) {
-    const source = metadata.find(model => model.name === route.requestedModelId);
-    expect(source, `missing metadata source for ${route.id}`).toBeDefined();
-    const key = normalizedParameterKey(route.parameters);
-    const variant = source!.variants.find(variant => normalizedParameterKey(variant.parameters) === key);
-    expect(variant, `route ${route.id} uses parameters not advertised by Cursor: ${key}`).toBeDefined();
-    if (route.requestedMaxMode === true && variant!.isMaxMode !== true) {
-      expect(source!.supportsMaxMode, `route ${route.id} sets maxMode for a model that does not support it`).toBe(true);
+liveCursorMetadataTest(
+  "live Cursor metadata validates every generated parameterized route",
+  async () => {
+    const metadata = await getCursorParameterizedModels(process.env.CURSOR_ACCESS_TOKEN!);
+    const generated = modelsFromParameterizedMetadata(metadata);
+    const processed = processModels(generated);
+    const parameterizedModelIds = metadata
+      .filter((model) => model.variants.some((variant) => variant.parameters.length > 0))
+      .map((model) => model.name);
+    const generatedRequestedIds = new Set(generated.map((model) => model.requestedModelId));
+    for (const modelId of parameterizedModelIds) {
+      expect(
+        generatedRequestedIds.has(modelId),
+        `no generated rows for parameterized model ${modelId}`,
+      ).toBe(true);
     }
-    expect(route.parameters?.find(parameter => parameter.id === "reasoning")?.value).not.toBe("minimal");
-    expect(route.parameters?.find(parameter => parameter.id === "reasoning")?.value).not.toBe("max");
-    const expectedWindow = expectedContextWindowForParameter(route.parameters?.find(parameter => parameter.id === "context")?.value);
-    if (expectedWindow) expect(route.contextWindow).toBe(expectedWindow);
-  }
-});
+    expect(generated.length).toBeGreaterThan(25);
+    expect(new Set(processed.map((model) => model.id)).size).toBe(processed.length);
+    expect(processed.some((model) => model.id === "gpt-5.5-max-fast")).toBe(true);
+    expect(processed.some((model) => model.id === "gpt-5.5-1m-fast")).toBe(false);
+    expect(processed.some((model) => model.id === "claude-opus-4-7")).toBe(true);
+    expect(processed.some((model) => model.id === "claude-opus-4-7-max")).toBe(true);
+    expect(processed.some((model) => model.id === "claude-opus-4-7-max-thinking")).toBe(true);
+
+    for (const source of metadata.filter(
+      (model) =>
+        model.supportsMaxMode && model.variants.some((variant) => variant.parameters.length > 0),
+    )) {
+      expect(
+        generated.some(
+          (route) => route.requestedModelId === source.name && route.requestedMaxMode === true,
+        ),
+        `no max-mode rows generated for ${source.name}`,
+      ).toBe(true);
+    }
+
+    for (const route of generated) {
+      const source = metadata.find((model) => model.name === route.requestedModelId);
+      expect(source, `missing metadata source for ${route.id}`).toBeDefined();
+      const key = normalizedParameterKey(route.parameters);
+      const variant = source!.variants.find(
+        (variant) => normalizedParameterKey(variant.parameters) === key,
+      );
+      expect(
+        variant,
+        `route ${route.id} uses parameters not advertised by Cursor: ${key}`,
+      ).toBeDefined();
+      if (route.requestedMaxMode === true && variant!.isMaxMode !== true) {
+        expect(
+          source!.supportsMaxMode,
+          `route ${route.id} sets maxMode for a model that does not support it`,
+        ).toBe(true);
+      }
+      expect(route.parameters?.find((parameter) => parameter.id === "reasoning")?.value).not.toBe(
+        "minimal",
+      );
+      expect(route.parameters?.find((parameter) => parameter.id === "reasoning")?.value).not.toBe(
+        "max",
+      );
+      const expectedWindow = expectedContextWindowForParameter(
+        route.parameters?.find((parameter) => parameter.id === "context")?.value,
+      );
+      if (expectedWindow) expect(route.contextWindow).toBe(expectedWindow);
+    }
+  },
+);

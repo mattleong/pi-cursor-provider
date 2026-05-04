@@ -57,36 +57,36 @@ Each raw Cursor model ID is parsed into components. Cursor has used both thinkin
 
 Examples:
 
-| Raw Cursor ID | Base | Effort | Variant |
-|---|---|---|---|
-| `gpt-5.4-medium` | `gpt-5.4` | `medium` | — |
-| `gpt-5.4-high-fast` | `gpt-5.4` | `high` | `-fast` |
-| `claude-4.6-opus-max-thinking` | `claude-4.6-opus` | `max` | `-thinking` |
-| `claude-opus-4-7-thinking-max` | `claude-opus-4-7` | `max` | `-thinking` |
-| `gpt-5.1-codex-max-high` | `gpt-5.1-codex-max` | `high` | — |
-| `composer-2` | `composer-2` | — | — |
+| Raw Cursor ID                  | Base                | Effort   | Variant     |
+| ------------------------------ | ------------------- | -------- | ----------- |
+| `gpt-5.4-medium`               | `gpt-5.4`           | `medium` | —           |
+| `gpt-5.4-high-fast`            | `gpt-5.4`           | `high`   | `-fast`     |
+| `claude-4.6-opus-max-thinking` | `claude-4.6-opus`   | `max`    | `-thinking` |
+| `claude-opus-4-7-thinking-max` | `claude-opus-4-7`   | `max`    | `-thinking` |
+| `gpt-5.1-codex-max-high`       | `gpt-5.1-codex-max` | `high`   | —           |
+| `composer-2`                   | `composer-2`        | —        | —           |
 
 Models sharing the same `(base, variant)` with **≥2 effort levels** and a sensible default (`medium` or no-suffix) are collapsed into a single entry with `supportsReasoningEffort: true`. Pi's thinking level maps to the effort suffix:
 
-| Pi Level | Cursor Suffix |
-|---|---|
-| `minimal` | `none` (if available) or `low` |
-| `low` | `low` |
-| `medium` | `medium` or no suffix (default) |
-| `high` | `high` |
-| `xhigh` | `max` (Claude) or `xhigh` (GPT) |
+| Pi Level  | Cursor Suffix                   |
+| --------- | ------------------------------- |
+| `minimal` | `none` (if available) or `low`  |
+| `low`     | `low`                           |
+| `medium`  | `medium` or no suffix (default) |
+| `high`    | `high`                          |
+| `xhigh`   | `max` (Claude) or `xhigh` (GPT) |
 
 ### Parameterized Cursor models
 
 Cursor exposes some choices as model parameters rather than standalone model IDs. The extension queries Cursor's `AiService.AvailableModels(useModelParameters=true)` endpoint when authenticated and generates rows for all advertised parameterized model variants; where Cursor marks a model as supporting Max Mode, GPT-style rows may also expose explicit `-max` entries over the same advertised parameter sets. At startup, it attempts live discovery with Pi's stored Cursor OAuth credentials (or a `CURSOR_ACCESS_TOKEN` override for testing) so models are available in `pi --list-models` and the model picker without requiring a fresh `/login cursor`. It falls back to the bundled static list when live metadata is unavailable. For example, GPT-5.5 has separate **Context** settings (`272K` and `1M`), **Reasoning** settings, and a **Fast** toggle for 272K variants. Pi's model picker cannot edit those Cursor-specific parameters directly, so this extension exposes them as separate selectable rows:
 
-| Pi model | Cursor `requestedModel` |
-|---|---|
-| `gpt-5.5` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "false"`, `maxMode: false` |
-| `gpt-5.5-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"`, `maxMode: false` |
-| `gpt-5.5-max` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "false"`, `maxMode: true` |
-| `gpt-5.5-max-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"`, `maxMode: true` |
-| `gpt-5.5-1m` | `modelId: "gpt-5.5"`, `context: "1m"`, `fast: "false"`, `maxMode: true` |
+| Pi model           | Cursor `requestedModel`                                                    |
+| ------------------ | -------------------------------------------------------------------------- |
+| `gpt-5.5`          | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "false"`, `maxMode: false` |
+| `gpt-5.5-fast`     | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"`, `maxMode: false`  |
+| `gpt-5.5-max`      | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "false"`, `maxMode: true`  |
+| `gpt-5.5-max-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"`, `maxMode: true`   |
+| `gpt-5.5-1m`       | `modelId: "gpt-5.5"`, `context: "1m"`, `fast: "false"`, `maxMode: true`    |
 
 Pi's thinking level supplies the Cursor `reasoning` parameter for those rows (`none`, `low`, `medium`, `high`, or `extra-high`). Pi's `minimal` level maps to Cursor `none` when available, otherwise to the lowest available Cursor effort; `minimal` is never sent to Cursor. Likewise, `max` is not sent as a Cursor reasoning parameter. There is no separate `/max` toggle: Cursor-specific flags like `maxMode` and `fast` are determined by the selected model row. Cursor's own model metadata does not include any `context=1m` + `fast=true` GPT-5.5 variant; sending that invalid combination is sanitized by Cursor to the default 1M medium configuration, so this extension intentionally does not expose `gpt-5.5-1m-fast`.
 
@@ -160,7 +160,9 @@ The proxy maintains conversation state per pi session, enabling multi-turn conve
 
 When Cursor pauses for a tool call, the proxy keeps the live upstream bridge open and waits for pi to send the tool result on the next request. That tool result is sent back into the same in-flight Cursor run, so the tool continuation stays part of the original user turn instead of inflating completed history.
 
-If that live bridge is gone before the tool result arrives (for example because the proxy restarted or the upstream stream died), the proxy returns an explicit `tool_continuation_lost` conflict instead of silently starting a new Cursor turn with the tool result as user text. Retry from before the tool call or start a new turn. Tool calls require streaming; `stream:false` requests with tools are rejected explicitly.
+If that live bridge is gone before the tool result arrives (for example because the proxy restarted or the upstream stream died), the proxy returns an explicit `tool_continuation_lost` conflict instead of silently starting a new Cursor turn with the tool result as user text. Retry from before the tool call or start a new turn. Tool calls require streaming; `stream:false` requests with tools are rejected explicitly. Paused tool-call bridges are cancelled after a TTL (default 15 minutes; override with `PI_CURSOR_ACTIVE_BRIDGE_TTL_MS`).
+
+`tool_choice: "none"` is honored by withholding MCP tools from Cursor. Other forced tool choices are rejected because Cursor's agent protocol does not expose an equivalent OpenAI-compatible control. Pi/OpenAI compatibility fields `max_tokens` and `max_completion_tokens` are accepted as no-ops because pi sends them routinely and Cursor controls output budgeting server-side. Unsupported sampling parameters such as `temperature` are rejected instead of silently ignored.
 
 ### Interruptions
 
@@ -197,8 +199,14 @@ That reconstruction preserves:
 
 ```bash
 npm install
+npm run typecheck
+npm run lint
+npm run format:check
 npm test
+npm run pack:check
 ```
+
+Protocol notes, generated protobuf provenance, and reverse-engineered wire-field mappings are documented in [`docs/protocol.md`](docs/protocol.md).
 
 ## Debug log timeline
 

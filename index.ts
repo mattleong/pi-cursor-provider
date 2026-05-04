@@ -26,7 +26,16 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.js";
-import { cleanupSessionState, getCursorModels, getCursorParameterizedModels, startProxy, type CursorModel, type CursorModelParameter, type CursorParameterizedModel, type CursorParameterizedVariant } from "./proxy.js";
+import {
+  cleanupSessionState,
+  getCursorModels,
+  getCursorParameterizedModels,
+  startProxy,
+  type CursorModel,
+  type CursorModelParameter,
+  type CursorParameterizedModel,
+  type CursorParameterizedVariant,
+} from "./proxy.js";
 
 // ── Cost estimation ──
 
@@ -52,16 +61,27 @@ function getExtensionDebugLogFilePath(): string {
     return extensionDebugLogFilePath;
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  extensionDebugLogFilePath = pathJoin(tmpdir(), `pi-cursor-provider-extension-debug-${stamp}-${process.pid}.log`);
+  extensionDebugLogFilePath = pathJoin(
+    tmpdir(),
+    `pi-cursor-provider-extension-debug-${stamp}-${process.pid}.log`,
+  );
   return extensionDebugLogFilePath;
 }
 
 function truncateDebugValue(value: string, max = 240): string {
-  return value.length > max ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>` : value;
+  return value.length > max
+    ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>`
+    : value;
 }
 
-function summarizeBase64ImageData(data: string): { base64Length: number; byteLength?: number; sha256?: string } {
-  const summary: { base64Length: number; byteLength?: number; sha256?: string } = { base64Length: data.length };
+function summarizeBase64ImageData(data: string): {
+  base64Length: number;
+  byteLength?: number;
+  sha256?: string;
+} {
+  const summary: { base64Length: number; byteLength?: number; sha256?: string } = {
+    base64Length: data.length,
+  };
   try {
     const bytes = Buffer.from(data.replace(/\s/g, ""), "base64");
     if (bytes.length > 0) {
@@ -76,13 +96,20 @@ function summarizeImageBlock(type: unknown, mimeType: unknown, data: unknown): u
   return {
     type,
     mimeType,
-    ...(typeof data === "string" ? summarizeBase64ImageData(data) : { data: `<redacted base64 ${String(data ?? "").length} chars>` }),
+    ...(typeof data === "string"
+      ? summarizeBase64ImageData(data)
+      : { data: `<redacted base64 ${String(data ?? "").length} chars>` }),
   };
 }
 
 function summarizeDataImageUrl(url: string): unknown {
   const match = url.trim().match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
-  if (!match) return { url: url.startsWith("data:image/") ? `<redacted data image ${url.length} chars>` : truncateDebugValue(url) };
+  if (!match)
+    return {
+      url: url.startsWith("data:image/")
+        ? `<redacted data image ${url.length} chars>`
+        : truncateDebugValue(url),
+    };
   return {
     mimeType: match[1]?.toLowerCase(),
     ...summarizeBase64ImageData(match[2]!),
@@ -134,7 +161,16 @@ function summarizeMessage(message: unknown): unknown {
   };
 }
 
-function summarizeBranchTail(ctx: { sessionManager?: { getBranch?: () => unknown[]; getLeafId?: () => string; getSessionId?: () => string } }, limit = 6): unknown {
+function summarizeBranchTail(
+  ctx: {
+    sessionManager?: {
+      getBranch?: () => unknown[];
+      getLeafId?: () => string;
+      getSessionId?: () => string;
+    };
+  },
+  limit = 6,
+): unknown {
   try {
     const branch = ctx.sessionManager?.getBranch?.();
     if (!Array.isArray(branch)) return undefined;
@@ -162,7 +198,9 @@ function summarizeBranchTail(ctx: { sessionManager?: { getBranch?: () => unknown
 function summarizeProviderPayload(payload: unknown): unknown {
   if (!payload || typeof payload !== "object") return payload;
   const typed = payload as Record<string, unknown>;
-  const messages = Array.isArray(typed.messages) ? typed.messages.map((message) => summarizeMessage(message)).slice(-8) : undefined;
+  const messages = Array.isArray(typed.messages)
+    ? typed.messages.map((message) => summarizeMessage(message)).slice(-8)
+    : undefined;
   const toolResultImages = Array.isArray(typed.cursor_tool_result_images)
     ? typed.cursor_tool_result_images.map((entry) => {
         if (!entry || typeof entry !== "object") return entry;
@@ -205,7 +243,8 @@ function payloadToolCallIds(payload: Record<string, unknown>): Set<string> {
   for (const message of messages) {
     if (!message || typeof message !== "object") continue;
     const typed = message as Record<string, unknown>;
-    if (typed.role === "tool" && typeof typed.tool_call_id === "string" && typed.tool_call_id) ids.add(typed.tool_call_id);
+    if (typed.role === "tool" && typeof typed.tool_call_id === "string" && typed.tool_call_id)
+      ids.add(typed.tool_call_id);
   }
   return ids;
 }
@@ -231,7 +270,12 @@ export function extractToolResultImagePayloads(
     const images = content.flatMap((block) => {
       if (!block || typeof block !== "object") return [];
       const image = block as Record<string, unknown>;
-      if (image.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string") return [];
+      if (
+        image.type !== "image" ||
+        typeof image.data !== "string" ||
+        typeof image.mimeType !== "string"
+      )
+        return [];
       return [{ data: image.data, mimeType: image.mimeType }];
     });
     if (images.length === 0) continue;
@@ -255,49 +299,52 @@ function debugExtensionLog(event: string, data?: Record<string, unknown>): void 
 }
 
 const MODEL_COST_TABLE: Record<string, ModelCost> = {
-  "claude-4-sonnet":         { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-  "claude-4.5-haiku":        { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
-  "claude-4.5-opus":         { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-  "claude-4.5-sonnet":       { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-  "claude-4.6-opus":         { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-  "claude-4.6-sonnet":       { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-  "composer-1":              { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-  "composer-1.5":            { input: 3.5, output: 17.5, cacheRead: 0.35, cacheWrite: 0 },
-  "composer-2":              { input: 0.5, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
-  "gemini-2.5-flash":        { input: 0.3, output: 2.5, cacheRead: 0.03, cacheWrite: 0 },
-  "gemini-3-flash":          { input: 0.5, output: 3, cacheRead: 0.05, cacheWrite: 0 },
-  "gemini-3-pro":            { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
-  "gemini-3.1-pro":          { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
-  "gpt-5":                   { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-  "gpt-5-mini":              { input: 0.25, output: 2, cacheRead: 0.025, cacheWrite: 0 },
-  "gpt-5.2":                 { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
-  "gpt-5.2-codex":           { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
-  "gpt-5.3-codex":           { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
-  "gpt-5.4":                 { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
-  "gpt-5.4-mini":            { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-  "gpt-5.5":                 { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
-  "grok-4.20":               { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
-  "kimi-k2.5":               { input: 0.6, output: 3, cacheRead: 0.1, cacheWrite: 0 },
+  "claude-4-sonnet": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  "claude-4.5-haiku": { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+  "claude-4.5-opus": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+  "claude-4.5-sonnet": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  "claude-4.6-opus": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+  "claude-4.6-sonnet": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  "composer-1": { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+  "composer-1.5": { input: 3.5, output: 17.5, cacheRead: 0.35, cacheWrite: 0 },
+  "composer-2": { input: 0.5, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
+  "gemini-2.5-flash": { input: 0.3, output: 2.5, cacheRead: 0.03, cacheWrite: 0 },
+  "gemini-3-flash": { input: 0.5, output: 3, cacheRead: 0.05, cacheWrite: 0 },
+  "gemini-3-pro": { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
+  "gemini-3.1-pro": { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
+  "gpt-5": { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+  "gpt-5-mini": { input: 0.25, output: 2, cacheRead: 0.025, cacheWrite: 0 },
+  "gpt-5.2": { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+  "gpt-5.2-codex": { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+  "gpt-5.3-codex": { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+  "gpt-5.4": { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+  "gpt-5.4-mini": { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+  "gpt-5.5": { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+  "grok-4.20": { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
+  "kimi-k2.5": { input: 0.6, output: 3, cacheRead: 0.1, cacheWrite: 0 },
 };
 
 const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCost }> = [
-  { match: (id) => /claude.*opus.*fast/i.test(id),   cost: { input: 30, output: 150, cacheRead: 3, cacheWrite: 37.5 } },
-  { match: (id) => /claude.*opus/i.test(id),         cost: MODEL_COST_TABLE["claude-4.6-opus"]! },
-  { match: (id) => /claude.*haiku/i.test(id),        cost: MODEL_COST_TABLE["claude-4.5-haiku"]! },
-  { match: (id) => /claude.*sonnet/i.test(id),       cost: MODEL_COST_TABLE["claude-4.6-sonnet"]! },
-  { match: (id) => /composer/i.test(id),             cost: MODEL_COST_TABLE["composer-1"]! },
-  { match: (id) => /gpt-5\.5/i.test(id),             cost: MODEL_COST_TABLE["gpt-5.5"]! },
-  { match: (id) => /gpt-5\.4.*mini/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-mini"]! },
-  { match: (id) => /gpt-5\.4/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.4"]! },
-  { match: (id) => /gpt-5\.3/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.3-codex"]! },
-  { match: (id) => /gpt-5\.2/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.2"]! },
-  { match: (id) => /gpt-5.*mini/i.test(id),          cost: MODEL_COST_TABLE["gpt-5-mini"]! },
-  { match: (id) => /gpt-5/i.test(id),                cost: MODEL_COST_TABLE["gpt-5"]! },
-  { match: (id) => /gemini.*3\.1/i.test(id),        cost: MODEL_COST_TABLE["gemini-3.1-pro"]! },
-  { match: (id) => /gemini.*flash/i.test(id),        cost: MODEL_COST_TABLE["gemini-2.5-flash"]! },
-  { match: (id) => /gemini/i.test(id),               cost: MODEL_COST_TABLE["gemini-3-pro"]! },
-  { match: (id) => /grok/i.test(id),                 cost: MODEL_COST_TABLE["grok-4.20"]! },
-  { match: (id) => /kimi/i.test(id),                 cost: MODEL_COST_TABLE["kimi-k2.5"]! },
+  {
+    match: (id) => /claude.*opus.*fast/i.test(id),
+    cost: { input: 30, output: 150, cacheRead: 3, cacheWrite: 37.5 },
+  },
+  { match: (id) => /claude.*opus/i.test(id), cost: MODEL_COST_TABLE["claude-4.6-opus"]! },
+  { match: (id) => /claude.*haiku/i.test(id), cost: MODEL_COST_TABLE["claude-4.5-haiku"]! },
+  { match: (id) => /claude.*sonnet/i.test(id), cost: MODEL_COST_TABLE["claude-4.6-sonnet"]! },
+  { match: (id) => /composer/i.test(id), cost: MODEL_COST_TABLE["composer-1"]! },
+  { match: (id) => /gpt-5\.5/i.test(id), cost: MODEL_COST_TABLE["gpt-5.5"]! },
+  { match: (id) => /gpt-5\.4.*mini/i.test(id), cost: MODEL_COST_TABLE["gpt-5.4-mini"]! },
+  { match: (id) => /gpt-5\.4/i.test(id), cost: MODEL_COST_TABLE["gpt-5.4"]! },
+  { match: (id) => /gpt-5\.3/i.test(id), cost: MODEL_COST_TABLE["gpt-5.3-codex"]! },
+  { match: (id) => /gpt-5\.2/i.test(id), cost: MODEL_COST_TABLE["gpt-5.2"]! },
+  { match: (id) => /gpt-5.*mini/i.test(id), cost: MODEL_COST_TABLE["gpt-5-mini"]! },
+  { match: (id) => /gpt-5/i.test(id), cost: MODEL_COST_TABLE["gpt-5"]! },
+  { match: (id) => /gemini.*3\.1/i.test(id), cost: MODEL_COST_TABLE["gemini-3.1-pro"]! },
+  { match: (id) => /gemini.*flash/i.test(id), cost: MODEL_COST_TABLE["gemini-2.5-flash"]! },
+  { match: (id) => /gemini/i.test(id), cost: MODEL_COST_TABLE["gemini-3-pro"]! },
+  { match: (id) => /grok/i.test(id), cost: MODEL_COST_TABLE["grok-4.20"]! },
+  { match: (id) => /kimi/i.test(id), cost: MODEL_COST_TABLE["kimi-k2.5"]! },
 ];
 
 const DEFAULT_COST: ModelCost = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 };
@@ -306,12 +353,14 @@ function estimateModelCost(modelId: string): ModelCost {
   const normalized = modelId.toLowerCase();
   const exact = MODEL_COST_TABLE[normalized];
   if (exact) return exact;
-  const stripped = normalized.replace(/-(high|medium|low|preview|thinking|spark-preview|fast)$/g, "");
+  const stripped = normalized.replace(
+    /-(high|medium|low|preview|thinking|spark-preview|fast)$/g,
+    "",
+  );
   const strippedMatch = MODEL_COST_TABLE[stripped];
   if (strippedMatch) return strippedMatch;
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
 }
-
 
 // ── Effort-level dedup ──
 
@@ -326,10 +375,10 @@ const CURSOR_EFFORT_SUFFIXES: Array<{ suffix: string; effort: string }> = [
 ];
 
 interface ParsedModelId {
-  base: string;       // model ID with effort stripped
-  effort: string;     // effort level, or "" if no effort suffix
-  fast: boolean;      // has -fast suffix
-  thinking: boolean;  // has -thinking suffix
+  base: string; // model ID with effort stripped
+  effort: string; // effort level, or "" if no effort suffix
+  fast: boolean; // has -fast suffix
+  thinking: boolean; // has -thinking suffix
 }
 
 function stripEffortSuffix(id: string): { remaining: string; effort: string } {
@@ -392,7 +441,11 @@ export interface ProcessedModel extends CursorModel {
 export function buildNoReasoningEffortLookup(models: ProcessedModel[]): Map<string, string> {
   const lookup = new Map<string, string>();
   for (const model of models) {
-    if (model.supportsEffort && model.effortMap && Object.values(model.effortMap).includes("none")) {
+    if (
+      model.supportsEffort &&
+      model.effortMap &&
+      Object.values(model.effortMap).includes("none")
+    ) {
       lookup.set(model.id, "none");
     }
   }
@@ -412,7 +465,9 @@ function routingForModel(model: CursorModel): CursorModelRouting | undefined {
     modelId: model.requestedModelId ?? model.id,
     ...(model.parameters?.length ? { parameters: model.parameters } : {}),
     ...(model.requiresMaxMode ? { requiresMaxMode: true } : {}),
-    ...(typeof model.requestedMaxMode === "boolean" ? { requestedMaxMode: model.requestedMaxMode } : {}),
+    ...(typeof model.requestedMaxMode === "boolean"
+      ? { requestedMaxMode: model.requestedMaxMode }
+      : {}),
   };
 }
 
@@ -426,13 +481,16 @@ function defaultRoutingEffort(model: ProcessedModel): string | undefined {
   return Object.keys(routes)[0];
 }
 
-export function buildRawModelLookup(models: ProcessedModel[]): Map<string, Record<string, CursorModelRouting>> {
+export function buildRawModelLookup(
+  models: ProcessedModel[],
+): Map<string, Record<string, CursorModelRouting>> {
   const lookup = new Map<string, Record<string, CursorModelRouting>>();
   for (const model of models) {
     if (model.supportsEffort && model.rawRoutingByEffort) {
       const routes = { ...model.rawRoutingByEffort };
       const defaultEffort = defaultRoutingEffort(model);
-      if (defaultEffort !== undefined && !routes[""]) routes[""] = model.rawRoutingByEffort[defaultEffort]!;
+      if (defaultEffort !== undefined && !routes[""])
+        routes[""] = model.rawRoutingByEffort[defaultEffort]!;
       lookup.set(model.id, routes);
       continue;
     }
@@ -455,7 +513,8 @@ export function applyRawCursorModelId(
   payload.cursor_model_id = routing.modelId;
   if (routing.parameters?.length) payload.cursor_model_parameters = routing.parameters;
   if (routing.requiresMaxMode) payload.cursor_requires_max_mode = true;
-  if (typeof routing.requestedMaxMode === "boolean") payload.cursor_model_max_mode = routing.requestedMaxMode;
+  if (typeof routing.requestedMaxMode === "boolean")
+    payload.cursor_model_max_mode = routing.requestedMaxMode;
 }
 
 export function applyNoReasoningEffort(
@@ -463,7 +522,12 @@ export function applyNoReasoningEffort(
   thinkingLevel: string,
   noReasoningEffortByModelId: Map<string, string>,
 ): void {
-  if (thinkingLevel !== "off" || payload.reasoning_effort !== undefined || typeof payload.model !== "string") return;
+  if (
+    thinkingLevel !== "off" ||
+    payload.reasoning_effort !== undefined ||
+    typeof payload.model !== "string"
+  )
+    return;
   const noReasoningEffort = noReasoningEffortByModelId.get(payload.model);
   if (noReasoningEffort) payload.reasoning_effort = noReasoningEffort;
 }
@@ -487,7 +551,7 @@ const EFFORT_ORDER = ["none", "low", "", "medium", "high", "xhigh", "max"] as co
  * available cursor effort, falling back to the lowest available.
  */
 export function buildEffortMap(efforts: Set<string>): Record<string, string> {
-  const sorted = EFFORT_ORDER.filter(e => efforts.has(e));
+  const sorted = EFFORT_ORDER.filter((e) => efforts.has(e));
   if (sorted.length === 0) return {};
   const lowest = sorted[0]!;
 
@@ -498,20 +562,25 @@ export function buildEffortMap(efforts: Set<string>): Record<string, string> {
 
   return {
     minimal: pick("none", "low", ""),
-    low:     pick("low", "none", ""),
-    medium:  pick("medium", "", "low"),
-    high:    pick("high", "medium", ""),
-    xhigh:   pick("max", "xhigh", "high", "medium", "", "low", "none"),
+    low: pick("low", "none", ""),
+    medium: pick("medium", "", "low"),
+    high: pick("high", "medium", ""),
+    xhigh: pick("max", "xhigh", "high", "medium", "", "low", "none"),
   };
 }
 
 /** Dedup raw models: collapse effort variants into one entry with supportsReasoningEffort. */
 export function processModels(raw: CursorModel[]): ProcessedModel[] {
   // Group by (base, fast, thinking)
-  const groups = new Map<string, {
-    base: string; fast: boolean; thinking: boolean;
-    efforts: Map<string, CursorModel>;
-  }>();
+  const groups = new Map<
+    string,
+    {
+      base: string;
+      fast: boolean;
+      thinking: boolean;
+      efforts: Map<string, CursorModel>;
+    }
+  >();
 
   for (const model of raw) {
     const p = parseModelId(model.id);
@@ -549,15 +618,27 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
         [...g.efforts.entries()].map(([effort, model]) => [effort, model.id]),
       );
       const rawRoutingByEffort = Object.fromEntries(
-        [...g.efforts.entries()].map(([effort, model]) => [effort, {
-          modelId: model.requestedModelId ?? model.id,
-          ...(model.parameters?.length ? { parameters: model.parameters } : {}),
-          ...(model.requiresMaxMode ? { requiresMaxMode: true } : {}),
-          ...(typeof model.requestedMaxMode === "boolean" ? { requestedMaxMode: model.requestedMaxMode } : {}),
-        }]),
+        [...g.efforts.entries()].map(([effort, model]) => [
+          effort,
+          {
+            modelId: model.requestedModelId ?? model.id,
+            ...(model.parameters?.length ? { parameters: model.parameters } : {}),
+            ...(model.requiresMaxMode ? { requiresMaxMode: true } : {}),
+            ...(typeof model.requestedMaxMode === "boolean"
+              ? { requestedMaxMode: model.requestedMaxMode }
+              : {}),
+          },
+        ]),
       );
 
-      result.push({ ...rep, id, supportsEffort: true, effortMap, rawModelByEffort, rawRoutingByEffort });
+      result.push({
+        ...rep,
+        id,
+        supportsEffort: true,
+        effortMap,
+        rawModelByEffort,
+        rawRoutingByEffort,
+      });
     } else {
       // Keep single entries as-is (base model without effort variants)
       for (const model of g.efforts.values()) {
@@ -575,9 +656,10 @@ function modelConfig(m: ProcessedModel) {
     id: m.id,
     name: m.name,
     reasoning: supportsReasoningModelId(m.id),
-    ...(m.supportsEffort && m.effortMap && {
-      thinkingLevelMap: m.effortMap,
-    }),
+    ...(m.supportsEffort &&
+      m.effortMap && {
+        thinkingLevelMap: m.effortMap,
+      }),
     input,
     cost: estimateModelCost(m.id),
     contextWindow: m.contextWindow,
@@ -585,19 +667,40 @@ function modelConfig(m: ProcessedModel) {
     compat: {
       supportsDeveloperRole: false,
       supportsReasoningEffort: m.supportsEffort,
-      ...(m.supportsEffort && m.effortMap && {
-        reasoningEffortMap: m.effortMap,
-      }),
+      ...(m.supportsEffort &&
+        m.effortMap && {
+          reasoningEffortMap: m.effortMap,
+        }),
       maxTokensField: "max_tokens" as const,
     },
   };
 }
 
-
 const GPT55_VARIANTS = [
-  { idPart: "", label: "272K", context: "272k", contextWindow: 272_000, requestedMaxMode: false, fastOptions: [false, true] },
-  { idPart: "-max", label: "272K Max", context: "272k", contextWindow: 272_000, requestedMaxMode: true, fastOptions: [false, true] },
-  { idPart: "-1m", label: "1M", context: "1m", contextWindow: 1_000_000, requestedMaxMode: true, fastOptions: [false] },
+  {
+    idPart: "",
+    label: "272K",
+    context: "272k",
+    contextWindow: 272_000,
+    requestedMaxMode: false,
+    fastOptions: [false, true],
+  },
+  {
+    idPart: "-max",
+    label: "272K Max",
+    context: "272k",
+    contextWindow: 272_000,
+    requestedMaxMode: true,
+    fastOptions: [false, true],
+  },
+  {
+    idPart: "-1m",
+    label: "1M",
+    context: "1m",
+    contextWindow: 1_000_000,
+    requestedMaxMode: true,
+    fastOptions: [false],
+  },
 ] as const;
 
 const GPT55_REASONING_LEVELS = [
@@ -618,7 +721,9 @@ function gpt55ParameterizedModels(): CursorModel[] {
     for (const fast of variant.fastOptions) {
       for (const reasoning of GPT55_REASONING_LEVELS) {
         const id = `gpt-5.5${variant.idPart}-${reasoning.suffix}${fast ? "-fast" : ""}`;
-        const nameParts = ["GPT-5.5", variant.label, reasoning.label, fast ? "Fast" : ""].filter(Boolean);
+        const nameParts = ["GPT-5.5", variant.label, reasoning.label, fast ? "Fast" : ""].filter(
+          Boolean,
+        );
         models.push({
           id,
           name: nameParts.join(" "),
@@ -659,12 +764,16 @@ function cursorEffortSuffix(value: string): string {
 }
 
 function cursorEffortLabel(value: string): string {
-  return GPT55_REASONING_LEVELS.find((level) => level.value === value)?.label
-    || ({ xhigh: "Extra High", max: "Max", none: "None" } as Record<string, string>)[value]
-    || value.replace(/-/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+  return (
+    GPT55_REASONING_LEVELS.find((level) => level.value === value)?.label ||
+    ({ xhigh: "Extra High", max: "Max", none: "None" } as Record<string, string>)[value] ||
+    value.replace(/-/g, " ").replace(/\b\w/g, (char) => char.toUpperCase())
+  );
 }
 
-function metadataEffortParameterId(variant: CursorParameterizedVariant): "reasoning" | "effort" | undefined {
+function metadataEffortParameterId(
+  variant: CursorParameterizedVariant,
+): "reasoning" | "effort" | undefined {
   if (variant.parameters.some((parameter) => parameter.id === "reasoning")) return "reasoning";
   if (variant.parameters.some((parameter) => parameter.id === "effort")) return "effort";
   return undefined;
@@ -684,7 +793,12 @@ function contextLabel(context: string | undefined): string | undefined {
   return context.toUpperCase();
 }
 
-function maxModeIdPart(modelName: string, context: string | undefined, requestedMaxMode: boolean, hasEffortParameter: boolean): string {
+function maxModeIdPart(
+  modelName: string,
+  context: string | undefined,
+  requestedMaxMode: boolean,
+  hasEffortParameter: boolean,
+): string {
   // 1M context already names the Max/extended-context selection. For default
   // context windows, expose maxMode as an explicit row suffix. If the Cursor
   // model ID already contains "max" (for example gpt-5.1-codex-max), or if
@@ -694,18 +808,33 @@ function maxModeIdPart(modelName: string, context: string | undefined, requested
   return !hasEffortParameter || /(^|-)max($|-)/i.test(modelName) ? "-max-mode" : "-max";
 }
 
-function maxModeLabel(modelName: string, context: string | undefined, requestedMaxMode: boolean, hasEffortParameter: boolean): string | undefined {
+function maxModeLabel(
+  modelName: string,
+  context: string | undefined,
+  requestedMaxMode: boolean,
+  hasEffortParameter: boolean,
+): string | undefined {
   const idPart = maxModeIdPart(modelName, context, requestedMaxMode, hasEffortParameter);
   if (!idPart) return undefined;
   return idPart === "-max-mode" ? "Max Mode" : "Max";
 }
 
-function parameterizedBaseId(modelName: string, variant: CursorParameterizedVariant, requestedMaxMode: boolean, hasEffortParameter: boolean): string {
+function parameterizedBaseId(
+  modelName: string,
+  variant: CursorParameterizedVariant,
+  requestedMaxMode: boolean,
+  hasEffortParameter: boolean,
+): string {
   const context = parameterValue(variant.parameters, "context");
   return `${modelName}${contextIdPart(context)}${maxModeIdPart(modelName, context, requestedMaxMode, hasEffortParameter)}`;
 }
 
-function parameterizedBaseLabel(model: CursorParameterizedModel, variant: CursorParameterizedVariant, requestedMaxMode: boolean, hasEffortParameter: boolean): string[] {
+function parameterizedBaseLabel(
+  model: CursorParameterizedModel,
+  variant: CursorParameterizedVariant,
+  requestedMaxMode: boolean,
+  hasEffortParameter: boolean,
+): string[] {
   const context = parameterValue(variant.parameters, "context");
   return [
     model.clientDisplayName || model.name,
@@ -714,13 +843,21 @@ function parameterizedBaseLabel(model: CursorParameterizedModel, variant: Cursor
   ].filter(Boolean) as string[];
 }
 
-function hasVariantParameterSet(model: CursorParameterizedModel, parameters: CursorModelParameter[]): boolean {
+function hasVariantParameterSet(
+  model: CursorParameterizedModel,
+  parameters: CursorModelParameter[],
+): boolean {
   const normalized = normalizeParameterValues(parameters);
-  return model.variants.some((variant) => normalizeParameterValues(variant.parameters) === normalized);
+  return model.variants.some(
+    (variant) => normalizeParameterValues(variant.parameters) === normalized,
+  );
 }
 
 function normalizeParameterValues(parameters: CursorModelParameter[]): string {
-  return parameters.map((parameter) => `${parameter.id}=${parameter.value}`).sort().join(";");
+  return parameters
+    .map((parameter) => `${parameter.id}=${parameter.value}`)
+    .sort()
+    .join(";");
 }
 
 function buildParameterizedRowsFromGroup(options: {
@@ -737,18 +874,37 @@ function buildParameterizedRowsFromGroup(options: {
   const fast = parameterValue(first.parameters, "fast") === "true";
   const thinking = parameterValue(first.parameters, "thinking") === "true";
   const hasEffortParameter = Boolean(options.effortParameterId);
-  const baseId = parameterizedBaseId(options.model.name, first, options.requestedMaxMode, hasEffortParameter);
-  const baseLabelParts = parameterizedBaseLabel(options.model, first, options.requestedMaxMode, hasEffortParameter);
-  const contextWindow = contextWindowFromParameter(context, options.requestedMaxMode
-    ? options.model.contextTokenLimitForMaxMode ?? options.model.contextTokenLimit ?? 200_000
-    : options.model.contextTokenLimit ?? 200_000);
+  const baseId = parameterizedBaseId(
+    options.model.name,
+    first,
+    options.requestedMaxMode,
+    hasEffortParameter,
+  );
+  const baseLabelParts = parameterizedBaseLabel(
+    options.model,
+    first,
+    options.requestedMaxMode,
+    hasEffortParameter,
+  );
+  const contextWindow = contextWindowFromParameter(
+    context,
+    options.requestedMaxMode
+      ? (options.model.contextTokenLimitForMaxMode ?? options.model.contextTokenLimit ?? 200_000)
+      : (options.model.contextTokenLimit ?? 200_000),
+  );
 
   return options.variants.flatMap((variant) => {
-    const parameters = variant.parameters.map((parameter) => ({ id: parameter.id, value: parameter.value }));
+    const parameters = variant.parameters.map((parameter) => ({
+      id: parameter.id,
+      value: parameter.value,
+    }));
     if (!hasVariantParameterSet(options.model, parameters)) return [];
 
-    const effort = options.effortParameterId ? parameterValue(variant.parameters, options.effortParameterId) : undefined;
-    if (options.effortParameterId === "reasoning" && (effort === "minimal" || effort === "max")) return [];
+    const effort = options.effortParameterId
+      ? parameterValue(variant.parameters, options.effortParameterId)
+      : undefined;
+    if (options.effortParameterId === "reasoning" && (effort === "minimal" || effort === "max"))
+      return [];
 
     const id = options.effortParameterId
       ? `${baseId}-${cursorEffortSuffix(effort!)}${thinking ? "-thinking" : ""}${fast ? "-fast" : ""}`
@@ -758,24 +914,31 @@ function buildParameterizedRowsFromGroup(options: {
       effort ? cursorEffortLabel(effort) : undefined,
       thinking ? "Thinking" : undefined,
       fast ? "Fast" : undefined,
-    ].filter(Boolean).join(" ");
+    ]
+      .filter(Boolean)
+      .join(" ");
 
-    return [{
-      id,
-      name,
-      reasoning: Boolean(options.effortParameterId) || thinking,
-      contextWindow,
-      maxTokens: 64_000,
-      requestedModelId: options.model.name,
-      requiresMaxMode: variant.isMaxMode,
-      requestedMaxMode: options.requestedMaxMode,
-      supportsImages: options.model.supportsImages,
-      parameters,
-    } satisfies CursorModel];
+    return [
+      {
+        id,
+        name,
+        reasoning: Boolean(options.effortParameterId) || thinking,
+        contextWindow,
+        maxTokens: 64_000,
+        requestedModelId: options.model.name,
+        requiresMaxMode: variant.isMaxMode,
+        requestedMaxMode: options.requestedMaxMode,
+        supportsImages: options.model.supportsImages,
+        parameters,
+      } satisfies CursorModel,
+    ];
   });
 }
 
-function parameterGroupKey(variant: CursorParameterizedVariant, effortParameterId?: string): string {
+function parameterGroupKey(
+  variant: CursorParameterizedVariant,
+  effortParameterId?: string,
+): string {
   const params = variant.parameters
     .filter((parameter) => parameter.id !== effortParameterId)
     .map((parameter) => `${parameter.id}=${parameter.value}`)
@@ -784,7 +947,10 @@ function parameterGroupKey(variant: CursorParameterizedVariant, effortParameterI
   return `${variant.isMaxMode ? "max" : "nonmax"}|${params}`;
 }
 
-function shouldGenerateSyntheticMaxRows(model: CursorParameterizedModel, variant: CursorParameterizedVariant): boolean {
+function shouldGenerateSyntheticMaxRows(
+  model: CursorParameterizedModel,
+  variant: CursorParameterizedVariant,
+): boolean {
   // Cursor's metadata has both per-variant isMaxMode and model-level
   // supportsMaxMode. Some supported Max Mode combinations are represented only
   // by supportsMaxMode=true over a non-Max parameter set, so expose explicit
@@ -792,10 +958,15 @@ function shouldGenerateSyntheticMaxRows(model: CursorParameterizedModel, variant
   return model.supportsMaxMode === true && !variant.isMaxMode;
 }
 
-export function modelsFromParameterizedMetadata(parameterizedModels: CursorParameterizedModel[]): CursorModel[] {
+export function modelsFromParameterizedMetadata(
+  parameterizedModels: CursorParameterizedModel[],
+): CursorModel[] {
   const rows: CursorModel[] = [];
   for (const model of parameterizedModels) {
-    const groups = new Map<string, { effortParameterId?: "reasoning" | "effort"; variants: CursorParameterizedVariant[] }>();
+    const groups = new Map<
+      string,
+      { effortParameterId?: "reasoning" | "effort"; variants: CursorParameterizedVariant[] }
+    >();
     for (const variant of model.variants) {
       if (variant.parameters.length === 0) continue;
       const effortParameterId = metadataEffortParameterId(variant);
@@ -808,19 +979,23 @@ export function modelsFromParameterizedMetadata(parameterizedModels: CursorParam
     for (const group of groups.values()) {
       const first = group.variants[0];
       if (!first) continue;
-      rows.push(...buildParameterizedRowsFromGroup({
-        model,
-        variants: group.variants,
-        requestedMaxMode: first.isMaxMode,
-        effortParameterId: group.effortParameterId,
-      }));
-      if (shouldGenerateSyntheticMaxRows(model, first)) {
-        rows.push(...buildParameterizedRowsFromGroup({
+      rows.push(
+        ...buildParameterizedRowsFromGroup({
           model,
           variants: group.variants,
-          requestedMaxMode: true,
+          requestedMaxMode: first.isMaxMode,
           effortParameterId: group.effortParameterId,
-        }));
+        }),
+      );
+      if (shouldGenerateSyntheticMaxRows(model, first)) {
+        rows.push(
+          ...buildParameterizedRowsFromGroup({
+            model,
+            variants: group.variants,
+            requestedMaxMode: true,
+            effortParameterId: group.effortParameterId,
+          }),
+        );
       }
     }
   }
@@ -837,7 +1012,10 @@ function normalizeDisplayModel(model: CursorModel): CursorModel {
   };
 }
 
-export function augmentCursorModels(raw: CursorModel[], parameterizedModels: CursorParameterizedModel[] = []): CursorModel[] {
+export function augmentCursorModels(
+  raw: CursorModel[],
+  parameterizedModels: CursorParameterizedModel[] = [],
+): CursorModel[] {
   const byId = new Map<string, CursorModel>();
   const imageSupportByModelId = new Map(
     parameterizedModels
@@ -849,11 +1027,14 @@ export function augmentCursorModels(raw: CursorModel[], parameterizedModels: Cur
     const metadataSupportsImages = imageSupportByModelId.get(lookupId);
     byId.set(model.id, {
       ...model,
-      ...(model.supportsImages === undefined && metadataSupportsImages !== undefined ? { supportsImages: metadataSupportsImages } : {}),
+      ...(model.supportsImages === undefined && metadataSupportsImages !== undefined
+        ? { supportsImages: metadataSupportsImages }
+        : {}),
     });
   }
 
-  const metadataRows = modelsFromParameterizedMetadata(parameterizedModels).map(normalizeDisplayModel);
+  const metadataRows =
+    modelsFromParameterizedMetadata(parameterizedModels).map(normalizeDisplayModel);
   for (const model of metadataRows) byId.set(model.id, model);
 
   // Fallback for static/offline discovery. Cursor exposes GPT-5.5 context as
@@ -865,7 +1046,9 @@ export function augmentCursorModels(raw: CursorModel[], parameterizedModels: Cur
   return [...byId.values()];
 }
 
-export const FALLBACK_MODELS: CursorModel[] = augmentCursorModels(rawFallbackModels as CursorModel[]).map((model) => ({
+export const FALLBACK_MODELS: CursorModel[] = augmentCursorModels(
+  rawFallbackModels as CursorModel[],
+).map((model) => ({
   ...model,
   reasoning: supportsReasoningModelId(model.id),
 }));
@@ -876,7 +1059,9 @@ const CURSOR_PROVIDER_ID = "cursor";
 
 type StartupTokenSource = "env" | "pi_oauth" | "pi_oauth_refresh";
 
-async function getStoredCursorOAuthAccessToken(): Promise<{ accessToken: string; source: StartupTokenSource } | undefined> {
+async function getStoredCursorOAuthAccessToken(): Promise<
+  { accessToken: string; source: StartupTokenSource } | undefined
+> {
   const authStorage = AuthStorage.create();
   const credential = authStorage.get(CURSOR_PROVIDER_ID);
   if (credential?.type !== "oauth") return undefined;
@@ -890,14 +1075,19 @@ async function getStoredCursorOAuthAccessToken(): Promise<{ accessToken: string;
   return { accessToken: refreshed.access, source: "pi_oauth_refresh" };
 }
 
-async function getStartupCursorAccessToken(): Promise<{ accessToken: string; source: StartupTokenSource } | undefined> {
+async function getStartupCursorAccessToken(): Promise<
+  { accessToken: string; source: StartupTokenSource } | undefined
+> {
   const envToken = getCursorAccessTokenFromEnv();
   if (envToken) return { accessToken: envToken, source: "env" };
   return getStoredCursorOAuthAccessToken();
 }
 
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
-  const cleanupCurrentSession = (_event: unknown, ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } }) => {
+  const cleanupCurrentSession = (
+    _event: unknown,
+    ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } },
+  ) => {
     debugExtensionLog("session.cleanup_hook", {
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
@@ -926,7 +1116,10 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
 
   pi.on("message_update", async (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
-    const typedEvent = event as { message?: unknown; assistantMessageEvent?: Record<string, unknown> };
+    const typedEvent = event as {
+      message?: unknown;
+      assistantMessageEvent?: Record<string, unknown>;
+    };
     debugExtensionLog("message.update", {
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
@@ -934,7 +1127,13 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
       assistantMessageEvent: typedEvent.assistantMessageEvent
         ? {
             type: typedEvent.assistantMessageEvent.type,
-            delta: truncateDebugValue(String((typedEvent.assistantMessageEvent as Record<string, unknown>).delta ?? (typedEvent.assistantMessageEvent as Record<string, unknown>).content ?? "")),
+            delta: truncateDebugValue(
+              String(
+                (typedEvent.assistantMessageEvent as Record<string, unknown>).delta ??
+                  (typedEvent.assistantMessageEvent as Record<string, unknown>).content ??
+                  "",
+              ),
+            ),
           }
         : undefined,
       message: summarizeMessage(typedEvent.message),
@@ -983,7 +1182,9 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
     });
   });
 
-  debugExtensionLog("extension.debug_hooks_registered", { logFile: getExtensionDebugLogFilePath() });
+  debugExtensionLog("extension.debug_hooks_registered", {
+    logFile: getExtensionDebugLogFilePath(),
+  });
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -1012,7 +1213,8 @@ export default async function (pi: ExtensionAPI) {
     if (payload && ctx.model?.provider === "cursor") {
       payload.pi_session_id = ctx.sessionManager.getSessionId();
       const toolResultImagePayloads = extractToolResultImagePayloads(ctx, payload);
-      if (toolResultImagePayloads.length > 0) payload.cursor_tool_result_images = toolResultImagePayloads;
+      if (toolResultImagePayloads.length > 0)
+        payload.cursor_tool_result_images = toolResultImagePayloads;
       applyNoReasoningEffort(payload, pi.getThinkingLevel(), noReasoningEffortByModelId);
       applyRawCursorModelId(payload, rawModelByEffortByModelId);
       debugExtensionLog("before_provider_request", {
@@ -1031,7 +1233,10 @@ export default async function (pi: ExtensionAPI) {
   const startupModels = await discoverStartupModels();
   register(pi, port, startupModels.rawModels, startupModels.parameterizedModels);
 
-  async function discoverStartupModels(): Promise<{ rawModels: CursorModel[]; parameterizedModels: CursorParameterizedModel[] }> {
+  async function discoverStartupModels(): Promise<{
+    rawModels: CursorModel[];
+    parameterizedModels: CursorParameterizedModel[];
+  }> {
     if (process.env.PI_OFFLINE) return { rawModels: FALLBACK_MODELS, parameterizedModels: [] };
 
     let startupToken: { accessToken: string; source: StartupTokenSource } | undefined;
@@ -1075,11 +1280,16 @@ export default async function (pi: ExtensionAPI) {
     return { rawModels: FALLBACK_MODELS, parameterizedModels: [] };
   }
 
-  function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[], parameterizedModels: CursorParameterizedModel[] = []) {
+  function register(
+    pi: ExtensionAPI,
+    port: number,
+    rawModels: CursorModel[],
+    parameterizedModels: CursorParameterizedModel[] = [],
+  ) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
     const augmentedModels = augmentCursorModels(rawModels, parameterizedModels);
     const processed = skipDedup
-      ? augmentedModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
+      ? augmentedModels.map((m) => ({ ...m, supportsEffort: false }) as ProcessedModel)
       : processModels(augmentedModels);
     noReasoningEffortByModelId = buildNoReasoningEffortLookup(processed);
     rawModelByEffortByModelId = buildRawModelLookup(processed);
@@ -1104,7 +1314,12 @@ export default async function (pi: ExtensionAPI) {
             getCursorParameterizedModels(accessToken),
           ]);
           if (discovered.length > 0 || parameterized.length > 0) {
-            register(pi, realPort, discovered.length > 0 ? discovered : FALLBACK_MODELS, parameterized);
+            register(
+              pi,
+              realPort,
+              discovered.length > 0 ? discovered : FALLBACK_MODELS,
+              parameterized,
+            );
           }
 
           return {
@@ -1125,10 +1340,15 @@ export default async function (pi: ExtensionAPI) {
             getCursorParameterizedModels(refreshed.access),
           ]);
           if (discovered.length > 0 || parameterized.length > 0) {
-            register(pi, realPort, discovered.length > 0 ? discovered : FALLBACK_MODELS, parameterized);
+            register(
+              pi,
+              realPort,
+              discovered.length > 0 ? discovered : FALLBACK_MODELS,
+              parameterized,
+            );
           }
 
-          return refreshed;
+          return refreshed as OAuthCredentials;
         },
 
         getApiKey(credentials: OAuthCredentials): string {
@@ -1138,6 +1358,4 @@ export default async function (pi: ExtensionAPI) {
       },
     });
   }
-
-
 }

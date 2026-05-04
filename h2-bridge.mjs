@@ -67,7 +67,9 @@ process.stdin.on("end", () => {
 });
 
 function waitForData() {
-  return new Promise((resolve) => { stdinResolve = resolve; });
+  return new Promise((resolve) => {
+    stdinResolve = resolve;
+  });
 }
 
 async function readExact(n) {
@@ -141,7 +143,8 @@ const isErrorStatus = () => responseStatus !== 0 && (responseStatus < 200 || res
 h2Stream.on("response", (responseHeaders) => {
   resetTimeout();
   responseStatus = Number(responseHeaders[":status"] || 0);
-  responseStatusText = responseHeaders["grpc-message"] || responseHeaders["connect-error-message"] || "";
+  responseStatusText =
+    responseHeaders["grpc-message"] || responseHeaders["connect-error-message"] || "";
 });
 
 // Forward H2 response data → stdout (length-prefixed)
@@ -160,7 +163,9 @@ h2Stream.on("end", () => {
   if (isErrorStatus()) {
     const body = Buffer.concat(errorChunks).toString("utf8").trim();
     const detail = responseStatusText || body || "HTTP/2 upstream request failed";
-    writeMessage(connectEndStreamError(`http_${responseStatus}`, `Cursor HTTP ${responseStatus}: ${detail}`));
+    writeMessage(
+      connectEndStreamError(`http_${responseStatus}`, `Cursor HTTP ${responseStatus}: ${detail}`),
+    );
     setTimeout(() => process.exit(1), 100);
     return;
   }
