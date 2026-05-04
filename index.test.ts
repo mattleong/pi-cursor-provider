@@ -252,6 +252,36 @@ describe("processModels", () => {
     expect(result[0].effortMap!.xhigh).toBe("xhigh");
   });
 
+  test("gpt-5.5-1m — deduped as a separate 1M context model", () => {
+    const result = processModels([
+      m("gpt-5.5-1m-low", "GPT-5.5 1M Low"),
+      m("gpt-5.5-1m-medium", "GPT-5.5 1M"),
+      m("gpt-5.5-1m-high", "GPT-5.5 1M High"),
+      m("gpt-5.5-1m-xhigh", "GPT-5.5 1M Extra High"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("gpt-5.5-1m");
+    expect(result[0].name).toBe("GPT-5.5 1M");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.medium).toBe("medium");
+    expect(result[0].effortMap!.xhigh).toBe("xhigh");
+  });
+
+  test("gpt-5.5-1m-fast — deduped from 1M effort+fast variants", () => {
+    const result = processModels([
+      m("gpt-5.5-1m-low-fast", "GPT-5.5 1M Low Fast"),
+      m("gpt-5.5-1m-medium-fast", "GPT-5.5 1M Fast"),
+      m("gpt-5.5-1m-high-fast", "GPT-5.5 1M High Fast"),
+      m("gpt-5.5-1m-xhigh-fast", "GPT-5.5 1M Extra High Fast"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("gpt-5.5-1m-fast");
+    expect(result[0].name).toBe("GPT-5.5 1M Fast");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.medium).toBe("medium");
+    expect(result[0].effortMap!.xhigh).toBe("xhigh");
+  });
+
   test("gpt-5.2 — deduped from default + effort variants", () => {
     const result = processModels([
       m("gpt-5.2"), m("gpt-5.2-high"), m("gpt-5.2-low"), m("gpt-5.2-xhigh"),
@@ -403,6 +433,18 @@ describe("processModels", () => {
     expect(gpt55Fast).toBeDefined();
     expect(gpt55Fast!.contextWindow).toBe(272_000);
 
+    const gpt55OneMillion = result.find(r => r.id === "gpt-5.5-1m");
+    expect(gpt55OneMillion).toBeDefined();
+    expect(gpt55OneMillion!.name).toBe("GPT-5.5 1M");
+    expect(gpt55OneMillion!.supportsEffort).toBe(true);
+    expect(gpt55OneMillion!.contextWindow).toBe(1_000_000);
+
+    const gpt55OneMillionFast = result.find(r => r.id === "gpt-5.5-1m-fast");
+    expect(gpt55OneMillionFast).toBeDefined();
+    expect(gpt55OneMillionFast!.name).toBe("GPT-5.5 1M Fast");
+    expect(gpt55OneMillionFast!.supportsEffort).toBe(true);
+    expect(gpt55OneMillionFast!.contextWindow).toBe(1_000_000);
+
     // Opus should be deduped too
     const opus46 = result.find(r => r.id === "claude-4.6-opus");
     expect(opus46).toBeDefined();
@@ -415,6 +457,10 @@ describe("processModels", () => {
     expect(result.find(r => r.id === "gpt-5.4-high")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-medium")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-high")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-1m-medium")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-1m-high")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-1m-medium-fast")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-1m-high-fast")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-low-fast")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.2-low")).toBeUndefined();
   });
@@ -456,11 +502,13 @@ describe("resolveModelId", () => {
     expect(resolveModelId("gpt-5.4", "high")).toBe("gpt-5.4-high");
     expect(resolveModelId("gpt-5.4", "xhigh")).toBe("gpt-5.4-xhigh");
     expect(resolveModelId("gpt-5.5", "high")).toBe("gpt-5.5-high");
+    expect(resolveModelId("gpt-5.5-1m", "high")).toBe("gpt-5.5-1m-high");
   });
 
   test("fast model + effort — inserts before -fast", () => {
     expect(resolveModelId("gpt-5.4-fast", "medium")).toBe("gpt-5.4-medium-fast");
     expect(resolveModelId("gpt-5.4-fast", "high")).toBe("gpt-5.4-high-fast");
+    expect(resolveModelId("gpt-5.5-1m-fast", "high")).toBe("gpt-5.5-1m-high-fast");
   });
 
   test("thinking model + effort — inserts before -thinking", () => {
