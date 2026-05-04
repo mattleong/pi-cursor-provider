@@ -132,6 +132,27 @@ export interface CursorModelParameter {
   value: string;
 }
 
+export interface CursorParameterizedVariant {
+  parameters: CursorModelParameter[];
+  isMaxMode: boolean;
+  isDefaultMaxConfig?: boolean;
+  isDefaultNonMaxConfig?: boolean;
+  displayName?: string;
+  displayNameOutsidePicker?: string;
+  variantStringRepresentation?: string;
+}
+
+export interface CursorParameterizedModel {
+  name: string;
+  clientDisplayName?: string;
+  serverModelName?: string;
+  supportsMaxMode?: boolean;
+  supportsNonMaxMode?: boolean;
+  contextTokenLimit?: number;
+  contextTokenLimitForMaxMode?: number;
+  variants: CursorParameterizedVariant[];
+}
+
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
@@ -336,7 +357,12 @@ interface SpawnBridgeOptions {
 }
 
 function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
-  debugLog("bridge.spawn", { rpcPath: options.rpcPath, url: options.url ?? CURSOR_API_URL, unary: options.unary ?? false });
+  debugLog("bridge.spawn", {
+    rpcPath: options.rpcPath,
+    url: options.url ?? CURSOR_API_URL,
+    unary: options.unary ?? false,
+    cursorClientVersion: process.env.PI_CURSOR_CLIENT_VERSION || "cli-2026.05.01-eea359f",
+  });
   const proc = spawn("node", [BRIDGE_PATH], {
     stdio: ["pipe", "pipe", "ignore"],
   });
@@ -451,6 +477,7 @@ export interface CursorModel {
 }
 
 let cachedModels: CursorModel[] | null = null;
+let cachedParameterizedModels: CursorParameterizedModel[] | null = null;
 
 export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
@@ -502,6 +529,171 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
     offset = frameEnd;
   }
   return null;
+}
+
+function encodeVarint(value: number): number[] {
+  const out: number[] = [];
+  let v = value >>> 0;
+  while (v >= 0x80) {
+    out.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  out.push(v);
+  return out;
+}
+
+function encodeBoolField(fieldNo: number, value: boolean): number[] {
+  return [...encodeVarint(fieldNo << 3), value ? 1 : 0];
+}
+
+function encodeAvailableModelsRequest(): Uint8Array {
+  // aiserver.v1.AvailableModelsRequest {
+  //   optional bool use_model_parameters = 5;
+  //   optional bool do_not_use_markdown = 7;
+  // }
+  return new Uint8Array([
+    ...encodeBoolField(5, true),
+    ...encodeBoolField(7, true),
+  ]);
+}
+
+interface WireReader {
+  bytes: Uint8Array;
+  offset: number;
+}
+
+function readVarint(reader: WireReader): number {
+  let result = 0;
+  let shift = 0;
+  while (reader.offset < reader.bytes.length) {
+    const byte = reader.bytes[reader.offset++]!;
+    result |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return result >>> 0;
+    shift += 7;
+    if (shift > 35) throw new Error("varint too long");
+  }
+  throw new Error("unexpected EOF while reading varint");
+}
+
+function readLengthDelimited(reader: WireReader): Uint8Array {
+  const length = readVarint(reader);
+  const end = reader.offset + length;
+  if (end > reader.bytes.length) throw new Error("length-delimited field exceeds buffer");
+  const value = reader.bytes.subarray(reader.offset, end);
+  reader.offset = end;
+  return value;
+}
+
+function skipWireField(reader: WireReader, wireType: number): void {
+  switch (wireType) {
+    case 0:
+      readVarint(reader);
+      return;
+    case 1:
+      reader.offset += 8;
+      return;
+    case 2:
+      readLengthDelimited(reader);
+      return;
+    case 5:
+      reader.offset += 4;
+      return;
+    default:
+      throw new Error(`unsupported wire type ${wireType}`);
+  }
+}
+
+function decodeString(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes);
+}
+
+function decodeModelParameter(bytes: Uint8Array): CursorModelParameter {
+  const reader: WireReader = { bytes, offset: 0 };
+  const parameter: CursorModelParameter = { id: "", value: "" };
+  while (reader.offset < bytes.length) {
+    const tag = readVarint(reader);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === 1 && wireType === 2) parameter.id = decodeString(readLengthDelimited(reader));
+    else if (fieldNo === 2 && wireType === 2) parameter.value = decodeString(readLengthDelimited(reader));
+    else skipWireField(reader, wireType);
+  }
+  return parameter;
+}
+
+function decodeParameterizedVariant(bytes: Uint8Array): CursorParameterizedVariant {
+  const reader: WireReader = { bytes, offset: 0 };
+  const variant: CursorParameterizedVariant = { parameters: [], isMaxMode: false };
+  while (reader.offset < bytes.length) {
+    const tag = readVarint(reader);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === 1 && wireType === 2) variant.parameters.push(decodeModelParameter(readLengthDelimited(reader)));
+    else if (fieldNo === 2 && wireType === 2) variant.displayName = decodeString(readLengthDelimited(reader));
+    else if (fieldNo === 8 && wireType === 2) variant.displayNameOutsidePicker = decodeString(readLengthDelimited(reader));
+    else if (fieldNo === 3 && wireType === 0) variant.isMaxMode = readVarint(reader) !== 0;
+    else if (fieldNo === 4 && wireType === 0) variant.isDefaultMaxConfig = readVarint(reader) !== 0;
+    else if (fieldNo === 5 && wireType === 0) variant.isDefaultNonMaxConfig = readVarint(reader) !== 0;
+    else if (fieldNo === 9 && wireType === 2) variant.variantStringRepresentation = decodeString(readLengthDelimited(reader));
+    else skipWireField(reader, wireType);
+  }
+  return variant;
+}
+
+function decodeParameterizedModel(bytes: Uint8Array): CursorParameterizedModel {
+  const reader: WireReader = { bytes, offset: 0 };
+  const model: CursorParameterizedModel = { name: "", variants: [] };
+  while (reader.offset < bytes.length) {
+    const tag = readVarint(reader);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === 1 && wireType === 2) model.name = decodeString(readLengthDelimited(reader));
+    else if (fieldNo === 14 && wireType === 0) model.supportsMaxMode = readVarint(reader) !== 0;
+    else if (fieldNo === 19 && wireType === 0) model.supportsNonMaxMode = readVarint(reader) !== 0;
+    else if (fieldNo === 15 && wireType === 0) model.contextTokenLimit = readVarint(reader);
+    else if (fieldNo === 16 && wireType === 0) model.contextTokenLimitForMaxMode = readVarint(reader);
+    else if (fieldNo === 17 && wireType === 2) model.clientDisplayName = decodeString(readLengthDelimited(reader));
+    else if (fieldNo === 18 && wireType === 2) model.serverModelName = decodeString(readLengthDelimited(reader));
+    else if (fieldNo === 30 && wireType === 2) model.variants.push(decodeParameterizedVariant(readLengthDelimited(reader)));
+    else skipWireField(reader, wireType);
+  }
+  return model;
+}
+
+function decodeAvailableModelsResponse(bytes: Uint8Array): CursorParameterizedModel[] {
+  const reader: WireReader = { bytes, offset: 0 };
+  const models: CursorParameterizedModel[] = [];
+  while (reader.offset < bytes.length) {
+    const tag = readVarint(reader);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === 2 && wireType === 2) {
+      const model = decodeParameterizedModel(readLengthDelimited(reader));
+      if (model.name && model.variants.length > 0) models.push(model);
+    } else {
+      skipWireField(reader, wireType);
+    }
+  }
+  return models;
+}
+
+export async function getCursorParameterizedModels(apiKey: string): Promise<CursorParameterizedModel[]> {
+  if (cachedParameterizedModels) return cachedParameterizedModels;
+  try {
+    const response = await callCursorUnaryRpc({
+      accessToken: apiKey,
+      rpcPath: "/aiserver.v1.AiService/AvailableModels",
+      requestBody: encodeAvailableModelsRequest(),
+    });
+    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) return [];
+    const body = decodeConnectUnaryBody(response.body) ?? response.body;
+    const models = decodeAvailableModelsResponse(body);
+    cachedParameterizedModels = models;
+    return models;
+  } catch (err) {
+    console.error("[cursor-provider] Parameterized model discovery failed:", err instanceof Error ? err.message : err);
+    return [];
+  }
 }
 
 export function inferCursorContextWindow(id: string, name: string): number {
@@ -668,6 +860,14 @@ async function handleChatCompletion(
 ): Promise<void> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
+  if (body.reasoning_effort && !body.cursor_model_id && !body.cursor_model_parameters) {
+    debugLog("model_routing.fallback_suffix_generation", {
+      requestId,
+      model: body.model,
+      reasoning_effort: body.reasoning_effort,
+      resolvedModelId: modelId,
+    });
+  }
   const maxMode = typeof body.cursor_model_max_mode === "boolean"
     ? body.cursor_model_max_mode
     : body.cursor_requires_max_mode === true;
@@ -1149,6 +1349,11 @@ export function buildCursorRequest(
   // Some Cursor models (for example GPT-5.5) use requestedModel.parameters
   // for context/reasoning/fast instead of encoding everything in the model ID.
   // Max Mode is routed from model metadata for parameterized variants.
+  debugLog("cursor_request.requested_model", {
+    modelId,
+    maxMode,
+    parameters: cursorModelParameters,
+  });
   const parameters = cursorModelParameters.map((parameter) => create(RequestedModel_ModelParameterbytesSchema, parameter));
   const requestedModel = create(RequestedModelSchema, { modelId, maxMode, parameters });
   const runRequest = create(AgentRunRequestSchema, { conversationState, action, requestedModel, conversationId });

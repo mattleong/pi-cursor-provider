@@ -76,7 +76,7 @@ Models sharing the same `(base, variant)` with **≥2 effort levels** and a sens
 
 ### Parameterized Cursor models
 
-Cursor CLI exposes some choices as model parameters rather than standalone model IDs. For example, GPT-5.5 has separate **Context** settings (`272K` and `1M`), **Reasoning** settings, and a **Fast** toggle for 272K variants. Pi's model picker cannot edit those Cursor-specific parameters directly, so this extension exposes them as separate selectable rows:
+Cursor CLI exposes some choices as model parameters rather than standalone model IDs. The extension queries Cursor's `AiService.AvailableModels(useModelParameters=true)` endpoint when authenticated and generates rows for all advertised parameterized model variants; where Cursor marks a model as supporting Max Mode, GPT-style rows may also expose explicit `-max` entries over the same advertised parameter sets. It falls back to the bundled static list when live metadata is unavailable. For example, GPT-5.5 has separate **Context** settings (`272K` and `1M`), **Reasoning** settings, and a **Fast** toggle for 272K variants. Pi's model picker cannot edit those Cursor-specific parameters directly, so this extension exposes them as separate selectable rows:
 
 | Pi model | Cursor `requestedModel` |
 |---|---|
@@ -86,16 +86,17 @@ Cursor CLI exposes some choices as model parameters rather than standalone model
 | `gpt-5.5-max-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"`, `maxMode: true` |
 | `gpt-5.5-1m` | `modelId: "gpt-5.5"`, `context: "1m"`, `fast: "false"`, `maxMode: true` |
 
-Pi's thinking level supplies the Cursor `reasoning` parameter for those rows (`none`, `low`, `medium`, `high`, or `extra-high`). There is no separate `/max` toggle: Cursor-specific flags like `maxMode` and `fast` are determined by the selected model row. Cursor's own model metadata does not include any `context=1m` + `fast=true` GPT-5.5 variant; sending that invalid combination is sanitized by Cursor to the default 1M medium configuration, so this extension intentionally does not expose `gpt-5.5-1m-fast`.
+Pi's thinking level supplies the Cursor `reasoning` parameter for those rows (`none`, `low`, `medium`, `high`, or `extra-high`). Pi's `minimal` level maps to Cursor `none` when available, otherwise to the lowest available Cursor effort; `minimal` is never sent to Cursor. Likewise, `max` is not sent as a Cursor reasoning parameter. There is no separate `/max` toggle: Cursor-specific flags like `maxMode` and `fast` are determined by the selected model row. Cursor's own model metadata does not include any `context=1m` + `fast=true` GPT-5.5 variant; sending that invalid combination is sanitized by Cursor to the default 1M medium configuration, so this extension intentionally does not expose `gpt-5.5-1m-fast`.
 
 For deduped models, the extension keeps an exact map from `(displayed model, effort)` back to the raw Cursor model ID or parameter set returned/derived from Cursor. That avoids guessing where the effort segment belongs:
 
 ```
 pi selects: gpt-5.4-fast              + effort: high   → Cursor receives: gpt-5.4-high-fast
 pi selects: gpt-5.4                   + effort: medium → Cursor receives: gpt-5.4-medium
-pi selects: gpt-5.5-1m                + effort: high   → Cursor receives: gpt-5.5 + context=1m + reasoning=high
-pi selects: claude-opus-4-7-thinking  + effort: max    → Cursor receives: claude-opus-4-7-thinking-max
-pi selects: composer-2                + no effort      → Cursor receives: composer-2
+pi selects: gpt-5.5-max-fast          + effort: high   → Cursor receives: gpt-5.5 + context=272k + reasoning=high + fast=true + maxMode=true
+pi selects: gpt-5.5-1m                + effort: high   → Cursor receives: gpt-5.5 + context=1m + reasoning=high + fast=false + maxMode=true
+pi selects: claude-opus-4-7-thinking  + effort: xhigh  → Cursor receives: claude-opus-4-7 + thinking=true + context=300k + effort=xhigh
+pi selects: composer-2-fast           + no effort      → Cursor receives: composer-2 + fast=true
 ```
 
 When a group is **collapsed**, the proxy registers one model with `supportsReasoningEffort: true` and an internal effort map (see table above).
@@ -113,6 +114,22 @@ To see all raw Cursor model variants without dedup:
 
 ```bash
 PI_CURSOR_RAW_MODELS=1 pi
+```
+
+### Live Cursor metadata verification
+
+Normal tests use fixtures and do not require Cursor credentials. To verify the live Cursor parameterized metadata path, provide an access token and run:
+
+```bash
+LIVE_CURSOR_METADATA=1 CURSOR_ACCESS_TOKEN=... npm run verify:cursor-live
+```
+
+### Cursor client version header
+
+The HTTP/2 bridge sends Cursor's CLI client-version header. Override it when testing against a different installed Cursor Agent build:
+
+```bash
+PI_CURSOR_CLIENT_VERSION=cli-2026.05.01-eea359f pi
 ```
 
 ## Session Management

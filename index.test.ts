@@ -1,4 +1,5 @@
 import rawModels from "./cursor-models-raw.json";
+import gpt55ParameterizedFixture from "./fixtures/cursor-gpt55-parameterized.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
@@ -10,6 +11,7 @@ import {
   applyRawCursorModelId,
   augmentCursorModels,
   FALLBACK_MODELS,
+  modelsFromParameterizedMetadata,
   parseModelId,
   processModels,
   registerSessionLifecycleCleanup,
@@ -19,6 +21,7 @@ import {
   resolveModelId,
   resolveRequestedModelId,
   inferCursorContextWindow,
+  getCursorParameterizedModels,
   __testInternals,
   cleanupAllSessionState,
   cleanupSessionState,
@@ -317,6 +320,86 @@ describe("processModels", () => {
     expect(processed.some(model => model.id === "gpt-5.5-1m")).toBe(true);
     expect(processed.some(model => model.id === "gpt-5.5-1m-fast")).toBe(false);
     expect(augmented.some(model => /^gpt-5\.5-1m-.*-fast$/.test(model.id))).toBe(false);
+  });
+
+  test("metadata-driven GPT-5.5 generation matches Cursor parameterized fixture", () => {
+    const generated = modelsFromParameterizedMetadata(gpt55ParameterizedFixture as any);
+    const processed = processModels(generated);
+    const ids = processed.map(model => model.id).sort();
+    expect(ids).toEqual([
+      "gpt-5.5",
+      "gpt-5.5-1m",
+      "gpt-5.5-fast",
+      "gpt-5.5-max",
+      "gpt-5.5-max-fast",
+    ]);
+    expect(processed.find(model => model.id === "gpt-5.5")!.contextWindow).toBe(272_000);
+    expect(processed.find(model => model.id === "gpt-5.5-fast")!.rawRoutingByEffort!.high!.requestedMaxMode).toBe(false);
+    expect(processed.find(model => model.id === "gpt-5.5-max-fast")!.rawRoutingByEffort!.high).toEqual({
+      modelId: "gpt-5.5",
+      requestedMaxMode: true,
+      parameters: [
+        { id: "context", value: "272k" },
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "true" },
+      ],
+    });
+    expect(processed.find(model => model.id === "gpt-5.5-1m")!.contextWindow).toBe(1_000_000);
+    expect(processed.find(model => model.id === "gpt-5.5-1m")!.rawRoutingByEffort!.high!.parameters).toContainEqual({ id: "fast", value: "false" });
+    expect(generated.some(model => model.id.includes("1m") && model.id.endsWith("fast"))).toBe(false);
+    const reasoningValues = generated.flatMap(model => model.parameters ?? []).filter(parameter => parameter.id === "reasoning").map(parameter => parameter.value);
+    expect(reasoningValues).not.toContain("minimal");
+    expect(reasoningValues).not.toContain("max");
+  });
+
+  test("metadata-driven generation covers non-GPT-5.5 parameterized models", () => {
+    const generated = modelsFromParameterizedMetadata([
+      {
+        name: "composer-2",
+        clientDisplayName: "Composer 2",
+        supportsMaxMode: true,
+        supportsNonMaxMode: true,
+        variants: [
+          { isMaxMode: false, parameters: [{ id: "fast", value: "false" }] },
+          { isMaxMode: false, parameters: [{ id: "fast", value: "true" }] },
+        ],
+      },
+      {
+        name: "gpt-5.3-codex",
+        clientDisplayName: "Codex 5.3",
+        supportsMaxMode: true,
+        supportsNonMaxMode: true,
+        variants: [
+          { isMaxMode: false, parameters: [{ id: "reasoning", value: "low" }, { id: "fast", value: "false" }] },
+          { isMaxMode: false, parameters: [{ id: "reasoning", value: "high" }, { id: "fast", value: "false" }] },
+          { isMaxMode: false, parameters: [{ id: "reasoning", value: "low" }, { id: "fast", value: "true" }] },
+          { isMaxMode: false, parameters: [{ id: "reasoning", value: "high" }, { id: "fast", value: "true" }] },
+        ],
+      },
+      {
+        name: "claude-opus-4-7",
+        clientDisplayName: "Opus 4.7",
+        supportsMaxMode: true,
+        supportsNonMaxMode: true,
+        variants: [
+          { isMaxMode: false, parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "high" }] },
+          { isMaxMode: false, parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "xhigh" }] },
+        ],
+      },
+    ] as any);
+    const processed = processModels(generated);
+    expect(processed.some(model => model.id === "composer-2-fast")).toBe(true);
+    expect(processed.find(model => model.id === "gpt-5.3-codex-fast")!.rawRoutingByEffort!.high).toEqual({
+      modelId: "gpt-5.3-codex",
+      requestedMaxMode: false,
+      parameters: [{ id: "reasoning", value: "high" }, { id: "fast", value: "true" }],
+    });
+    expect(processed.find(model => model.id === "gpt-5.3-codex-max-fast")!.rawRoutingByEffort!.high!.requestedMaxMode).toBe(true);
+    expect(processed.find(model => model.id === "claude-opus-4-7-thinking")!.rawRoutingByEffort!.xhigh).toEqual({
+      modelId: "claude-opus-4-7",
+      parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "xhigh" }],
+      requestedMaxMode: false,
+    });
   });
 
   test("gpt-5.2 — deduped from default + effort variants", () => {
@@ -2086,3 +2169,49 @@ describe("proxy integration — session handling", () => {
 
 });
 
+
+const liveCursorMetadataTest = process.env.LIVE_CURSOR_METADATA && process.env.CURSOR_ACCESS_TOKEN ? test : test.skip;
+
+function normalizedParameterKey(parameters: { id: string; value: string }[] = []): string {
+  return parameters.map(parameter => `${parameter.id}=${parameter.value}`).sort().join(";");
+}
+
+function expectedContextWindowForParameter(context: string | undefined): number | undefined {
+  if (context === "272k") return 272_000;
+  if (context === "200k") return 200_000;
+  if (context === "300k") return 300_000;
+  if (context === "1m") return 1_000_000;
+  return undefined;
+}
+
+liveCursorMetadataTest("live Cursor metadata validates every generated parameterized route", async () => {
+  const metadata = await getCursorParameterizedModels(process.env.CURSOR_ACCESS_TOKEN!);
+  const generated = modelsFromParameterizedMetadata(metadata);
+  const processed = processModels(generated);
+  const parameterizedModelIds = metadata
+    .filter(model => model.variants.some(variant => variant.parameters.length > 0))
+    .map(model => model.name);
+  const generatedRequestedIds = new Set(generated.map(model => model.requestedModelId));
+  for (const modelId of parameterizedModelIds) {
+    expect(generatedRequestedIds.has(modelId), `no generated rows for parameterized model ${modelId}`).toBe(true);
+  }
+  expect(generated.length).toBeGreaterThan(25);
+  expect(new Set(processed.map(model => model.id)).size).toBe(processed.length);
+  expect(processed.some(model => model.id === "gpt-5.5-max-fast")).toBe(true);
+  expect(processed.some(model => model.id === "gpt-5.5-1m-fast")).toBe(false);
+
+  for (const route of generated) {
+    const source = metadata.find(model => model.name === route.requestedModelId);
+    expect(source, `missing metadata source for ${route.id}`).toBeDefined();
+    const key = normalizedParameterKey(route.parameters);
+    const variant = source!.variants.find(variant => normalizedParameterKey(variant.parameters) === key);
+    expect(variant, `route ${route.id} uses parameters not advertised by Cursor: ${key}`).toBeDefined();
+    if (route.requestedMaxMode === true && variant!.isMaxMode !== true) {
+      expect(source!.supportsMaxMode, `route ${route.id} sets maxMode for a model that does not support it`).toBe(true);
+    }
+    expect(route.parameters?.find(parameter => parameter.id === "reasoning")?.value).not.toBe("minimal");
+    expect(route.parameters?.find(parameter => parameter.id === "reasoning")?.value).not.toBe("max");
+    const expectedWindow = expectedContextWindowForParameter(route.parameters?.find(parameter => parameter.id === "context")?.value);
+    if (expectedWindow) expect(route.contextWindow).toBe(expectedWindow);
+  }
+});

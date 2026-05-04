@@ -24,7 +24,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.js";
-import { cleanupSessionState, getCursorModels, startProxy, type CursorModel, type CursorModelParameter } from "./proxy.js";
+import { cleanupSessionState, getCursorModels, getCursorParameterizedModels, startProxy, type CursorModel, type CursorModelParameter, type CursorParameterizedModel, type CursorParameterizedVariant } from "./proxy.js";
 
 // ── Cost estimation ──
 
@@ -504,16 +504,192 @@ function gpt55ParameterizedModels(): CursorModel[] {
   return models;
 }
 
-export function augmentCursorModels(raw: CursorModel[]): CursorModel[] {
+function parameterValue(parameters: CursorModelParameter[], id: string): string | undefined {
+  return parameters.find((parameter) => parameter.id === id)?.value;
+}
+
+function contextWindowFromParameter(context: string | undefined, fallback = 200_000): number {
+  if (context === "272k") return 272_000;
+  if (context === "1m") return 1_000_000;
+  const k = context?.match(/^(\d+)k$/i)?.[1];
+  if (k) return Number(k) * 1_000;
+  const m = context?.match(/^(\d+)m$/i)?.[1];
+  if (m) return Number(m) * 1_000_000;
+  return fallback;
+}
+
+function cursorEffortSuffix(value: string): string {
+  return value;
+}
+
+function cursorEffortLabel(value: string): string {
+  return GPT55_REASONING_LEVELS.find((level) => level.value === value)?.label
+    || ({ xhigh: "Extra High", max: "Max", none: "None" } as Record<string, string>)[value]
+    || value.replace(/-/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function metadataEffortParameterId(variant: CursorParameterizedVariant): "reasoning" | "effort" | undefined {
+  if (variant.parameters.some((parameter) => parameter.id === "reasoning")) return "reasoning";
+  if (variant.parameters.some((parameter) => parameter.id === "effort")) return "effort";
+  return undefined;
+}
+
+function isDefaultContext(context: string | undefined): boolean {
+  if (!context) return true;
+  return context === "200k" || context === "272k" || context === "300k";
+}
+
+function contextIdPart(context: string | undefined): string {
+  return context && !isDefaultContext(context) ? `-${context.toLowerCase()}` : "";
+}
+
+function contextLabel(context: string | undefined): string | undefined {
+  if (!context || isDefaultContext(context)) return undefined;
+  return context.toUpperCase();
+}
+
+function maxModeNeedsIdPart(context: string | undefined, requestedMaxMode: boolean): boolean {
+  // 1M context already names the Max/extended-context selection. For default
+  // context windows, expose maxMode as an explicit -max row.
+  return requestedMaxMode && context !== "1m";
+}
+
+function parameterizedBaseId(modelName: string, variant: CursorParameterizedVariant, requestedMaxMode: boolean): string {
+  const context = parameterValue(variant.parameters, "context");
+  return `${modelName}${contextIdPart(context)}${maxModeNeedsIdPart(context, requestedMaxMode) ? "-max" : ""}`;
+}
+
+function parameterizedBaseLabel(model: CursorParameterizedModel, variant: CursorParameterizedVariant, requestedMaxMode: boolean): string[] {
+  const context = parameterValue(variant.parameters, "context");
+  return [
+    model.clientDisplayName || model.name,
+    contextLabel(context),
+    maxModeNeedsIdPart(context, requestedMaxMode) ? "Max" : undefined,
+  ].filter(Boolean) as string[];
+}
+
+function hasVariantParameterSet(model: CursorParameterizedModel, parameters: CursorModelParameter[]): boolean {
+  const normalized = normalizeParameterValues(parameters);
+  return model.variants.some((variant) => normalizeParameterValues(variant.parameters) === normalized);
+}
+
+function normalizeParameterValues(parameters: CursorModelParameter[]): string {
+  return parameters.map((parameter) => `${parameter.id}=${parameter.value}`).sort().join(";");
+}
+
+function buildParameterizedRowsFromGroup(options: {
+  model: CursorParameterizedModel;
+  variants: CursorParameterizedVariant[];
+  requestedMaxMode: boolean;
+  effortParameterId?: "reasoning" | "effort";
+}): CursorModel[] {
+  const first = options.variants[0];
+  if (!first) return [];
+  if (options.requestedMaxMode && !first.isMaxMode && !options.model.supportsMaxMode) return [];
+
+  const context = parameterValue(first.parameters, "context");
+  const fast = parameterValue(first.parameters, "fast") === "true";
+  const thinking = parameterValue(first.parameters, "thinking") === "true";
+  const baseId = parameterizedBaseId(options.model.name, first, options.requestedMaxMode);
+  const baseLabelParts = parameterizedBaseLabel(options.model, first, options.requestedMaxMode);
+  const contextWindow = contextWindowFromParameter(context, options.requestedMaxMode
+    ? options.model.contextTokenLimitForMaxMode ?? options.model.contextTokenLimit ?? 200_000
+    : options.model.contextTokenLimit ?? 200_000);
+
+  return options.variants.flatMap((variant) => {
+    const parameters = variant.parameters.map((parameter) => ({ id: parameter.id, value: parameter.value }));
+    if (!hasVariantParameterSet(options.model, parameters)) return [];
+
+    const effort = options.effortParameterId ? parameterValue(variant.parameters, options.effortParameterId) : undefined;
+    if (options.effortParameterId === "reasoning" && (effort === "minimal" || effort === "max")) return [];
+
+    const id = options.effortParameterId
+      ? `${baseId}-${cursorEffortSuffix(effort!)}${thinking ? "-thinking" : ""}${fast ? "-fast" : ""}`
+      : `${baseId}${thinking ? "-thinking" : ""}${fast ? "-fast" : ""}`;
+    const name = [
+      ...baseLabelParts,
+      effort ? cursorEffortLabel(effort) : undefined,
+      thinking ? "Thinking" : undefined,
+      fast ? "Fast" : undefined,
+    ].filter(Boolean).join(" ");
+
+    return [{
+      id,
+      name,
+      reasoning: Boolean(options.effortParameterId) || thinking,
+      contextWindow,
+      maxTokens: 64_000,
+      requestedModelId: options.model.name,
+      requiresMaxMode: variant.isMaxMode,
+      requestedMaxMode: options.requestedMaxMode,
+      parameters,
+    } satisfies CursorModel];
+  });
+}
+
+function parameterGroupKey(variant: CursorParameterizedVariant, effortParameterId?: string): string {
+  const params = variant.parameters
+    .filter((parameter) => parameter.id !== effortParameterId)
+    .map((parameter) => `${parameter.id}=${parameter.value}`)
+    .sort()
+    .join(";");
+  return `${variant.isMaxMode ? "max" : "nonmax"}|${params}`;
+}
+
+function shouldGenerateSyntheticMaxRows(model: CursorParameterizedModel, variant: CursorParameterizedVariant): boolean {
+  if (!model.supportsMaxMode || variant.isMaxMode) return false;
+  // Generate orthogonal Max rows for GPT-style parameterized models where we
+  // have observed Cursor accepting maxMode on top of a non-Max parameter set.
+  // Avoid doing this for models whose ID already includes "max" to prevent
+  // confusing double-max row names.
+  return /^gpt-/i.test(model.name) && !/(^|-)max($|-)/i.test(model.name);
+}
+
+export function modelsFromParameterizedMetadata(parameterizedModels: CursorParameterizedModel[]): CursorModel[] {
+  const rows: CursorModel[] = [];
+  for (const model of parameterizedModels) {
+    const groups = new Map<string, { effortParameterId?: "reasoning" | "effort"; variants: CursorParameterizedVariant[] }>();
+    for (const variant of model.variants) {
+      if (variant.parameters.length === 0) continue;
+      const effortParameterId = metadataEffortParameterId(variant);
+      const key = parameterGroupKey(variant, effortParameterId);
+      const group = groups.get(key) ?? { effortParameterId, variants: [] };
+      group.variants.push(variant);
+      groups.set(key, group);
+    }
+
+    for (const group of groups.values()) {
+      const first = group.variants[0];
+      if (!first) continue;
+      rows.push(...buildParameterizedRowsFromGroup({
+        model,
+        variants: group.variants,
+        requestedMaxMode: first.isMaxMode,
+        effortParameterId: group.effortParameterId,
+      }));
+      if (shouldGenerateSyntheticMaxRows(model, first)) {
+        rows.push(...buildParameterizedRowsFromGroup({
+          model,
+          variants: group.variants,
+          requestedMaxMode: true,
+          effortParameterId: group.effortParameterId,
+        }));
+      }
+    }
+  }
+  return rows;
+}
+
+export function augmentCursorModels(raw: CursorModel[], parameterizedModels: CursorParameterizedModel[] = []): CursorModel[] {
   const byId = new Map<string, CursorModel>();
   for (const model of raw) byId.set(model.id, model);
 
-  // Cursor CLI exposes GPT-5.5 context as a parameter (272K vs 1M), not as
-  // distinct base model names. Pi's model picker cannot edit Cursor parameters,
-  // so synthesize separate selectable rows while routing both through
-  // requestedModel.modelId="gpt-5.5" with explicit parameters. Only do this
-  // when Cursor/fallback discovery already says GPT-5.5 is available.
-  if (raw.some((model) => /^gpt-5\.5(?:-|$)/.test(model.id))) {
+  const metadataRows = modelsFromParameterizedMetadata(parameterizedModels);
+  for (const model of metadataRows) byId.set(model.id, model);
+
+  // Fallback for static/offline discovery. Cursor CLI exposes GPT-5.5 context as
+  // parameters (272K vs 1M), not distinct backend model IDs.
+  if (metadataRows.length === 0 && raw.some((model) => /^gpt-5\.5(?:-|$)/.test(model.id))) {
     for (const model of gpt55ParameterizedModels()) byId.set(model.id, model);
   }
 
@@ -659,9 +835,9 @@ export default async function (pi: ExtensionAPI) {
   const port = await proxyReady;
   register(pi, port, FALLBACK_MODELS);
 
-  function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
+  function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[], parameterizedModels: CursorParameterizedModel[] = []) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
-    const augmentedModels = augmentCursorModels(rawModels);
+    const augmentedModels = augmentCursorModels(rawModels, parameterizedModels);
     const processed = skipDedup
       ? augmentedModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
       : processModels(augmentedModels);
@@ -683,8 +859,11 @@ export default async function (pi: ExtensionAPI) {
 
           // Discover real models and re-register
           const realPort = await proxyReady;
-          const discovered = await getCursorModels(accessToken);
-          if (discovered.length > 0) register(pi, realPort, discovered);
+          const [discovered, parameterized] = await Promise.all([
+            getCursorModels(accessToken),
+            getCursorParameterizedModels(accessToken),
+          ]);
+          if (discovered.length > 0) register(pi, realPort, discovered, parameterized);
 
           return {
             refresh: refreshToken,
@@ -699,8 +878,11 @@ export default async function (pi: ExtensionAPI) {
 
           // Discover real models on refresh too
           const realPort = await proxyReady;
-          const discovered = await getCursorModels(refreshed.access);
-          if (discovered.length > 0) register(pi, realPort, discovered);
+          const [discovered, parameterized] = await Promise.all([
+            getCursorModels(refreshed.access),
+            getCursorParameterizedModels(refreshed.access),
+          ]);
+          if (discovered.length > 0) register(pi, realPort, discovered, parameterized);
 
           return refreshed;
         },
