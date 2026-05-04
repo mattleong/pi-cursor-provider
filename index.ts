@@ -282,12 +282,6 @@ export function supportsReasoningModelId(id: string): boolean {
  */
 const EFFORT_ORDER = ["none", "low", "", "medium", "high", "xhigh", "max"] as const;
 
-const SYNTHETIC_EFFORT_VARIANTS: Record<string, readonly string[]> = {
-  // Cursor sometimes omits the xhigh variant for GPT-5.4 Mini during
-  // discovery, but the model still accepts it.
-  "gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
-};
-
 /**
  * Build a reasoning-effort map from the set of available effort suffixes.
  * For each pi effort level (minimal/low/medium/high/xhigh), picks the closest
@@ -308,7 +302,7 @@ export function buildEffortMap(efforts: Set<string>): Record<string, string> {
     low:     pick("low", "none", ""),
     medium:  pick("medium", "", "low"),
     high:    pick("high", "medium", ""),
-    xhigh:   pick("max", "xhigh", "high"),
+    xhigh:   pick("max", "xhigh"),
   };
 }
 
@@ -335,16 +329,13 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
 
   for (const g of groups.values()) {
     const effortNames = new Set(g.efforts.keys());
-    for (const syntheticEffort of SYNTHETIC_EFFORT_VARIANTS[g.base] ?? []) {
-      effortNames.add(syntheticEffort);
-    }
 
     // Dedup when there are multiple effort variants, OR a single variant
     // whose effort is non-empty (e.g. claude-4.5-opus-high — strip the
     // mandatory effort suffix so the model appears as claude-4.5-opus
     // with effort mapping).
     const hasOnlyEffortVariants = g.efforts.size === 1 && !g.efforts.has("");
-    const shouldDedup = effortNames.size >= 2 || hasOnlyEffortVariants || effortNames.size > g.efforts.size;
+    const shouldDedup = effortNames.size >= 2 || hasOnlyEffortVariants;
     if (shouldDedup) {
       // Pick representative: prefer "medium" or default ("") for name/metadata
       const rep = g.efforts.get("medium") ?? g.efforts.get("") ?? [...g.efforts.values()][0]!;
