@@ -372,7 +372,7 @@ export function applyNoReasoningEffort(
 export function supportsReasoningModelId(id: string): boolean {
   const { base, effort, thinking } = parseModelId(id);
   if (effort || thinking) return true;
-  if (base === "default") return true;
+  if (base === "default" || base === "auto") return true;
   return /^(claude|composer|gemini|gpt|grok|kimi)(-|$)/i.test(base);
 }
 
@@ -726,11 +726,21 @@ export function modelsFromParameterizedMetadata(parameterizedModels: CursorParam
   return rows;
 }
 
+function normalizeDisplayModel(model: CursorModel): CursorModel {
+  if (model.id !== "default") return model;
+  return {
+    ...model,
+    id: "auto",
+    name: model.name && model.name !== "default" ? model.name : "Auto",
+    requestedModelId: model.requestedModelId ?? "default",
+  };
+}
+
 export function augmentCursorModels(raw: CursorModel[], parameterizedModels: CursorParameterizedModel[] = []): CursorModel[] {
   const byId = new Map<string, CursorModel>();
-  for (const model of raw) byId.set(model.id, model);
+  for (const model of raw.map(normalizeDisplayModel)) byId.set(model.id, model);
 
-  const metadataRows = modelsFromParameterizedMetadata(parameterizedModels);
+  const metadataRows = modelsFromParameterizedMetadata(parameterizedModels).map(normalizeDisplayModel);
   for (const model of metadataRows) byId.set(model.id, model);
 
   // Fallback for static/offline discovery. Cursor exposes GPT-5.5 context as

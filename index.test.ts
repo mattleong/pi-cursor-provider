@@ -222,6 +222,7 @@ describe("reasoning support", () => {
     expect(supportsReasoningModelId("gpt-5.5")).toBe(true);
     expect(supportsReasoningModelId("composer-2")).toBe(true);
     expect(supportsReasoningModelId("default")).toBe(true);
+    expect(supportsReasoningModelId("auto")).toBe(true);
     expect(supportsReasoningModelId("totally-unknown-model")).toBe(false);
   });
 
@@ -310,6 +311,18 @@ describe("processModels", () => {
     expect(result[0].supportsEffort).toBe(true);
     expect(result[0].effortMap!.medium).toBe("medium");
     expect(result[0].effortMap!.xhigh).toBe("xhigh");
+  });
+
+  test("default Cursor model is exposed as auto/Auto but routes to default", () => {
+    const augmented = augmentCursorModels([m("default", "Auto")]);
+    expect(augmented).toHaveLength(1);
+    expect(augmented[0].id).toBe("auto");
+    expect(augmented[0].name).toBe("Auto");
+    expect(augmented[0].requestedModelId).toBe("default");
+
+    const payload: Record<string, unknown> = { model: "auto" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processModels(augmented)));
+    expect(payload.cursor_model_id).toBe("default");
   });
 
   test("GPT-5.5 augmentation exposes max-mode rows but not impossible 1M fast variants", () => {
