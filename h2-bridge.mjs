@@ -33,6 +33,15 @@ function writeMessage(data) {
   process.stdout.write(data);
 }
 
+function connectEndStreamError(code, message) {
+  const payload = Buffer.from(JSON.stringify({ error: { code, message } }), "utf8");
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = 0b00000010;
+  frame.writeUInt32BE(payload.length, 1);
+  payload.copy(frame, 5);
+  return frame;
+}
+
 // --- Buffered stdin reader ---
 
 let stdinBuf = Buffer.alloc(0);
@@ -124,16 +133,37 @@ if (!unary) {
   headers["connect-protocol-version"] = "1";
 }
 const h2Stream = client.request(headers);
+let responseStatus = 0;
+let responseStatusText = "";
+const errorChunks = [];
+const isErrorStatus = () => responseStatus !== 0 && (responseStatus < 200 || responseStatus >= 300);
+
+h2Stream.on("response", (responseHeaders) => {
+  resetTimeout();
+  responseStatus = Number(responseHeaders[":status"] || 0);
+  responseStatusText = responseHeaders["grpc-message"] || responseHeaders["connect-error-message"] || "";
+});
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
   resetTimeout();
-  writeMessage(chunk);
+  if (isErrorStatus()) {
+    errorChunks.push(Buffer.from(chunk));
+  } else {
+    writeMessage(chunk);
+  }
 });
 
 h2Stream.on("end", () => {
   clearTimeout(timeout);
   client.close();
+  if (isErrorStatus()) {
+    const body = Buffer.concat(errorChunks).toString("utf8").trim();
+    const detail = responseStatusText || body || "HTTP/2 upstream request failed";
+    writeMessage(connectEndStreamError(`http_${responseStatus}`, `Cursor HTTP ${responseStatus}: ${detail}`));
+    setTimeout(() => process.exit(1), 100);
+    return;
+  }
   // Give stdout time to flush
   setTimeout(() => process.exit(0), 100);
 });

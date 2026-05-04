@@ -160,9 +160,11 @@ The proxy maintains conversation state per pi session, enabling multi-turn conve
 
 When Cursor pauses for a tool call, the proxy keeps the live upstream bridge open and waits for pi to send the tool result on the next request. That tool result is sent back into the same in-flight Cursor run, so the tool continuation stays part of the original user turn instead of inflating completed history.
 
+If that live bridge is gone before the tool result arrives (for example because the proxy restarted or the upstream stream died), the proxy returns an explicit `tool_continuation_lost` conflict instead of silently starting a new Cursor turn with the tool result as user text. Retry from before the tool call or start a new turn. Tool calls require streaming; `stream:false` requests with tools are rejected explicitly.
+
 ### Interruptions
 
-If the client disconnects or interrupts a turn mid-stream, the proxy cancels the upstream Cursor run and does **not** commit the pending checkpoint. Checkpoints are only committed after a turn finishes successfully.
+If the client disconnects or interrupts a turn mid-stream, the proxy cancels the upstream Cursor run and does **not** commit the pending checkpoint or its newly written blobs. Checkpoints are only committed after a turn finishes successfully.
 
 ### Session fork
 

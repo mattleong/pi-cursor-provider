@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -85,6 +85,7 @@ const CONNECT_END_STREAM_FLAG = 0b00000010;
 // and accepts only jpeg/png/gif/webp by magic bytes.
 const CURSOR_CLI_MAX_IMAGE_BYTES = 5_242_880;
 const CURSOR_SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const MAX_OPENAI_REQUEST_BODY_BYTES = 25 * 1024 * 1024;
 // Use import.meta.url for bridge path resolution (jiti supports this)
 const BRIDGE_PATH = pathResolve(dirname(fileURLToPath(import.meta.url)), "h2-bridge.mjs");
 
@@ -207,6 +208,8 @@ interface ActiveBridge {
 export interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
+  checkpointTurnCount?: number;
+  checkpointHistoryFingerprint?: string;
   sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
@@ -400,6 +403,7 @@ function nextDebugRequestId(): string {
 export const __testInternals = {
   activeBridges,
   conversationStates,
+  fingerprintCompletedTurns,
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
@@ -441,7 +445,7 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     unary: options.unary ?? false,
     cursorClientVersion: process.env.PI_CURSOR_CLIENT_VERSION || "cli-2026.05.01-eea359f",
   });
-  const proc = spawn("node", [BRIDGE_PATH], {
+  const proc = spawn(process.execPath, [BRIDGE_PATH], {
     stdio: ["pipe", "pipe", "ignore"],
   });
 
@@ -841,9 +845,16 @@ export async function startProxy(
           await handleChatCompletion(parsed, accessToken, req, res, requestId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          const invalidRequest = err instanceof SyntaxError || message.startsWith("Request body exceeds ");
           debugLog("http.chat.error", { requestId, message, stack: err instanceof Error ? err.stack : undefined });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message, type: "server_error", code: "internal_error" } }));
+          res.writeHead(invalidRequest ? 400 : 500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: {
+              message,
+              type: invalidRequest ? "invalid_request_error" : "server_error",
+              code: invalidRequest ? "invalid_request" : "internal_error",
+            },
+          }));
         }
         return;
       }
@@ -888,7 +899,18 @@ export function stopProxy(): void {
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
+    let total = 0;
+    let rejected = false;
+    req.on("data", (c: Buffer) => {
+      if (rejected) return;
+      total += c.length;
+      if (total > MAX_OPENAI_REQUEST_BODY_BYTES) {
+        rejected = true;
+        reject(new Error(`Request body exceeds ${MAX_OPENAI_REQUEST_BODY_BYTES} byte limit`));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
@@ -903,6 +925,110 @@ export function evictStaleConversations(now = Date.now()): void {
       conversationStates.delete(key);
     }
   }
+}
+
+function stableNormalizeForHash(value: unknown): unknown {
+  if (value == null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
+    const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+    return { __bytes: debugByteSummary(bytes) };
+  }
+  if (Array.isArray(value)) return value.map((item) => stableNormalizeForHash(item));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, inner]) => inner !== undefined)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, inner]) => [key, stableNormalizeForHash(inner)]),
+    );
+  }
+  return String(value);
+}
+
+function fingerprintImage(image: ParsedImageContent): Record<string, unknown> {
+  return {
+    mimeType: image.mimeType,
+    ...debugByteSummary(image.data),
+  };
+}
+
+export function fingerprintCompletedTurns(turns: ParsedTurn[]): string {
+  const normalized = turns.map((turn) => ({
+    userText: turn.userText,
+    userImages: (turn.userImages ?? []).map(fingerprintImage),
+    steps: turn.steps.map((step) => {
+      if (step.kind === "assistantText") return { kind: step.kind, text: step.text };
+      return {
+        kind: step.kind,
+        toolCallId: step.toolCallId,
+        toolName: step.toolName,
+        arguments: stableNormalizeForHash(step.arguments),
+        result: step.result
+          ? {
+              content: step.result.content,
+              isError: step.result.isError,
+              images: (step.result.images ?? []).map(fingerprintImage),
+            }
+          : undefined,
+      };
+    }),
+  }));
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+function clearStoredCheckpoint(stored: StoredConversation, clearBlobStore = false): void {
+  stored.checkpoint = null;
+  delete stored.checkpointTurnCount;
+  delete stored.checkpointHistoryFingerprint;
+  if (clearBlobStore) stored.blobStore.clear();
+}
+
+function discardStaleCheckpointIfNeeded(stored: StoredConversation, turns: ParsedTurn[], requestId: string, convKey: string): void {
+  if (!stored.checkpoint) return;
+
+  const currentTurnCount = turns.length;
+  const currentHistoryFingerprint = fingerprintCompletedTurns(turns);
+  const storedCheckpointTurnCount = stored.checkpointTurnCount;
+  const storedCheckpointHistoryFingerprint = stored.checkpointHistoryFingerprint;
+  const reason = storedCheckpointTurnCount === undefined || !storedCheckpointHistoryFingerprint
+    ? "missing_checkpoint_metadata"
+    : storedCheckpointTurnCount !== currentTurnCount
+      ? "completed_turn_count_mismatch"
+      : storedCheckpointHistoryFingerprint !== currentHistoryFingerprint
+        ? "completed_history_fingerprint_mismatch"
+        : undefined;
+
+  if (!reason) return;
+
+  debugLog("chat.discard_checkpoint", {
+    requestId,
+    convKey,
+    reason,
+    storedCheckpointTurnCount,
+    currentTurnCount,
+    storedCheckpointHistoryFingerprint,
+    currentHistoryFingerprint,
+  });
+  clearStoredCheckpoint(stored, true);
+}
+
+function mergeBlobStore(stored: StoredConversation, blobStore: Map<string, Uint8Array>): void {
+  for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+  stored.lastAccessMs = Date.now();
+}
+
+function commitStoredCheckpoint(
+  stored: StoredConversation,
+  checkpointBytes: Uint8Array,
+  blobStore: Map<string, Uint8Array>,
+  completedTurns: ParsedTurn[],
+  currentTurn: ParsedTurn,
+): void {
+  const completedHistory = [...completedTurns, currentTurn];
+  mergeBlobStore(stored, blobStore);
+  stored.checkpoint = checkpointBytes;
+  stored.checkpointTurnCount = completedHistory.length;
+  stored.checkpointHistoryFingerprint = fingerprintCompletedTurns(completedHistory);
 }
 
 /**
@@ -992,6 +1118,19 @@ async function handleChatCompletion(
     return;
   }
 
+  if (body.stream === false && tools.length > 0) {
+    debugLog("chat.nonstream_tools_unsupported", { requestId, toolCount: tools.length });
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      error: {
+        message: "stream:false with tools is not supported by pi-cursor-provider; use streaming tool calls instead.",
+        type: "invalid_request_error",
+        code: "nonstream_tools_unsupported",
+      },
+    }));
+    return;
+  }
+
   const sessionId = derivePiSessionId(body);
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
@@ -1004,15 +1143,28 @@ async function handleChatCompletion(
     hasActiveBridge: !!activeBridge,
   });
 
-  if (activeBridge && toolResults.length > 0) {
-    debugLog("chat.resume_tool_results", { requestId, bridgeKey, toolResults, pendingExecs: activeBridge.pendingExecs });
-    activeBridges.delete(bridgeKey);
-    if (activeBridge.bridge.alive) {
-      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, body.stream !== false, requestId);
-      return;
+  if (toolResults.length > 0) {
+    if (activeBridge) {
+      debugLog("chat.resume_tool_results", { requestId, bridgeKey, toolResults, pendingExecs: activeBridge.pendingExecs });
+      activeBridges.delete(bridgeKey);
+      if (activeBridge.bridge.alive) {
+        handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, body.stream !== false, requestId);
+        return;
+      }
+      clearInterval(activeBridge.heartbeatTimer);
+      activeBridge.bridge.end();
     }
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
+
+    debugLog("chat.lost_tool_continuation", { requestId, bridgeKey, convKey, toolResults });
+    res.writeHead(409, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      error: {
+        message: "Cursor tool continuation was lost because the live upstream bridge is no longer available. Retry from before the tool call or start a new turn.",
+        type: "invalid_state_error",
+        code: "tool_continuation_lost",
+      },
+    }));
+    return;
   }
 
   if (activeBridge && activeBridges.has(bridgeKey)) {
@@ -1036,6 +1188,7 @@ async function handleChatCompletion(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
+  discardStaleCheckpointIfNeeded(stored, turns, requestId, convKey);
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText = userText || (toolResults.length > 0
@@ -1629,7 +1782,7 @@ export function buildCursorRequest(
       turns: turnBlobIds,
       todos: [],
       pendingToolCalls: [],
-      previousWorkspaceUris: [`file://${process.cwd()}`],
+      previousWorkspaceUris: [pathToFileURL(process.cwd()).href],
       mode: 1,
       fileStates: {},
       fileStatesV2: {},
@@ -2296,13 +2449,6 @@ function writeSSEStream(
           },
           (checkpointBytes) => {
             latestCheckpoint = checkpointBytes;
-            const stored = conversationStates.get(convKey);
-            if (stored) {
-              stored.checkpoint = checkpointBytes;
-              for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-
-              stored.lastAccessMs = Date.now();
-            }
             debugLog("stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
           },
         );
@@ -2330,16 +2476,19 @@ function writeSSEStream(
     clearInterval(heartbeatTimer);
     req.removeListener("close", onClientClose);
     res.removeListener("close", onClientClose);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-      if (!cancelled && latestCheckpoint) {
-        stored.checkpoint = latestCheckpoint;
-        debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
-      }
-    }
+
     if (cancelled) return;
+
+    const stored = conversationStates.get(convKey);
+    if (code !== 0) {
+      sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
+      sendSSE(makeUsageChunk());
+      sendDone();
+      closeResponse();
+      activeBridges.delete(bridgeKey);
+      return;
+    }
+
     if (!mcpExecReceived) {
       const flushed = tagFilter.flush();
       if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -2347,15 +2496,19 @@ function writeSSEStream(
         appendAssistantTextToTurn(currentTurn, flushed.content);
         sendSSE(makeChunk({ content: flushed.content }));
       }
+      if (stored) {
+        if (latestCheckpoint) {
+          commitStoredCheckpoint(stored, latestCheckpoint, blobStore, completedTurns, currentTurn);
+          debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
+        } else {
+          mergeBlobStore(stored, blobStore);
+        }
+      }
       sendSSE(makeChunk({}, "stop"));
       sendSSE(makeUsageChunk());
       sendDone();
       closeResponse();
-    } else if (code !== 0) {
-      sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
-      sendSSE(makeUsageChunk());
-      sendDone();
-      closeResponse();
+    } else {
       activeBridges.delete(bridgeKey);
     }
   });
@@ -2531,13 +2684,6 @@ async function handleNonStreamingResponse(
             () => {},
             (checkpointBytes) => {
               latestCheckpoint = checkpointBytes;
-              const stored = conversationStates.get(convKey);
-              if (stored) {
-                stored.checkpoint = checkpointBytes;
-                for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-  
-                stored.lastAccessMs = Date.now();
-              }
               debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
             },
           );
@@ -2555,20 +2701,11 @@ async function handleNonStreamingResponse(
       },
     ));
 
-    bridge.onClose(() => {
-      debugLog("nonstream.bridge_close", { requestId, convKey, cancelled, nonStreamError: nonStreamError?.message, currentTurn, latestCheckpoint });
+    bridge.onClose((code) => {
+      debugLog("nonstream.bridge_close", { requestId, convKey, code, cancelled, nonStreamError: nonStreamError?.message, currentTurn, latestCheckpoint });
       clearInterval(heartbeatTimer);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);
-      const stored = conversationStates.get(convKey);
-      if (stored) {
-        for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-        stored.lastAccessMs = Date.now();
-        if (!cancelled && !nonStreamError && latestCheckpoint) {
-          stored.checkpoint = latestCheckpoint;
-          debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
-        }
-      }
 
       if (cancelled) {
         if (!res.headersSent) {
@@ -2577,6 +2714,10 @@ async function handleNonStreamingResponse(
         }
         resolve();
         return;
+      }
+
+      if (code !== 0 && !nonStreamError) {
+        nonStreamError = new Error("Bridge connection lost");
       }
 
       if (nonStreamError) {
@@ -2592,6 +2733,15 @@ async function handleNonStreamingResponse(
       fullText += flushed.content;
       appendAssistantTextToTurn(currentTurn, flushed.content);
       const usage = computeUsage(state);
+      const stored = conversationStates.get(convKey);
+      if (stored) {
+        if (latestCheckpoint) {
+          commitStoredCheckpoint(stored, latestCheckpoint, payload.blobStore, completedTurns, currentTurn);
+          debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
+        } else {
+          mergeBlobStore(stored, payload.blobStore);
+        }
+      }
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({

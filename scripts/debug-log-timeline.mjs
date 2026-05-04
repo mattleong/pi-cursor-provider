@@ -8,6 +8,8 @@ const NOTABLE_EVENTS = [
   "chat.no_user_message",
   "http.chat.error",
   "chat.discard_checkpoint",
+  "chat.lost_tool_continuation",
+  "chat.nonstream_tools_unsupported",
   "chat.resume_tool_results",
   "stream.tool_call_pause",
   "tool_resume.start",

@@ -190,7 +190,7 @@ describe("buildEffortMap", () => {
 
   test("with default (empty) and medium", () => {
     const map = buildEffortMap(new Set(["", "low", "medium", "high"]));
-    expect(map).toEqual({ minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "low" });
+    expect(map).toEqual({ minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "high" });
   });
 
   test("default without medium — medium maps to empty", () => {
@@ -210,7 +210,7 @@ describe("buildEffortMap", () => {
 
   test("low+high — medium falls back to low", () => {
     const map = buildEffortMap(new Set(["low", "high"]));
-    expect(map).toEqual({ minimal: "low", low: "low", medium: "low", high: "high", xhigh: "low" });
+    expect(map).toEqual({ minimal: "low", low: "low", medium: "low", high: "high", xhigh: "high" });
   });
 });
 
@@ -2061,6 +2061,64 @@ describe("proxy integration — session handling", () => {
     expect(Array.from(result.content[0].content.value.data)).toEqual(Array.from(pngBytes()));
   });
 
+  test("lost tool-call continuation returns an explicit conflict instead of silently starting a new turn", async () => {
+    const bridges: FakeBridge[] = [];
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case === "runRequest") {
+          fake.emitServerMessage(makeMcpExecMessage("tc-lost", "read", { path: "README.md" }));
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+
+    const sessionId = "session-lost-tool-continuation";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const port = await startProxy(async () => "test-token");
+
+    const first = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "inspect file" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(first.body).toContain('"finish_reason":"tool_calls"');
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+
+    bridges[0].close(1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+
+    const second = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "inspect file" },
+        { role: "assistant", content: null, tool_calls: [{ id: "tc-lost", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+        { role: "tool", content: "README contents", tool_call_id: "tc-lost" },
+      ],
+    });
+
+    expect(second.statusCode).toBe(409);
+    expect(second.body).toContain("tool_continuation_lost");
+  });
+
+  test("stream:false with tools is rejected explicitly", async () => {
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      stream: false,
+      messages: [{ role: "user", content: "inspect file" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toContain("nonstream_tools_unsupported");
+  });
+
   test("partial tool-result batches stay in-flight until all pending tool results arrive", async () => {
     const execClientMessages: any[] = [];
     const sessionId = "session-partial-tools";
@@ -2213,7 +2271,7 @@ describe("proxy integration — session handling", () => {
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
   });
 
-  test("stream cancellation sends cancelAction and persists the latest checkpoint and blob store immediately", async () => {
+  test("stream cancellation sends cancelAction without committing pending checkpoint or blob store", async () => {
     let cancelCount = 0;
     const sessionId = "session-cancel";
     const convKey = deriveConversationKeyFromSessionId(sessionId);
@@ -2278,13 +2336,12 @@ describe("proxy integration — session handling", () => {
     const stored = __testInternals.conversationStates.get(convKey);
     expect(cancelCount).toBe(1);
     expect(stored).toBeDefined();
-    expect(stored?.checkpoint).toBeTruthy();
-
-    expect(Array.from(stored?.blobStore.get(blobKey) ?? [])).toEqual(Array.from(blobData));
+    expect(stored?.checkpoint).toBeNull();
+    expect(stored?.blobStore.has(blobKey)).toBe(false);
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
   });
 
-  test("interrupt after a checkpoint reuses the stored checkpoint on the next request", async () => {
+  test("interrupt after a checkpoint does not reuse the uncommitted checkpoint on the next request", async () => {
     const sessionId = "session-interrupt-after-checkpoint";
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
@@ -2339,7 +2396,7 @@ describe("proxy integration — session handling", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const storedCheckpoint = __testInternals.conversationStates.get(convKey)?.checkpoint;
-    expect(storedCheckpoint).toBeTruthy();
+    expect(storedCheckpoint).toBeNull();
 
     const runRequests: any[] = [];
     setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
@@ -2362,11 +2419,12 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).toEqual(storedCheckpoint);
     expect(runRequests[0].conversationId).toBe("conv-interrupt-after-checkpoint");
+    expect(runRequests[0].conversationState.turns).toHaveLength(1);
+    expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
   });
 
-  test("interrupt after checkpoint reuses it even when pi includes partial assistant text in resumed history", async () => {
+  test("interrupt after checkpoint reconstructs resumed history with partial assistant text", async () => {
     const sessionId = "session-interrupt-partial-assistant";
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
@@ -2412,7 +2470,7 @@ describe("proxy integration — session handling", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const storedCheckpoint = __testInternals.conversationStates.get(convKey)?.checkpoint;
-    expect(storedCheckpoint).toBeTruthy();
+    expect(storedCheckpoint).toBeNull();
 
     const runRequests: any[] = [];
     setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
@@ -2437,12 +2495,12 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    // Checkpoint should be REUSED despite the partial assistant text in the incoming history
-    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).toEqual(storedCheckpoint);
     expect(runRequests[0].conversationId).toBe("conv-partial-assistant");
+    expect(runRequests[0].conversationState.turns).toHaveLength(1);
+    expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
   });
 
-  test("interrupt before any new checkpoint reuses the prior checkpoint (session continues)", async () => {
+  test("interrupt before any new checkpoint discards prior checkpoint when resumed history includes the interrupted turn", async () => {
     const sessionId = "session-interrupt-before-checkpoint";
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
@@ -2453,6 +2511,8 @@ describe("proxy integration — session handling", () => {
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-old",
       checkpoint: priorCheckpoint,
+      checkpointTurnCount: priorTurns.length,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(priorTurns),
       sessionScoped: true,
       blobStore: new Map(priorPayload.blobStore),
       lastAccessMs: Date.now(),
@@ -2486,7 +2546,7 @@ describe("proxy integration — session handling", () => {
     interruptedBridge.emitServerMessage(makeTextDeltaMessage("partial output"));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    // Prior checkpoint survives — no discard logic
+    // Prior completed checkpoint survives the interrupted in-flight turn.
     expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(priorCheckpoint);
 
     const runRequests: any[] = [];
@@ -2513,15 +2573,14 @@ describe("proxy integration — session handling", () => {
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
     expect(runRequests[0].conversationId).toBe("conv-old");
-    // Prior checkpoint reused — session continues on Cursor side
-    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).toEqual(priorCheckpoint);
+    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).not.toEqual(priorCheckpoint);
+    expect(runRequests[0].conversationState.turns).toHaveLength(2);
     expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
   });
 
-  test("same-depth branch with different assistant text reuses checkpoint (pi lifecycle hooks handle real forks)", async () => {
-    // When only assistant steps differ on the last turn, the checkpoint is kept.
-    // Actual branch navigation in pi fires session_before_tree/session_before_fork
-    // which cleans up state before the next request arrives.
+  test("same-depth branch with different assistant text discards stale checkpoint", async () => {
+    // Lifecycle hooks clean up real Pi forks, but the proxy still validates
+    // completed-history fingerprints so stale checkpoints are not reused.
     const runRequests: any[] = [];
 
     setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
@@ -2539,6 +2598,8 @@ describe("proxy integration — session handling", () => {
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-branch",
       checkpoint: toBinary(ConversationStateStructureSchema, priorRequest.conversationState),
+      checkpointTurnCount: storedTurns.length,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(storedTurns),
 
 
       sessionScoped: true,
@@ -2562,8 +2623,8 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    // Checkpoint reused — conversationState comes from the stored checkpoint
-    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).toEqual(storedCheckpoint);
+    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).not.toEqual(storedCheckpoint);
+    expect(runRequests[0].conversationState.turns).toHaveLength(1);
   });
 
 });

@@ -501,7 +501,7 @@ export function buildEffortMap(efforts: Set<string>): Record<string, string> {
     low:     pick("low", "none", ""),
     medium:  pick("medium", "", "low"),
     high:    pick("high", "medium", ""),
-    xhigh:   pick("max", "xhigh"),
+    xhigh:   pick("max", "xhigh", "high", "medium", "", "low", "none"),
   };
 }
 
