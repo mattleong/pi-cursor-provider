@@ -2,7 +2,16 @@ import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
-import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
+import {
+  applyNoReasoningEffort,
+  buildEffortMap,
+  buildNoReasoningEffortLookup,
+  FALLBACK_MODELS,
+  parseModelId,
+  processModels,
+  registerSessionLifecycleCleanup,
+  supportsReasoningModelId,
+} from "./index.ts";
 import {
   resolveModelId,
   __testInternals,
@@ -265,6 +274,16 @@ describe("processModels", () => {
     expect(result[0].effortMap!.minimal).toBe("none");
   });
 
+  test("no-reasoning lookup tracks models with none effort", () => {
+    const result = processModels([
+      m("gpt-5.4-mini-low"), m("gpt-5.4-mini-medium"), m("gpt-5.4-mini-none"),
+      m("gpt-5.4-low"), m("gpt-5.4-medium"), m("gpt-5.4-high"),
+    ]);
+    const lookup = buildNoReasoningEffortLookup(result);
+    expect(lookup.get("gpt-5.4-mini")).toBe("none");
+    expect(lookup.has("gpt-5.4")).toBe(false);
+  });
+
   test("claude-4.6-opus — high+max deduped, effort clamped to lowest", () => {
     const result = processModels([
       m("claude-4.6-opus-high"), m("claude-4.6-opus-max"),
@@ -378,6 +397,11 @@ describe("processModels", () => {
     const gpt55 = result.find(r => r.id === "gpt-5.5");
     expect(gpt55).toBeDefined();
     expect(gpt55!.supportsEffort).toBe(true);
+    expect(gpt55!.contextWindow).toBe(272_000);
+
+    const gpt55Fast = result.find(r => r.id === "gpt-5.5-fast");
+    expect(gpt55Fast).toBeDefined();
+    expect(gpt55Fast!.contextWindow).toBe(272_000);
 
     // Opus should be deduped too
     const opus46 = result.find(r => r.id === "claude-4.6-opus");
@@ -393,6 +417,28 @@ describe("processModels", () => {
     expect(result.find(r => r.id === "gpt-5.5-high")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.5-low-fast")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.2-low")).toBeUndefined();
+  });
+});
+
+// ── no reasoning effort ──
+
+describe("applyNoReasoningEffort", () => {
+  test("maps thinking off to Cursor none effort when available", () => {
+    const payload: Record<string, unknown> = { model: "gpt-5.4-mini" };
+    applyNoReasoningEffort(payload, "off", new Map([["gpt-5.4-mini", "none"]]));
+    expect(payload.reasoning_effort).toBe("none");
+  });
+
+  test("does not override explicit reasoning effort", () => {
+    const payload: Record<string, unknown> = { model: "gpt-5.4-mini", reasoning_effort: "high" };
+    applyNoReasoningEffort(payload, "off", new Map([["gpt-5.4-mini", "none"]]));
+    expect(payload.reasoning_effort).toBe("high");
+  });
+
+  test("leaves models without none effort unchanged", () => {
+    const payload: Record<string, unknown> = { model: "gpt-5.4" };
+    applyNoReasoningEffort(payload, "off", new Map([["gpt-5.4-mini", "none"]]));
+    expect(payload.reasoning_effort).toBeUndefined();
   });
 });
 

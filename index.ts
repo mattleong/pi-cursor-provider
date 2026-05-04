@@ -244,9 +244,29 @@ export function parseModelId(id: string): ParsedModelId {
   return { base: remaining, effort: "", fast, thinking };
 }
 
-interface ProcessedModel extends CursorModel {
+export interface ProcessedModel extends CursorModel {
   supportsEffort: boolean;
   effortMap?: Record<string, string>;
+}
+
+export function buildNoReasoningEffortLookup(models: ProcessedModel[]): Map<string, string> {
+  const lookup = new Map<string, string>();
+  for (const model of models) {
+    if (model.supportsEffort && model.effortMap && Object.values(model.effortMap).includes("none")) {
+      lookup.set(model.id, "none");
+    }
+  }
+  return lookup;
+}
+
+export function applyNoReasoningEffort(
+  payload: Record<string, unknown>,
+  thinkingLevel: string,
+  noReasoningEffortByModelId: Map<string, string>,
+): void {
+  if (thinkingLevel !== "off" || payload.reasoning_effort !== undefined || typeof payload.model !== "string") return;
+  const noReasoningEffort = noReasoningEffortByModelId.get(payload.model);
+  if (noReasoningEffort) payload.reasoning_effort = noReasoningEffort;
 }
 
 export function supportsReasoningModelId(id: string): boolean {
@@ -457,6 +477,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
 export default async function (pi: ExtensionAPI) {
   // Current access token, updated by login/refresh/getApiKey
   let currentToken = "";
+  let noReasoningEffortByModelId = new Map<string, string>();
 
   // Start proxy eagerly — it just binds a port, no auth needed until a request arrives.
   // The getAccessToken callback reads currentToken at request time.
@@ -477,6 +498,7 @@ export default async function (pi: ExtensionAPI) {
     const payload = event.payload as Record<string, unknown> | undefined;
     if (payload && ctx.model?.provider === "cursor") {
       payload.pi_session_id = ctx.sessionManager.getSessionId();
+      applyNoReasoningEffort(payload, pi.getThinkingLevel(), noReasoningEffortByModelId);
       debugExtensionLog("before_provider_request", {
         sessionId: ctx.sessionManager.getSessionId(),
         leafId: ctx.sessionManager.getLeafId?.(),
@@ -497,6 +519,7 @@ export default async function (pi: ExtensionAPI) {
     const processed = skipDedup
       ? rawModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
       : processModels(rawModels);
+    noReasoningEffortByModelId = buildNoReasoningEffortLookup(processed);
 
     pi.registerProvider("cursor", {
       baseUrl,
