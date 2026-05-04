@@ -302,6 +302,19 @@ describe("processModels", () => {
     expect(result[0].id).toBe("gpt-5.4-mini");
     expect(result[0].supportsEffort).toBe(true);
     expect(result[0].effortMap!.minimal).toBe("none");
+    expect(result[0].effortMap!.xhigh).toBe("xhigh");
+  });
+
+  test("gpt-5.4-mini — synthesizes xhigh when discovery omits it", () => {
+    const result = processModels([
+      m("gpt-5.4-mini-low"), m("gpt-5.4-mini-medium"), m("gpt-5.4-mini-high"),
+      m("gpt-5.4-mini-none"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("gpt-5.4-mini");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.minimal).toBe("none");
+    expect(result[0].effortMap!.xhigh).toBe("xhigh");
   });
 
   test("no-reasoning lookup tracks models with none effort", () => {

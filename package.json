@@ -23,8 +23,8 @@
     "openai-compatible"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*"
+    "@mariozechner/pi-ai": "^0.72.1",
+    "@mariozechner/pi-coding-agent": "^0.72.1"
   },
   "engines": {
     "node": ">=18"
