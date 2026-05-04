@@ -1,15 +1,15 @@
 {
   "name": "pi-cursor-provider",
   "version": "0.1.12",
-  "description": "Pi extension providing access to Cursor models via OAuth and a local OpenAI-compatible gRPC proxy",
+  "description": "Pi extension providing access to Cursor models via OAuth and a native Pi streamSimple provider",
   "keywords": [
     "cursor",
     "grpc",
+    "native-provider",
     "oauth",
-    "openai-compatible",
     "pi",
     "pi-package",
-    "proxy"
+    "streamSimple"
   ],
   "homepage": "https://github.com/ndraiman/pi-cursor-provider#readme",
   "bugs": {

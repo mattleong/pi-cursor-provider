@@ -3,7 +3,7 @@
  *
  * Provides access to Cursor models (Claude, GPT, Gemini, etc.) via:
  * 1. Browser-based PKCE OAuth login to Cursor
- * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
+ * 2. Native Pi streamSimple provider translating Pi context → Cursor gRPC protocol
  *
  * Usage:
  *   /login cursor    — authenticate via browser
@@ -28,9 +28,9 @@ import {
 } from "./auth.js";
 import {
   cleanupSessionState,
+  createCursorNativeStream,
   getCursorModels,
   getCursorParameterizedModels,
-  startProxy,
   type CursorModel,
   type CursorModelParameter,
   type CursorParameterizedModel,
@@ -193,43 +193,6 @@ function summarizeBranchTail(
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
-}
-
-function summarizeProviderPayload(payload: unknown): unknown {
-  if (!payload || typeof payload !== "object") return payload;
-  const typed = payload as Record<string, unknown>;
-  const messages = Array.isArray(typed.messages)
-    ? typed.messages.map((message) => summarizeMessage(message)).slice(-8)
-    : undefined;
-  const toolResultImages = Array.isArray(typed.cursor_tool_result_images)
-    ? typed.cursor_tool_result_images.map((entry) => {
-        if (!entry || typeof entry !== "object") return entry;
-        const e = entry as Record<string, unknown>;
-        return {
-          toolCallId: e.toolCallId,
-          images: Array.isArray(e.images)
-            ? e.images.map((image) => {
-                const img = image as Record<string, unknown>;
-                return summarizeImageBlock("image", img.mimeType, img.data);
-              })
-            : undefined,
-        };
-      })
-    : undefined;
-  return {
-    model: typed.model,
-    cursor_model_id: typed.cursor_model_id,
-    cursor_model_parameters: typed.cursor_model_parameters,
-    cursor_tool_result_images: toolResultImages,
-    cursor_requires_max_mode: typed.cursor_requires_max_mode,
-    cursor_model_max_mode: typed.cursor_model_max_mode,
-    reasoning_effort: typed.reasoning_effort,
-    stream: typed.stream,
-    pi_session_id: typed.pi_session_id,
-    messageCount: Array.isArray(typed.messages) ? typed.messages.length : undefined,
-    messages,
-    toolCount: Array.isArray(typed.tools) ? typed.tools.length : undefined,
-  };
 }
 
 export interface CursorToolResultImagePayload {
@@ -1198,45 +1161,22 @@ export default async function (pi: ExtensionAPI) {
   let noReasoningEffortByModelId = new Map<string, string>();
   let rawModelByEffortByModelId = new Map<string, Record<string, CursorModelRouting>>();
 
-  // Start proxy eagerly — it just binds a port, no auth needed until a request arrives.
-  // The getAccessToken callback reads currentToken at request time.
-  const proxyReady = startProxy(async () => {
+  const getAccessToken = async () => {
     if (!currentToken) throw new Error("Not logged in to Cursor. Run /login cursor");
     return currentToken;
-  });
+  };
 
   const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
 
   registerSessionLifecycleCleanup(pi);
   registerExtensionDebugHooks(pi);
   debugExtensionLog("extension.start", {
+    mode: "native-streamSimple",
     debugLogFile: isExtensionDebugEnabled() ? getExtensionDebugLogFilePath() : undefined,
   });
 
-  pi.on("before_provider_request", (event, ctx) => {
-    const payload = event.payload as Record<string, unknown> | undefined;
-    if (payload && ctx.model?.provider === "cursor") {
-      payload.pi_session_id = ctx.sessionManager.getSessionId();
-      const toolResultImagePayloads = extractToolResultImagePayloads(ctx, payload);
-      if (toolResultImagePayloads.length > 0)
-        payload.cursor_tool_result_images = toolResultImagePayloads;
-      applyNoReasoningEffort(payload, pi.getThinkingLevel(), noReasoningEffortByModelId);
-      applyRawCursorModelId(payload, rawModelByEffortByModelId);
-      debugExtensionLog("before_provider_request", {
-        sessionId: ctx.sessionManager.getSessionId(),
-        leafId: ctx.sessionManager.getLeafId?.(),
-        model: ctx.model?.id,
-        payload: summarizeProviderPayload(payload),
-        branch: summarizeBranchTail(ctx),
-      });
-    }
-    return payload;
-  });
-
-  // Await proxy so models are registered before pi proceeds with model resolution.
-  const port = await proxyReady;
   const startupModels = await discoverStartupModels();
-  register(pi, port, startupModels.rawModels, startupModels.parameterizedModels);
+  register(pi, startupModels.rawModels, startupModels.parameterizedModels);
 
   async function discoverStartupModels(): Promise<{
     rawModels: CursorModel[];
@@ -1287,11 +1227,9 @@ export default async function (pi: ExtensionAPI) {
 
   function register(
     pi: ExtensionAPI,
-    port: number,
     rawModels: CursorModel[],
     parameterizedModels: CursorParameterizedModel[] = [],
   ) {
-    const baseUrl = `http://127.0.0.1:${port}/v1`;
     const augmentedModels = augmentCursorModels(rawModels, parameterizedModels);
     const processed = skipDedup
       ? augmentedModels.map((m) => ({ ...m, supportsEffort: false }) as ProcessedModel)
@@ -1300,8 +1238,13 @@ export default async function (pi: ExtensionAPI) {
     rawModelByEffortByModelId = buildRawModelLookup(processed);
 
     pi.registerProvider("cursor", {
-      baseUrl,
-      api: "openai-completions",
+      baseUrl: "https://api2.cursor.sh",
+      api: "cursor-native",
+      streamSimple: createCursorNativeStream({
+        getAccessToken,
+        getNoReasoningEffortByModelId: () => noReasoningEffortByModelId,
+        getRawModelRoutingByModelId: () => rawModelByEffortByModelId,
+      }),
       models: processed.map(modelConfig),
       oauth: {
         name: "Cursor",
@@ -1313,18 +1256,12 @@ export default async function (pi: ExtensionAPI) {
           currentToken = accessToken;
 
           // Discover real models and re-register
-          const realPort = await proxyReady;
           const [discovered, parameterized] = await Promise.all([
             getCursorModels(accessToken),
             getCursorParameterizedModels(accessToken),
           ]);
           if (discovered.length > 0 || parameterized.length > 0) {
-            register(
-              pi,
-              realPort,
-              discovered.length > 0 ? discovered : FALLBACK_MODELS,
-              parameterized,
-            );
+            register(pi, discovered.length > 0 ? discovered : FALLBACK_MODELS, parameterized);
           }
 
           return {
@@ -1339,18 +1276,12 @@ export default async function (pi: ExtensionAPI) {
           currentToken = refreshed.access;
 
           // Discover real models on refresh too
-          const realPort = await proxyReady;
           const [discovered, parameterized] = await Promise.all([
             getCursorModels(refreshed.access),
             getCursorParameterizedModels(refreshed.access),
           ]);
           if (discovered.length > 0 || parameterized.length > 0) {
-            register(
-              pi,
-              realPort,
-              discovered.length > 0 ? discovered : FALLBACK_MODELS,
-              parameterized,
-            );
+            register(pi, discovered.length > 0 ? discovered : FALLBACK_MODELS, parameterized);
           }
 
           return refreshed as OAuthCredentials;
@@ -1358,7 +1289,7 @@ export default async function (pi: ExtensionAPI) {
 
         getApiKey(credentials: OAuthCredentials): string {
           currentToken = credentials.access;
-          return "cursor-proxy";
+          return "cursor-native";
         },
       },
     });

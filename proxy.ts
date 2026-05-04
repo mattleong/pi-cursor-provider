@@ -1,11 +1,26 @@
 /**
- * Local OpenAI-compatible proxy: translates /v1/chat/completions to Cursor's gRPC protocol.
+ * Cursor native provider runtime: translates Pi streamSimple context to Cursor's
+ * protobuf/HTTP2 Connect protocol.
  *
  * Based on https://github.com/ephraimduncan/opencode-cursor by Ephraim Duncan.
  * Uses Node's http2 via a child process bridge (h2-bridge.mjs).
  */
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
+import {
+  createAssistantMessageEventStream,
+  type Api,
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Context,
+  type ImageContent as PiImageContent,
+  type Message as PiMessage,
+  type Model,
+  type SimpleStreamOptions,
+  type TextContent as PiTextContent,
+  type Tool as PiTool,
+  type ToolCall as PiToolCall,
+} from "@mariozechner/pi-ai";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
@@ -749,6 +764,852 @@ function readBody(req: IncomingMessage): Promise<string> {
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+}
+
+// ── Native pi streamSimple provider ──
+
+export interface CursorNativeModelRouting {
+  modelId: string;
+  parameters?: CursorModelParameter[];
+  requiresMaxMode?: boolean;
+  requestedMaxMode?: boolean;
+}
+
+export interface CursorNativeStreamConfig {
+  getAccessToken(): Promise<string>;
+  getNoReasoningEffortByModelId?(): Map<string, string>;
+  getRawModelRoutingByModelId?(): Map<string, Record<string, CursorNativeModelRouting>>;
+}
+
+type CursorNativeStreamOptions = SimpleStreamOptions & {
+  toolChoice?: unknown;
+};
+
+type NativeBlockKind = "text" | "thinking";
+
+interface NativeStreamWriter {
+  output: AssistantMessage;
+  closed: boolean;
+  start(): void;
+  text(delta: string): void;
+  thinking(delta: string): void;
+  toolCall(exec: PendingExec): void;
+  done(reason: "stop" | "length" | "toolUse", state?: StreamState): void;
+  error(message: string, reason: "error" | "aborted", state?: StreamState): void;
+}
+
+function emptyCursorUsage(): AssistantMessage["usage"] {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function tokenCost(tokens: number, ratePerMillion = 0): number {
+  return (tokens * ratePerMillion) / 1_000_000;
+}
+
+function applyCursorUsage(output: AssistantMessage, model: Model<Api>, state?: StreamState): void {
+  if (!state) return;
+  const usage = computeUsage(state);
+  const costInput = tokenCost(usage.prompt_tokens, model.cost?.input);
+  const costOutput = tokenCost(usage.completion_tokens, model.cost?.output);
+  output.usage = {
+    input: usage.prompt_tokens,
+    output: usage.completion_tokens,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: usage.total_tokens,
+    cost: {
+      input: costInput,
+      output: costOutput,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: costInput + costOutput,
+    },
+  };
+}
+
+function createCursorAssistantMessage(model: Model<Api>): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: emptyCursorUsage(),
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+function createNativeStreamWriter(
+  stream: AssistantMessageEventStream,
+  model: Model<Api>,
+): NativeStreamWriter {
+  const output = createCursorAssistantMessage(model);
+  let started = false;
+  let closed = false;
+  let active: { kind: NativeBlockKind; contentIndex: number; ended: boolean } | undefined;
+
+  const ensureStarted = () => {
+    if (started) return;
+    started = true;
+    stream.push({ type: "start", partial: output });
+  };
+
+  const endActiveBlock = () => {
+    if (!active || active.ended) return;
+    const block = output.content[active.contentIndex];
+    if (active.kind === "text" && block?.type === "text") {
+      stream.push({
+        type: "text_end",
+        contentIndex: active.contentIndex,
+        content: block.text,
+        partial: output,
+      });
+    } else if (active.kind === "thinking" && block?.type === "thinking") {
+      stream.push({
+        type: "thinking_end",
+        contentIndex: active.contentIndex,
+        content: block.thinking,
+        partial: output,
+      });
+    }
+    active.ended = true;
+    active = undefined;
+  };
+
+  const ensureBlock = (kind: NativeBlockKind): number => {
+    ensureStarted();
+    if (active?.kind === kind && !active.ended) return active.contentIndex;
+    endActiveBlock();
+    const contentIndex = output.content.length;
+    if (kind === "text") {
+      output.content.push({ type: "text", text: "" });
+      stream.push({ type: "text_start", contentIndex, partial: output });
+    } else {
+      output.content.push({ type: "thinking", thinking: "" });
+      stream.push({ type: "thinking_start", contentIndex, partial: output });
+    }
+    active = { kind, contentIndex, ended: false };
+    return contentIndex;
+  };
+
+  return {
+    output,
+    get closed() {
+      return closed;
+    },
+    start: ensureStarted,
+    text(delta: string) {
+      if (closed || !delta) return;
+      const contentIndex = ensureBlock("text");
+      const block = output.content[contentIndex];
+      if (block?.type !== "text") return;
+      block.text += delta;
+      stream.push({ type: "text_delta", contentIndex, delta, partial: output });
+    },
+    thinking(delta: string) {
+      if (closed || !delta) return;
+      const contentIndex = ensureBlock("thinking");
+      const block = output.content[contentIndex];
+      if (block?.type !== "thinking") return;
+      block.thinking += delta;
+      stream.push({ type: "thinking_delta", contentIndex, delta, partial: output });
+    },
+    toolCall(exec: PendingExec) {
+      if (closed) return;
+      ensureStarted();
+      endActiveBlock();
+      const contentIndex = output.content.length;
+      const parsedArguments = parseToolCallArguments(exec.decodedArgs);
+      const block = {
+        type: "toolCall" as const,
+        id: exec.toolCallId,
+        name: exec.toolName,
+        arguments: {},
+      };
+      output.content.push(block);
+      stream.push({ type: "toolcall_start", contentIndex, partial: output });
+      block.arguments = parsedArguments;
+      stream.push({
+        type: "toolcall_delta",
+        contentIndex,
+        delta: exec.decodedArgs,
+        partial: output,
+      });
+      stream.push({
+        type: "toolcall_end",
+        contentIndex,
+        toolCall: {
+          type: "toolCall",
+          id: exec.toolCallId,
+          name: exec.toolName,
+          arguments: parsedArguments,
+        },
+        partial: output,
+      });
+    },
+    done(reason: "stop" | "length" | "toolUse", state?: StreamState) {
+      if (closed) return;
+      ensureStarted();
+      endActiveBlock();
+      applyCursorUsage(output, model, state);
+      output.stopReason = reason;
+      stream.push({ type: "done", reason, message: output });
+      closed = true;
+      stream.end(output);
+    },
+    error(message: string, reason: "error" | "aborted", state?: StreamState) {
+      if (closed) return;
+      ensureStarted();
+      endActiveBlock();
+      applyCursorUsage(output, model, state);
+      output.stopReason = reason;
+      output.errorMessage = message;
+      stream.push({ type: "error", reason, error: output });
+      closed = true;
+      stream.end(output);
+    },
+  };
+}
+
+function isPiTextContent(block: unknown): block is PiTextContent {
+  return !!block && typeof block === "object" && (block as { type?: unknown }).type === "text";
+}
+
+function isPiImageContent(block: unknown): block is PiImageContent {
+  return !!block && typeof block === "object" && (block as { type?: unknown }).type === "image";
+}
+
+function isPiToolCall(block: unknown): block is PiToolCall {
+  return !!block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall";
+}
+
+function piContentToOpenAIContent(
+  content: string | PiMessage["content"],
+): OpenAIMessage["content"] {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: ContentPart[] = [];
+  for (const block of content) {
+    if (isPiTextContent(block)) {
+      parts.push({ type: "text", text: block.text });
+    } else if (isPiImageContent(block)) {
+      parts.push({ type: "image", data: block.data, mimeType: block.mimeType });
+    }
+  }
+  return parts.length > 0 ? parts : "";
+}
+
+function assistantTextFromPiContent(content: AssistantMessage["content"]): string {
+  return content
+    .filter((block): block is PiTextContent => isPiTextContent(block))
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function assistantToolCallsFromPiContent(content: AssistantMessage["content"]): OpenAIToolCall[] {
+  return content.filter(isPiToolCall).map((block) => ({
+    id: block.id,
+    type: "function" as const,
+    function: {
+      name: block.name,
+      arguments: JSON.stringify(block.arguments ?? {}),
+    },
+  }));
+}
+
+function piToolToOpenAI(tool: PiTool): OpenAIToolDef {
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters as unknown as Record<string, unknown>,
+    },
+  };
+}
+
+function resolveNativeReasoningEffort(
+  model: Model<Api>,
+  options: CursorNativeStreamOptions | undefined,
+  noReasoningEffortByModelId?: Map<string, string>,
+): string | undefined {
+  const requested = options?.reasoning;
+  if (requested) {
+    const mapped = model.thinkingLevelMap?.[requested];
+    return typeof mapped === "string" ? mapped : requested;
+  }
+  const offMapped = model.thinkingLevelMap?.off;
+  if (typeof offMapped === "string") return offMapped;
+  return noReasoningEffortByModelId?.get(model.id);
+}
+
+function applyNativeCursorRouting(
+  body: ChatCompletionRequest,
+  rawRoutingByModelId?: Map<string, Record<string, CursorNativeModelRouting>>,
+): void {
+  const routes = rawRoutingByModelId?.get(body.model);
+  const effort = body.reasoning_effort ?? "";
+  const routing = routes?.[effort] ?? routes?.[""];
+  if (!routing) return;
+  body.cursor_model_id = routing.modelId;
+  if (routing.parameters?.length) body.cursor_model_parameters = routing.parameters;
+  if (routing.requiresMaxMode) body.cursor_requires_max_mode = true;
+  if (typeof routing.requestedMaxMode === "boolean")
+    body.cursor_model_max_mode = routing.requestedMaxMode;
+}
+
+function contextToCursorChatCompletionRequest(
+  model: Model<Api>,
+  context: Context,
+  options: CursorNativeStreamOptions | undefined,
+  config: CursorNativeStreamConfig,
+): ChatCompletionRequest {
+  const messages: OpenAIMessage[] = [];
+  if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
+
+  for (const message of context.messages) {
+    if (message.role === "user") {
+      messages.push({ role: "user", content: piContentToOpenAIContent(message.content) });
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      const tool_calls = assistantToolCallsFromPiContent(message.content);
+      messages.push({
+        role: "assistant",
+        content: assistantTextFromPiContent(message.content),
+        ...(tool_calls.length > 0 ? { tool_calls } : {}),
+      });
+      continue;
+    }
+
+    if (message.role === "toolResult") {
+      messages.push({
+        role: "tool",
+        tool_call_id: message.toolCallId,
+        content: piContentToOpenAIContent(message.content),
+      });
+    }
+  }
+
+  const body: ChatCompletionRequest = {
+    model: model.id,
+    messages,
+    stream: true,
+    tools: (context.tools ?? []).map(piToolToOpenAI),
+    tool_choice: options?.toolChoice,
+    reasoning_effort: resolveNativeReasoningEffort(
+      model,
+      options,
+      config.getNoReasoningEffortByModelId?.(),
+    ),
+    pi_session_id: options?.sessionId,
+    user: options?.sessionId,
+    temperature: options?.temperature,
+    max_tokens: options?.maxTokens,
+  };
+
+  applyNativeCursorRouting(body, config.getRawModelRoutingByModelId?.());
+  return body;
+}
+
+function nativeRequestParameterError(body: ChatCompletionRequest): string | undefined {
+  if (body.temperature !== undefined)
+    return "Unsupported Cursor provider parameter(s): temperature";
+  return undefined;
+}
+
+function lostToolContinuationMessage(): string {
+  return "Cursor tool continuation was lost because the live upstream bridge is no longer available. Retry from before the tool call or start a new turn.";
+}
+
+export function createCursorNativeStream(
+  config: CursorNativeStreamConfig,
+): (
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+) => AssistantMessageEventStream {
+  return (model, context, options) => {
+    const stream = createAssistantMessageEventStream();
+    const writer = createNativeStreamWriter(stream, model);
+    writer.start();
+
+    (async () => {
+      let body = contextToCursorChatCompletionRequest(
+        model,
+        context,
+        options as CursorNativeStreamOptions | undefined,
+        config,
+      );
+
+      if (options?.onPayload) {
+        const replacement = await options.onPayload(body, model);
+        if (replacement && typeof replacement === "object")
+          body = replacement as ChatCompletionRequest;
+      }
+
+      await withSessionLock(deriveRequestLockKey(body), async () => {
+        if (writer.closed) return;
+        const accessToken = await config.getAccessToken();
+        await handleCursorNativeRequest(
+          body,
+          accessToken,
+          model,
+          options as CursorNativeStreamOptions | undefined,
+          writer,
+          nextDebugRequestId(),
+        );
+      });
+    })().catch((error) => {
+      writer.error(error instanceof Error ? error.message : String(error), "error");
+    });
+
+    return stream;
+  };
+}
+
+async function handleCursorNativeRequest(
+  body: ChatCompletionRequest,
+  accessToken: string,
+  model: Model<Api>,
+  options: CursorNativeStreamOptions | undefined,
+  writer: NativeStreamWriter,
+  requestId: string,
+): Promise<void> {
+  let parsedMessages: ParsedMessages;
+  try {
+    parsedMessages = parseMessages(body.messages, body.cursor_tool_result_images);
+  } catch (error) {
+    writer.error(error instanceof Error ? error.message : String(error), "error");
+    return;
+  }
+
+  const parameterError = nativeRequestParameterError(body);
+  if (parameterError) {
+    debugLog("native.unsupported_parameters", { requestId, message: parameterError });
+    writer.error(parameterError, "error");
+    return;
+  }
+
+  const toolResolution = resolveToolsForToolChoice(body.tools ?? [], body.tool_choice);
+  if ("error" in toolResolution) {
+    debugLog("native.unsupported_tool_choice", { requestId, tool_choice: body.tool_choice });
+    writer.error(toolResolution.error, "error");
+    return;
+  }
+
+  const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
+  const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
+  const maxMode =
+    typeof body.cursor_model_max_mode === "boolean"
+      ? body.cursor_model_max_mode
+      : body.cursor_requires_max_mode === true;
+  const sessionId = derivePiSessionId(body);
+  const bridgeKey = deriveBridgeKey(body.messages, sessionId);
+  const convKey = deriveConversationKey(body.messages, sessionId);
+  const activeBridge = activeBridges.get(bridgeKey);
+
+  debugLog("native.request", {
+    requestId,
+    sessionId,
+    bridgeKey,
+    convKey,
+    model: body.model,
+    resolvedModelId: modelId,
+    cursorModelId: body.cursor_model_id,
+    cursorModelParameters: body.cursor_model_parameters,
+    cursorRequiresMaxMode: body.cursor_requires_max_mode,
+    cursorModelMaxMode: body.cursor_model_max_mode,
+    maxMode,
+    messageCount: body.messages.length,
+    turnCount: turns.length,
+    userText,
+    toolResults,
+    hasActiveBridge: !!activeBridge,
+  });
+
+  if (!userText && userImages.length === 0 && toolResults.length === 0) {
+    writer.error("No user message found", "error");
+    return;
+  }
+
+  if (toolResults.length > 0) {
+    if (activeBridge) {
+      removeActiveBridge(bridgeKey);
+      if (activeBridge.bridge.alive) {
+        handleNativeToolResultResume(
+          activeBridge,
+          toolResults,
+          model,
+          modelId,
+          bridgeKey,
+          convKey,
+          turns,
+          writer,
+          options,
+          requestId,
+        );
+        return;
+      }
+      clearInterval(activeBridge.heartbeatTimer);
+      activeBridge.bridge.end();
+    }
+    const message = lostToolContinuationMessage();
+    debugLog("native.lost_tool_continuation", {
+      requestId,
+      bridgeKey,
+      convKey,
+      toolResults,
+      message,
+    });
+    writer.error(message, "error");
+    return;
+  }
+
+  if (activeBridge && activeBridges.has(bridgeKey)) {
+    clearInterval(activeBridge.heartbeatTimer);
+    activeBridge.bridge.end();
+    removeActiveBridge(bridgeKey);
+  }
+
+  let stored = conversationStates.get(convKey);
+  if (!stored) {
+    stored = {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: null,
+      sessionScoped: !!sessionId,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    };
+    conversationStates.set(convKey, stored);
+  }
+  stored.lastAccessMs = Date.now();
+  evictStaleConversations();
+  discardStaleCheckpointIfNeeded(stored, turns, requestId, convKey);
+
+  const mcpTools = buildMcpToolDefinitions(toolResolution.tools);
+  const effectiveUserText = userText;
+  const effectiveUserImages = userText || userImages.length > 0 ? userImages : [];
+  const payload = buildCursorRequest(
+    modelId,
+    systemPrompt,
+    effectiveUserText,
+    turns,
+    stored.conversationId,
+    stored.checkpoint,
+    stored.blobStore,
+    maxMode,
+    body.cursor_model_parameters,
+    mcpTools,
+    effectiveUserImages,
+  );
+  payload.mcpTools = mcpTools;
+
+  const currentTurn: ParsedTurn = {
+    userText: effectiveUserText,
+    steps: [],
+    ...(effectiveUserImages.length > 0 ? { userImages: effectiveUserImages } : {}),
+  };
+
+  debugLog("native.dispatch_stream", {
+    requestId,
+    bridgeKey,
+    convKey,
+    conversationId: stored.conversationId,
+    hasCheckpoint: !!stored.checkpoint,
+    payload,
+  });
+  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+  writeNativeStream(
+    bridge,
+    heartbeatTimer,
+    payload.blobStore,
+    payload.mcpTools,
+    model,
+    modelId,
+    bridgeKey,
+    convKey,
+    turns,
+    currentTurn,
+    writer,
+    options,
+    requestId,
+  );
+}
+
+function writeNativeStream(
+  bridge: BridgeHandle,
+  heartbeatTimer: ReturnType<typeof setInterval>,
+  blobStore: Map<string, Uint8Array>,
+  mcpTools: McpToolDefinition[],
+  model: Model<Api>,
+  modelId: string,
+  bridgeKey: string,
+  convKey: string,
+  completedTurns: ParsedTurn[],
+  currentTurn: ParsedTurn,
+  writer: NativeStreamWriter,
+  options?: CursorNativeStreamOptions,
+  requestId?: string,
+): void {
+  debugLog("native.stream.start", { requestId, bridgeKey, convKey, modelId });
+  const state: StreamState = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+  };
+  const tagFilter = createThinkingTagFilter();
+  let mcpExecReceived = false;
+  let cancelled = false;
+  let streamError: Error | null = null;
+  let latestCheckpoint: Uint8Array | null = null;
+
+  const abort = () => {
+    if (cancelled || writer.closed) return;
+    cancelled = true;
+    debugLog("native.stream.abort", { requestId, bridgeKey, convKey });
+    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+    writer.error("Aborted", "aborted", state);
+  };
+  options?.signal?.addEventListener("abort", abort, { once: true });
+
+  const emitText = (text: string, isThinking?: boolean) => {
+    if (writer.closed) return;
+    if (isThinking) {
+      writer.thinking(text);
+      return;
+    }
+    const { content, reasoning } = tagFilter.process(text);
+    if (reasoning) writer.thinking(reasoning);
+    if (content) {
+      appendAssistantTextToTurn(currentTurn, content);
+      writer.text(content);
+    }
+  };
+
+  const emitFlushed = () => {
+    const flushed = tagFilter.flush();
+    if (flushed.reasoning) writer.thinking(flushed.reasoning);
+    if (flushed.content) {
+      appendAssistantTextToTurn(currentTurn, flushed.content);
+      writer.text(flushed.content);
+    }
+  };
+
+  const processChunk = createConnectFrameParser(
+    (messageBytes) => {
+      try {
+        const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+        processServerMessage(
+          serverMessage,
+          blobStore,
+          mcpTools,
+          (data) => bridge.write(data),
+          state,
+          emitText,
+          (exec) => {
+            state.pendingExecs.push(exec);
+            mcpExecReceived = true;
+            emitFlushed();
+            currentTurn.steps.push({
+              kind: "toolCall",
+              toolCallId: exec.toolCallId,
+              toolName: exec.toolName,
+              arguments: parseToolCallArguments(exec.decodedArgs),
+            });
+
+            setActiveBridge(bridgeKey, {
+              bridge,
+              heartbeatTimer,
+              blobStore,
+              mcpTools,
+              pendingExecs: state.pendingExecs,
+              currentTurn,
+            });
+            debugLog("native.stream.tool_call_pause", {
+              requestId,
+              bridgeKey,
+              exec,
+              pendingExecs: state.pendingExecs,
+              currentTurn,
+            });
+
+            if (!writer.closed) {
+              writer.toolCall(exec);
+              writer.done("toolUse", state);
+            }
+          },
+          (checkpointBytes) => {
+            latestCheckpoint = checkpointBytes;
+            debugLog("native.stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
+          },
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        debugLog("native.stream.process_error", { requestId, message });
+        if (!writer.closed) writer.error(message, "error", state);
+      }
+    },
+    (endStreamBytes) => {
+      const endError = parseConnectEndStream(endStreamBytes);
+      if (endError) {
+        streamError = endError;
+        debugLog("native.stream.cursor_error", { requestId, modelId, message: endError.message });
+        writer.error(endError.message, "error", state);
+      }
+    },
+  );
+
+  bridge.onData(processChunk);
+
+  bridge.onClose((code) => {
+    debugLog("native.stream.bridge_close", {
+      requestId,
+      bridgeKey,
+      convKey,
+      code,
+      cancelled,
+      mcpExecReceived,
+      currentTurn,
+      latestCheckpoint,
+    });
+    clearInterval(heartbeatTimer);
+    options?.signal?.removeEventListener("abort", abort);
+
+    if (cancelled) return;
+    if (streamError) {
+      removeActiveBridge(bridgeKey);
+      return;
+    }
+
+    const stored = conversationStates.get(convKey);
+    if (code !== 0) {
+      writer.error("Bridge connection lost", "error", state);
+      removeActiveBridge(bridgeKey);
+      return;
+    }
+
+    if (!mcpExecReceived) {
+      emitFlushed();
+      if (stored) {
+        if (latestCheckpoint) {
+          commitStoredCheckpoint(stored, latestCheckpoint, blobStore, completedTurns, currentTurn);
+          debugLog("native.stream.checkpoint_committed", { requestId, convKey, stored });
+        } else {
+          mergeBlobStore(stored, blobStore);
+        }
+      }
+      writer.done("stop", state);
+    } else {
+      removeActiveBridge(bridgeKey);
+    }
+  });
+}
+
+function handleNativeToolResultResume(
+  active: ActiveBridge,
+  toolResults: ToolResultInfo[],
+  model: Model<Api>,
+  modelId: string,
+  bridgeKey: string,
+  convKey: string,
+  completedTurns: ParsedTurn[],
+  writer: NativeStreamWriter,
+  options?: CursorNativeStreamOptions,
+  requestId?: string,
+): void {
+  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
+  debugLog("native.tool_resume.start", {
+    requestId,
+    bridgeKey,
+    convKey,
+    toolResults,
+    pendingExecs,
+    currentTurn,
+  });
+
+  for (const result of toolResults) {
+    const turnToolStep = currentTurn.steps.find(
+      (step): step is ParsedToolCallStep =>
+        step.kind === "toolCall" && step.toolCallId === result.toolCallId,
+    );
+    if (turnToolStep) {
+      turnToolStep.result = { content: result.content, images: result.images, isError: false };
+    }
+  }
+
+  const turnResults = getTurnToolCallResults(currentTurn);
+  const unresolvedExecs = pendingExecs.filter((exec) => !turnResults.has(exec.toolCallId));
+  if (unresolvedExecs.length > 0) {
+    setActiveBridge(bridgeKey, {
+      bridge,
+      heartbeatTimer,
+      blobStore,
+      mcpTools,
+      pendingExecs,
+      currentTurn,
+    });
+    debugLog("native.tool_resume.partial_wait", {
+      requestId,
+      bridgeKey,
+      unresolvedExecs,
+      currentTurn,
+    });
+    for (const exec of unresolvedExecs) writer.toolCall(exec);
+    writer.done("toolUse");
+    return;
+  }
+
+  for (const exec of pendingExecs) {
+    const result = turnResults.get(exec.toolCallId);
+    if (!result) continue;
+    const mcpResult = create(McpResultSchema, {
+      result: {
+        case: "success",
+        value: create(McpSuccessSchema, {
+          content: buildMcpSuccessContent(result),
+          isError: false,
+        }),
+      },
+    });
+
+    const execClientMessage = create(ExecClientMessageSchema, {
+      id: exec.execMsgId,
+      execId: exec.execId,
+      message: { case: "mcpResult" as any, value: mcpResult as any },
+    });
+    const clientMessage = create(AgentClientMessageSchema, {
+      message: { case: "execClientMessage", value: execClientMessage },
+    });
+    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+    debugLog("native.tool_resume.sent_result", { requestId, exec, result });
+  }
+
+  writeNativeStream(
+    bridge,
+    heartbeatTimer,
+    blobStore,
+    mcpTools,
+    model,
+    modelId,
+    bridgeKey,
+    convKey,
+    completedTurns,
+    currentTurn,
+    writer,
+    options,
+    requestId,
+  );
 }
 
 // ── Request handling ──

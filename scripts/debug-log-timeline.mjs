@@ -257,6 +257,17 @@ function summarize(events, filePath) {
         if (req.sessionId) sessionIds.add(req.sessionId);
         break;
       }
+      case "native.request":
+        if (!req) break;
+        req.model = event.model;
+        req.stream = true;
+        req.sessionId = event.sessionId;
+        req.messageCount = event.messageCount;
+        req.parsedTurns = event.turnCount;
+        req.parsedToolResults = Array.isArray(event.toolResults) ? event.toolResults.length : 0;
+        req.parsedUserText = event.userText ?? undefined;
+        if (req.sessionId) sessionIds.add(req.sessionId);
+        break;
       case "chat.parsed_messages":
         if (!req) break;
         req.parsedTurns = Array.isArray(event.turns) ? event.turns.length : undefined;
@@ -266,6 +277,7 @@ function summarize(events, filePath) {
         req.parsedUserText = event.userText ?? undefined;
         break;
       case "chat.resume_tool_results":
+      case "native.tool_resume.start":
         if (!req) break;
         req.resumeToolResults = Array.isArray(event.toolResults) ? event.toolResults : [];
         req.pendingBeforeResume = Array.isArray(event.pendingExecs)
@@ -289,41 +301,50 @@ function summarize(events, filePath) {
         req.noUserMessage = true;
         break;
       case "http.chat.error":
+      case "native.unsupported_parameters":
+      case "native.lost_tool_continuation":
         if (!req) break;
         req.error = shorten(event.message ?? "unknown error", 120);
         break;
       case "stream.writer_start":
       case "nonstream.start":
+      case "native.stream.start":
         if (!req) break;
         req.currentTurnUser = event.currentTurn?.userText ?? req.currentTurnUser;
         req.completedTurnCount = event.completedTurnCount ?? req.completedTurnCount;
         break;
       case "tool_resume.sent_result":
+      case "native.tool_resume.sent_result":
         if (!req) break;
         req.sentResults.push(event.exec?.toolCallId ?? event.exec?.execId ?? "?");
         break;
       case "tool_resume.partial_wait":
+      case "native.tool_resume.partial_wait":
         if (!req) break;
         req.partialWait = Array.isArray(event.unresolvedExecs)
           ? event.unresolvedExecs.map(formatTool)
           : [];
         break;
       case "stream.tool_call_pause":
+      case "native.stream.tool_call_pause":
         if (!req) break;
         req.toolPauses.push(formatTool(event.exec));
         break;
       case "stream.checkpoint_buffered":
       case "nonstream.checkpoint_buffered":
+      case "native.stream.checkpoint_buffered":
         if (!req) break;
         req.checkpointBuffered += 1;
         break;
       case "stream.client_close":
       case "nonstream.client_close":
+      case "native.stream.abort":
         if (!req) break;
         req.clientClosed = true;
         break;
       case "stream.bridge_close":
       case "nonstream.bridge_close":
+      case "native.stream.bridge_close":
         if (!req) break;
         req.bridgeClose = {
           code: event.code ?? undefined,
@@ -334,6 +355,7 @@ function summarize(events, filePath) {
         break;
       case "stream.checkpoint_committed":
       case "nonstream.checkpoint_committed":
+      case "native.stream.checkpoint_committed":
         if (!req) break;
         req.checkpointCommitted = {
           turnCount: event.stored?.checkpointTurnCount,

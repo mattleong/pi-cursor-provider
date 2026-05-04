@@ -2,26 +2,24 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-cursor-provider.svg)](https://www.npmjs.com/package/pi-cursor-provider)
 
-[Pi](https://github.com/badlogic/pi-mono) extension that provides access to [Cursor](https://cursor.com) models via OAuth authentication and a local OpenAI-compatible proxy.
+[Pi](https://github.com/badlogic/pi-mono) extension that provides access to [Cursor](https://cursor.com) models via OAuth authentication and a native Pi `streamSimple` provider.
 
 ## How it works
 
 ```
-pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
-                                      ↓
-                              proxy.ts (HTTP server)
-                                      ↓
-                              h2-bridge.mjs (Node HTTP/2)
-                                      ↓
-                              api2.cursor.sh gRPC
+pi  →  cursor-native streamSimple  →  Cursor protobuf/Connect frames
+                                              ↓
+                                      h2-bridge.mjs (Node HTTP/2)
+                                              ↓
+                                      api2.cursor.sh gRPC
 ```
 
 1. **PKCE OAuth** — browser-based login to Cursor, no client secret needed
 2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
-3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol using Cursor's newer `requestedModel` request field
-4. **Image input** — forwards OpenAI-style `image_url` data URLs as Cursor `SelectedImage` entries in `UserMessage.selectedContext`
-5. **Tool-result images** — forwards image blocks returned by pi tools as Cursor MCP image result content
-6. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
+3. **Native Pi provider** — translates Pi context/tools directly to Cursor's protobuf/HTTP2 Connect protocol using Cursor's newer `requestedModel` request field
+4. **Image input** — forwards Pi image blocks as Cursor `SelectedImage` entries in `UserMessage.selectedContext`
+5. **Tool-result images** — forwards image blocks returned by Pi tools as Cursor MCP image result content
+6. **Tool routing** — rejects Cursor's native tools, exposes Pi's tools via MCP
 
 ## Install
 
@@ -101,7 +99,7 @@ pi selects: claude-opus-4-7-thinking  + effort: xhigh  → Cursor receives: clau
 pi selects: composer-2-fast           + no effort      → Cursor receives: composer-2 + fast=true
 ```
 
-When a group is **collapsed**, the proxy registers one model with `supportsReasoningEffort: true` and an internal effort map (see table above).
+When a group is **collapsed**, the provider registers one model with Pi thinking-level support and an internal effort map (see table above).
 
 **Collapsed** when Cursor returns either:
 
@@ -143,43 +141,43 @@ Image constraints are grounded in the Cursor CLI local-image path:
 - Supported formats are detected by magic bytes: jpeg, png, gif, or webp.
 - Maximum processed image payload is 5,242,880 bytes.
 - Cursor CLI downscales/compresses local files to fit that cap; this provider receives inline image bytes from Pi, so oversized inline images are rejected rather than resized.
-- Remote structured `image_url` attachments are rejected with a clear error; attach the image or provide an inline `data:image/...;base64,...` URL instead. Plain text URLs remain plain text.
+- Remote image URLs are not fetched; attach the image through Pi so it is available as an inline image block. Plain text URLs remain plain text.
 
 ## Session Management
 
-The proxy maintains conversation state per pi session, enabling multi-turn conversations with Cursor models while preserving forks, tool continuations, and interruptions correctly.
+The native provider runtime maintains conversation state per Pi session, enabling multi-turn conversations with Cursor models while preserving forks, tool continuations, and interruptions correctly.
 
 ### How it works
 
-- **Session tracking** — pi's session ID is injected into requests via a `before_provider_request` hook. The proxy keys bridge state and stored conversation state from that real session ID.
-- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The proxy stores that checkpoint, plus the completed-turn count and a fingerprint of the completed structured history, and reuses it only when the incoming history still matches.
+- **Session tracking** — Pi passes the session ID through `streamSimple` options. The provider keys bridge state and stored conversation state from that real session ID.
+- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The provider stores that checkpoint, plus the completed-turn count and a fingerprint of the completed structured history, and reuses it only when the incoming history still matches.
 - **Session-scoped state** — real pi session state is kept in memory until explicit cleanup or process restart. Anonymous fallback state can still be TTL-evicted.
 - **Lifecycle cleanup** — session state is cleaned up on pi lifecycle events such as session switch, fork, `/tree`, and shutdown.
 
 ### Tool continuations
 
-When Cursor pauses for a tool call, the proxy keeps the live upstream bridge open and waits for pi to send the tool result on the next request. That tool result is sent back into the same in-flight Cursor run, so the tool continuation stays part of the original user turn instead of inflating completed history.
+When Cursor pauses for a tool call, the provider keeps the live upstream bridge open and waits for Pi to send the tool result on the next stream request. That tool result is sent back into the same in-flight Cursor run, so the tool continuation stays part of the original user turn instead of inflating completed history.
 
-If that live bridge is gone before the tool result arrives (for example because the proxy restarted or the upstream stream died), the proxy returns an explicit `tool_continuation_lost` conflict instead of silently starting a new Cursor turn with the tool result as user text. Retry from before the tool call or start a new turn. Tool calls require streaming; `stream:false` requests with tools are rejected explicitly. Paused tool-call bridges are cancelled after a TTL (default 15 minutes; override with `PI_CURSOR_ACTIVE_BRIDGE_TTL_MS`).
+If that live bridge is gone before the tool result arrives (for example because the provider process restarted or the upstream stream died), the provider returns an explicit `tool_continuation_lost` error instead of silently starting a new Cursor turn with the tool result as user text. Retry from before the tool call or start a new turn. Paused tool-call bridges are cancelled after a TTL (default 15 minutes; override with `PI_CURSOR_ACTIVE_BRIDGE_TTL_MS`).
 
-`tool_choice: "none"` is honored by withholding MCP tools from Cursor. Other forced tool choices are rejected because Cursor's agent protocol does not expose an equivalent OpenAI-compatible control. Pi/OpenAI compatibility fields `max_tokens` and `max_completion_tokens` are accepted as no-ops because pi sends them routinely and Cursor controls output budgeting server-side. Unsupported sampling parameters such as `temperature` are rejected instead of silently ignored.
+`tool_choice: "none"` is honored by withholding MCP tools from Cursor when supplied through provider options/hooks. Other forced tool choices are rejected because Cursor's agent protocol does not expose an equivalent control. Cursor controls output budgeting server-side; unsupported sampling parameters such as `temperature` are rejected instead of silently ignored.
 
 ### Interruptions
 
-If the client disconnects or interrupts a turn mid-stream, the proxy cancels the upstream Cursor run and does **not** commit the pending checkpoint or its newly written blobs. Checkpoints are only committed after a turn finishes successfully.
+If Pi interrupts a turn mid-stream, the provider cancels the upstream Cursor run and does **not** commit the pending checkpoint or its newly written blobs. Checkpoints are only committed after a turn finishes successfully.
 
 ### Session fork
 
-When you navigate back in pi's session tree and branch from an earlier point, the proxy discards the stored checkpoint whenever the completed history no longer matches the stored checkpoint metadata. That includes both:
+When you navigate back in Pi's session tree and branch from an earlier point, the provider discards the stored checkpoint whenever the completed history no longer matches the stored checkpoint metadata. That includes both:
 
 - completed turn count mismatches, and
 - same-depth branch changes detected via completed-history fingerprint mismatch.
 
-After discarding a stale checkpoint, the proxy reconstructs proper protobuf conversation turns from the message history pi sends, so Cursor sees the actual conversation structure at the fork point.
+After discarding a stale checkpoint, the provider reconstructs proper protobuf conversation turns from the message history Pi sends, so Cursor sees the actual conversation structure at the fork point.
 
 ### Session resume
 
-Conversation state is stored in memory. If the proxy restarts, checkpoints are lost. On the next request, pi sends the full conversation history, and the proxy reconstructs structured protobuf turns from that history instead of relying on an inline plaintext fallback.
+Conversation state is stored in memory. If the provider process restarts, checkpoints are lost. On the next request, Pi sends the full conversation history, and the provider reconstructs structured protobuf turns from that history instead of relying on an inline plaintext fallback.
 
 That reconstruction preserves:
 
@@ -210,7 +208,7 @@ Protocol notes, generated protobuf provenance, and reverse-engineered wire-field
 
 ## Debug log timeline
 
-When `PI_CURSOR_PROVIDER_DEBUG=1` is enabled, the proxy writes timestamped JSONL logs to `os.tmpdir()` by default. You can turn a log into a compact human-readable timeline with:
+When `PI_CURSOR_PROVIDER_DEBUG=1` is enabled, the provider runtime writes timestamped JSONL logs to `os.tmpdir()` by default. You can turn a log into a compact human-readable timeline with:
 
 ```bash
 npm run debug:timeline -- --latest
@@ -221,4 +219,4 @@ Add `--json` if you want the parsed summary as JSON instead of formatted text.
 
 ## Credits
 
-OAuth flow and gRPC proxy adapted from [opencode-cursor](https://github.com/ephraimduncan/opencode-cursor) by Ephraim Duncan.
+OAuth flow and gRPC protocol bridge adapted from [opencode-cursor](https://github.com/ephraimduncan/opencode-cursor) by Ephraim Duncan.

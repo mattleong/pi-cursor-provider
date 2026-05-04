@@ -33,6 +33,7 @@ import {
   deriveConversationKeyFromSessionId,
   derivePiSessionId,
   buildCursorRequest,
+  createCursorNativeStream,
   parseMessages,
   setBridgeFactoryForTests,
   startProxy,
@@ -2341,6 +2342,234 @@ async function postChatCompletion(port: number, body: Record<string, unknown>) {
     req.end(JSON.stringify(body));
   });
 }
+
+function nativeModel(id = "gpt-5") {
+  return {
+    id,
+    name: id,
+    api: "cursor-native",
+    provider: "cursor",
+    baseUrl: "https://api2.cursor.sh",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  } as any;
+}
+
+async function collectEvents(stream: AsyncIterable<any>): Promise<any[]> {
+  const events: any[] = [];
+  for await (const event of stream) events.push(event);
+  return events;
+}
+
+describe("native streamSimple provider", () => {
+  test("image-only user request forwards selected images without the local proxy", async () => {
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("image received"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "image", data: pngBase64(), mimeType: "image/png" }],
+              timestamp: Date.now(),
+            },
+          ],
+        } as any,
+        { sessionId: "native-image-session" },
+      ),
+    );
+
+    expect(
+      events.some((event) => event.type === "text_delta" && event.delta === "image received"),
+    ).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+    expect(runRequests).toHaveLength(1);
+    const userMessage = runRequests[0].action.action.value.userMessage;
+    expect(userMessage.text).toBe("");
+    expect(userMessage.selectedContext.selectedImages).toHaveLength(1);
+    const selectedImage = userMessage.selectedContext.selectedImages[0];
+    expect(selectedImage.mimeType).toBe("image/png");
+    expect(selectedImage.dataOrBlobId.case).toBe("data");
+    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(pngBytes()));
+  });
+
+  test("tool-call continuation reuses the live bridge and emits pi-native tool events", async () => {
+    const runRequests: any[] = [];
+    const execClientMessages: any[] = [];
+    const sessionId = "native-tool-session";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.emitServerMessage(makeMcpExecMessage("tc1", "read", { path: "README.md" }));
+            return;
+          }
+          if (clientMessage.message.case === "execClientMessage") {
+            execClientMessages.push(clientMessage.message.value);
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("I found the issue."));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const firstEvents = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [{ role: "user", content: "inspect file", timestamp: Date.now() }],
+          tools: [
+            {
+              name: "read",
+              description: "Read a file",
+              parameters: { type: "object", properties: { path: { type: "string" } } },
+            },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    expect(
+      firstEvents.some((event) => event.type === "toolcall_end" && event.toolCall.id === "tc1"),
+    ).toBe(true);
+    expect(firstEvents.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+
+    const zeroUsage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    const secondEvents = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "inspect file", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [
+                { type: "toolCall", id: "tc1", name: "read", arguments: { path: "README.md" } },
+              ],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: zeroUsage,
+              stopReason: "toolUse",
+              timestamp: Date.now(),
+            },
+            {
+              role: "toolResult",
+              toolCallId: "tc1",
+              toolName: "read",
+              content: [{ type: "text", text: "README contents" }],
+              isError: false,
+              timestamp: Date.now(),
+            },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    expect(
+      secondEvents.some(
+        (event) => event.type === "text_delta" && event.delta === "I found the issue.",
+      ),
+    ).toBe(true);
+    expect(runRequests).toHaveLength(1);
+    expect(execClientMessages).toHaveLength(1);
+    expect(execClientMessages[0].execId).toBe("exec-1");
+    expect(execClientMessages[0].message.case).toBe("mcpResult");
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toBeTruthy();
+  });
+
+  test("native routing applies reasoning/model parameter maps without before_provider_request", async () => {
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("routed"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({
+      getAccessToken: async () => "test-token",
+      getRawModelRoutingByModelId: () =>
+        new Map([
+          [
+            "gpt-5.5",
+            {
+              high: {
+                modelId: "gpt-5.5",
+                parameters: [
+                  { id: "context", value: "272k" },
+                  { id: "reasoning", value: "high" },
+                  { id: "fast", value: "false" },
+                ],
+                requestedMaxMode: true,
+              },
+            },
+          ],
+        ]),
+    });
+
+    await collectEvents(
+      streamSimple(
+        { ...nativeModel("gpt-5.5"), thinkingLevelMap: { high: "high" } },
+        { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] } as any,
+        { sessionId: "native-routing-session", reasoning: "high" },
+      ),
+    );
+
+    expect(runRequests).toHaveLength(1);
+    expect(runRequests[0].requestedModel.modelId).toBe("gpt-5.5");
+    expect(runRequests[0].requestedModel.maxMode).toBe(true);
+    expect(runRequests[0].requestedModel.parameters.map((p: any) => `${p.id}=${p.value}`)).toEqual([
+      "context=272k",
+      "reasoning=high",
+      "fast=false",
+    ]);
+  });
+});
 
 describe("proxy integration — session handling", () => {
   test("image-only user request forwards selected images through the HTTP proxy", async () => {
