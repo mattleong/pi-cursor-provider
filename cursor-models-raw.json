@@ -560,6 +560,62 @@
     "maxTokens": 64000
   },
   {
+    "id": "gpt-5.5-low",
+    "name": "GPT-5.5 Low",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-medium",
+    "name": "GPT-5.5",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-high",
+    "name": "GPT-5.5 High",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-xhigh",
+    "name": "GPT-5.5 Extra High",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-low-fast",
+    "name": "GPT-5.5 Low Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-medium-fast",
+    "name": "GPT-5.5 Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-high-fast",
+    "name": "GPT-5.5 High Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-xhigh-fast",
+    "name": "GPT-5.5 Extra High Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
     "id": "grok-4-20",
     "name": "Grok 4.20",
     "reasoning": false,

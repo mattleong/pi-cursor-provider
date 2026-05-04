@@ -175,6 +175,7 @@ describe("reasoning support", () => {
   test("derives reasoning from model ids", () => {
     expect(supportsReasoningModelId("gpt-5.4")).toBe(true);
     expect(supportsReasoningModelId("gpt-5.4-fast")).toBe(true);
+    expect(supportsReasoningModelId("gpt-5.5")).toBe(true);
     expect(supportsReasoningModelId("composer-2")).toBe(true);
     expect(supportsReasoningModelId("default")).toBe(true);
     expect(supportsReasoningModelId("totally-unknown-model")).toBe(false);
@@ -183,6 +184,7 @@ describe("reasoning support", () => {
   test("fallback models keep derived reasoning enabled", () => {
     expect(FALLBACK_MODELS.length).toBeGreaterThan(0);
     expect(FALLBACK_MODELS.find((model) => model.id === "gpt-5.4-medium")?.reasoning).toBe(true);
+    expect(FALLBACK_MODELS.find((model) => model.id === "gpt-5.5-medium")?.reasoning).toBe(true);
     expect(FALLBACK_MODELS.find((model) => model.id === "composer-2")?.reasoning).toBe(true);
   });
 });
@@ -216,6 +218,29 @@ describe("processModels", () => {
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("gpt-5.4-fast");
     expect(result[0].supportsEffort).toBe(true);
+  });
+
+  test("gpt-5.5 — deduped from effort variants", () => {
+    const result = processModels([
+      m("gpt-5.5-low"), m("gpt-5.5-medium"), m("gpt-5.5-high"), m("gpt-5.5-xhigh"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("gpt-5.5");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.medium).toBe("medium");
+    expect(result[0].effortMap!.xhigh).toBe("xhigh");
+  });
+
+  test("gpt-5.5-fast — deduped from effort+fast variants including low", () => {
+    const result = processModels([
+      m("gpt-5.5-low-fast"), m("gpt-5.5-medium-fast"), m("gpt-5.5-high-fast"), m("gpt-5.5-xhigh-fast"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("gpt-5.5-fast");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.low).toBe("low");
+    expect(result[0].effortMap!.medium).toBe("medium");
+    expect(result[0].effortMap!.xhigh).toBe("xhigh");
   });
 
   test("gpt-5.2 — deduped from default + effort variants", () => {
@@ -350,6 +375,10 @@ describe("processModels", () => {
     expect(gpt54).toBeDefined();
     expect(gpt54!.supportsEffort).toBe(true);
 
+    const gpt55 = result.find(r => r.id === "gpt-5.5");
+    expect(gpt55).toBeDefined();
+    expect(gpt55!.supportsEffort).toBe(true);
+
     // Opus should be deduped too
     const opus46 = result.find(r => r.id === "claude-4.6-opus");
     expect(opus46).toBeDefined();
@@ -360,6 +389,9 @@ describe("processModels", () => {
     // No raw effort IDs should leak through for deduped models
     expect(result.find(r => r.id === "gpt-5.4-medium")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.4-high")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-medium")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-high")).toBeUndefined();
+    expect(result.find(r => r.id === "gpt-5.5-low-fast")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.2-low")).toBeUndefined();
   });
 });
@@ -377,6 +409,7 @@ describe("resolveModelId", () => {
     expect(resolveModelId("gpt-5.4", "medium")).toBe("gpt-5.4-medium");
     expect(resolveModelId("gpt-5.4", "high")).toBe("gpt-5.4-high");
     expect(resolveModelId("gpt-5.4", "xhigh")).toBe("gpt-5.4-xhigh");
+    expect(resolveModelId("gpt-5.5", "high")).toBe("gpt-5.5-high");
   });
 
   test("fast model + effort — inserts before -fast", () => {
