@@ -13,13 +13,14 @@
  */
 
 import rawFallbackModels from "./cursor-models-raw.json";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
 import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import {
   generateCursorAuthParams,
+  getCursorAccessTokenFromEnv,
   getTokenExpiry,
   pollCursorAuth,
   refreshCursorToken,
@@ -548,23 +549,33 @@ function contextLabel(context: string | undefined): string | undefined {
   return context.toUpperCase();
 }
 
-function maxModeNeedsIdPart(context: string | undefined, requestedMaxMode: boolean): boolean {
+function maxModeIdPart(modelName: string, context: string | undefined, requestedMaxMode: boolean, hasEffortParameter: boolean): string {
   // 1M context already names the Max/extended-context selection. For default
-  // context windows, expose maxMode as an explicit -max row.
-  return requestedMaxMode && context !== "1m";
+  // context windows, expose maxMode as an explicit row suffix. If the Cursor
+  // model ID already contains "max" (for example gpt-5.1-codex-max), or if
+  // this row has no effort parameter, use a clearer suffix so the model parser
+  // does not confuse Max Mode with a Cursor effort value.
+  if (!requestedMaxMode || context === "1m") return "";
+  return !hasEffortParameter || /(^|-)max($|-)/i.test(modelName) ? "-max-mode" : "-max";
 }
 
-function parameterizedBaseId(modelName: string, variant: CursorParameterizedVariant, requestedMaxMode: boolean): string {
+function maxModeLabel(modelName: string, context: string | undefined, requestedMaxMode: boolean, hasEffortParameter: boolean): string | undefined {
+  const idPart = maxModeIdPart(modelName, context, requestedMaxMode, hasEffortParameter);
+  if (!idPart) return undefined;
+  return idPart === "-max-mode" ? "Max Mode" : "Max";
+}
+
+function parameterizedBaseId(modelName: string, variant: CursorParameterizedVariant, requestedMaxMode: boolean, hasEffortParameter: boolean): string {
   const context = parameterValue(variant.parameters, "context");
-  return `${modelName}${contextIdPart(context)}${maxModeNeedsIdPart(context, requestedMaxMode) ? "-max" : ""}`;
+  return `${modelName}${contextIdPart(context)}${maxModeIdPart(modelName, context, requestedMaxMode, hasEffortParameter)}`;
 }
 
-function parameterizedBaseLabel(model: CursorParameterizedModel, variant: CursorParameterizedVariant, requestedMaxMode: boolean): string[] {
+function parameterizedBaseLabel(model: CursorParameterizedModel, variant: CursorParameterizedVariant, requestedMaxMode: boolean, hasEffortParameter: boolean): string[] {
   const context = parameterValue(variant.parameters, "context");
   return [
     model.clientDisplayName || model.name,
     contextLabel(context),
-    maxModeNeedsIdPart(context, requestedMaxMode) ? "Max" : undefined,
+    maxModeLabel(model.name, context, requestedMaxMode, hasEffortParameter),
   ].filter(Boolean) as string[];
 }
 
@@ -590,8 +601,9 @@ function buildParameterizedRowsFromGroup(options: {
   const context = parameterValue(first.parameters, "context");
   const fast = parameterValue(first.parameters, "fast") === "true";
   const thinking = parameterValue(first.parameters, "thinking") === "true";
-  const baseId = parameterizedBaseId(options.model.name, first, options.requestedMaxMode);
-  const baseLabelParts = parameterizedBaseLabel(options.model, first, options.requestedMaxMode);
+  const hasEffortParameter = Boolean(options.effortParameterId);
+  const baseId = parameterizedBaseId(options.model.name, first, options.requestedMaxMode, hasEffortParameter);
+  const baseLabelParts = parameterizedBaseLabel(options.model, first, options.requestedMaxMode, hasEffortParameter);
   const contextWindow = contextWindowFromParameter(context, options.requestedMaxMode
     ? options.model.contextTokenLimitForMaxMode ?? options.model.contextTokenLimit ?? 200_000
     : options.model.contextTokenLimit ?? 200_000);
@@ -637,12 +649,11 @@ function parameterGroupKey(variant: CursorParameterizedVariant, effortParameterI
 }
 
 function shouldGenerateSyntheticMaxRows(model: CursorParameterizedModel, variant: CursorParameterizedVariant): boolean {
-  if (!model.supportsMaxMode || variant.isMaxMode) return false;
-  // Generate orthogonal Max rows for GPT-style parameterized models where we
-  // have observed Cursor accepting maxMode on top of a non-Max parameter set.
-  // Avoid doing this for models whose ID already includes "max" to prevent
-  // confusing double-max row names.
-  return /^gpt-/i.test(model.name) && !/(^|-)max($|-)/i.test(model.name);
+  // Cursor's metadata has both per-variant isMaxMode and model-level
+  // supportsMaxMode. Some supported Max Mode combinations are represented only
+  // by supportsMaxMode=true over a non-Max parameter set, so expose explicit
+  // max-mode rows for every such advertised parameter set.
+  return model.supportsMaxMode === true && !variant.isMaxMode;
 }
 
 export function modelsFromParameterizedMetadata(parameterizedModels: CursorParameterizedModel[]): CursorModel[] {
@@ -687,7 +698,7 @@ export function augmentCursorModels(raw: CursorModel[], parameterizedModels: Cur
   const metadataRows = modelsFromParameterizedMetadata(parameterizedModels);
   for (const model of metadataRows) byId.set(model.id, model);
 
-  // Fallback for static/offline discovery. Cursor CLI exposes GPT-5.5 context as
+  // Fallback for static/offline discovery. Cursor exposes GPT-5.5 context as
   // parameters (272K vs 1M), not distinct backend model IDs.
   if (metadataRows.length === 0 && raw.some((model) => /^gpt-5\.5(?:-|$)/.test(model.id))) {
     for (const model of gpt55ParameterizedModels()) byId.set(model.id, model);
@@ -702,6 +713,30 @@ export const FALLBACK_MODELS: CursorModel[] = augmentCursorModels(rawFallbackMod
 }));
 
 // ── Extension ──
+
+const CURSOR_PROVIDER_ID = "cursor";
+
+type StartupTokenSource = "env" | "pi_oauth" | "pi_oauth_refresh";
+
+async function getStoredCursorOAuthAccessToken(): Promise<{ accessToken: string; source: StartupTokenSource } | undefined> {
+  const authStorage = AuthStorage.create();
+  const credential = authStorage.get(CURSOR_PROVIDER_ID);
+  if (credential?.type !== "oauth") return undefined;
+
+  if (Date.now() < credential.expires && credential.access) {
+    return { accessToken: credential.access, source: "pi_oauth" };
+  }
+
+  const refreshed = await refreshCursorToken(credential.refresh);
+  authStorage.set(CURSOR_PROVIDER_ID, { type: "oauth", ...refreshed });
+  return { accessToken: refreshed.access, source: "pi_oauth_refresh" };
+}
+
+async function getStartupCursorAccessToken(): Promise<{ accessToken: string; source: StartupTokenSource } | undefined> {
+  const envToken = getCursorAccessTokenFromEnv();
+  if (envToken) return { accessToken: envToken, source: "env" };
+  return getStoredCursorOAuthAccessToken();
+}
 
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
   const cleanupCurrentSession = (_event: unknown, ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } }) => {
@@ -833,7 +868,52 @@ export default async function (pi: ExtensionAPI) {
 
   // Await proxy so models are registered before pi proceeds with model resolution.
   const port = await proxyReady;
-  register(pi, port, FALLBACK_MODELS);
+  const startupModels = await discoverStartupModels();
+  register(pi, port, startupModels.rawModels, startupModels.parameterizedModels);
+
+  async function discoverStartupModels(): Promise<{ rawModels: CursorModel[]; parameterizedModels: CursorParameterizedModel[] }> {
+    if (process.env.PI_OFFLINE) return { rawModels: FALLBACK_MODELS, parameterizedModels: [] };
+
+    let startupToken: { accessToken: string; source: StartupTokenSource } | undefined;
+    try {
+      startupToken = await getStartupCursorAccessToken();
+    } catch (err) {
+      debugExtensionLog("model_discovery.startup.token_failed", {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    if (!startupToken) {
+      debugExtensionLog("model_discovery.startup.skipped", { reason: "no_cursor_oauth_token" });
+      return { rawModels: FALLBACK_MODELS, parameterizedModels: [] };
+    }
+
+    try {
+      currentToken = startupToken.accessToken;
+      const [discovered, parameterized] = await Promise.all([
+        getCursorModels(startupToken.accessToken),
+        getCursorParameterizedModels(startupToken.accessToken),
+      ]);
+      debugExtensionLog("model_discovery.startup", {
+        tokenSource: startupToken.source,
+        discoveredCount: discovered.length,
+        parameterizedCount: parameterized.length,
+      });
+      if (discovered.length > 0 || parameterized.length > 0) {
+        return {
+          rawModels: discovered.length > 0 ? discovered : FALLBACK_MODELS,
+          parameterizedModels: parameterized,
+        };
+      }
+    } catch (err) {
+      debugExtensionLog("model_discovery.startup.failed", {
+        tokenSource: startupToken.source,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    return { rawModels: FALLBACK_MODELS, parameterizedModels: [] };
+  }
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[], parameterizedModels: CursorParameterizedModel[] = []) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
@@ -863,7 +943,9 @@ export default async function (pi: ExtensionAPI) {
             getCursorModels(accessToken),
             getCursorParameterizedModels(accessToken),
           ]);
-          if (discovered.length > 0) register(pi, realPort, discovered, parameterized);
+          if (discovered.length > 0 || parameterized.length > 0) {
+            register(pi, realPort, discovered.length > 0 ? discovered : FALLBACK_MODELS, parameterized);
+          }
 
           return {
             refresh: refreshToken,
@@ -882,7 +964,9 @@ export default async function (pi: ExtensionAPI) {
             getCursorModels(refreshed.access),
             getCursorParameterizedModels(refreshed.access),
           ]);
-          if (discovered.length > 0) register(pi, realPort, discovered, parameterized);
+          if (discovered.length > 0 || parameterized.length > 0) {
+            register(pi, realPort, discovered.length > 0 ? discovered : FALLBACK_MODELS, parameterized);
+          }
 
           return refreshed;
         },

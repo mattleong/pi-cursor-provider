@@ -389,6 +389,7 @@ describe("processModels", () => {
     ] as any);
     const processed = processModels(generated);
     expect(processed.some(model => model.id === "composer-2-fast")).toBe(true);
+    expect(processed.find(model => model.id === "composer-2-max-mode-fast")!.requestedMaxMode).toBe(true);
     expect(processed.find(model => model.id === "gpt-5.3-codex-fast")!.rawRoutingByEffort!.high).toEqual({
       modelId: "gpt-5.3-codex",
       requestedMaxMode: false,
@@ -399,6 +400,11 @@ describe("processModels", () => {
       modelId: "claude-opus-4-7",
       parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "xhigh" }],
       requestedMaxMode: false,
+    });
+    expect(processed.find(model => model.id === "claude-opus-4-7-max-thinking")!.rawRoutingByEffort!.xhigh).toEqual({
+      modelId: "claude-opus-4-7",
+      parameters: [{ id: "thinking", value: "true" }, { id: "context", value: "300k" }, { id: "effort", value: "xhigh" }],
+      requestedMaxMode: true,
     });
   });
 
@@ -2199,6 +2205,13 @@ liveCursorMetadataTest("live Cursor metadata validates every generated parameter
   expect(new Set(processed.map(model => model.id)).size).toBe(processed.length);
   expect(processed.some(model => model.id === "gpt-5.5-max-fast")).toBe(true);
   expect(processed.some(model => model.id === "gpt-5.5-1m-fast")).toBe(false);
+  expect(processed.some(model => model.id === "claude-opus-4-7")).toBe(true);
+  expect(processed.some(model => model.id === "claude-opus-4-7-max")).toBe(true);
+  expect(processed.some(model => model.id === "claude-opus-4-7-max-thinking")).toBe(true);
+
+  for (const source of metadata.filter(model => model.supportsMaxMode && model.variants.some(variant => variant.parameters.length > 0))) {
+    expect(generated.some(route => route.requestedModelId === source.name && route.requestedMaxMode === true), `no max-mode rows generated for ${source.name}`).toBe(true);
+  }
 
   for (const route of generated) {
     const source = metadata.find(model => model.name === route.requestedModelId);
