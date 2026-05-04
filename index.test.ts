@@ -366,6 +366,35 @@ describe("processModels", () => {
     expect(reasoningValues).not.toContain("max");
   });
 
+  test("metadata-driven rows retain Cursor image-support metadata", () => {
+    const generated = modelsFromParameterizedMetadata([
+      {
+        name: "text-only-model",
+        clientDisplayName: "Text Only",
+        supportsMaxMode: false,
+        supportsNonMaxMode: true,
+        supportsImages: false,
+        variants: [
+          { isMaxMode: false, parameters: [{ id: "reasoning", value: "low" }] },
+          { isMaxMode: false, parameters: [{ id: "reasoning", value: "high" }] },
+        ],
+      },
+    ] as any);
+
+    expect(generated).toHaveLength(2);
+    expect(generated.every(model => model.supportsImages === false)).toBe(true);
+
+    const augmented = augmentCursorModels([m("plain-text-only", "Plain Text Only")], [
+      {
+        name: "plain-text-only",
+        clientDisplayName: "Plain Text Only",
+        supportsImages: false,
+        variants: [],
+      },
+    ] as any);
+    expect(augmented.find(model => model.id === "plain-text-only")?.supportsImages).toBe(false);
+  });
+
   test("metadata-driven generation covers non-GPT-5.5 parameterized models", () => {
     const generated = modelsFromParameterizedMetadata([
       {
@@ -1231,6 +1260,33 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(req.mcpTools.mcpTools[0].providerIdentifier).toBe("pi");
   });
 
+  test("adds inline images to the current user message selected context", () => {
+    const image = { data: new Uint8Array([1, 2, 3, 4]), mimeType: "image/png" };
+    const payload = buildCursorRequest("gpt-5", "system", "describe this", [], "conv-1", null, undefined, false, [], [], [image]);
+    const req = decodeRunRequest(payload);
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toBe("describe this");
+    expect(userAction.userMessage.selectedContext.selectedImages).toHaveLength(1);
+    const selectedImage = userAction.userMessage.selectedContext.selectedImages[0];
+    expect(selectedImage.mimeType).toBe("image/png");
+    expect(selectedImage.dataOrBlobId.case).toBe("data");
+    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual([1, 2, 3, 4]);
+    expect(selectedImage.uuid).toMatch(/^[0-9a-f-]{36}$/i);
+  });
+
+  test("preserves images when reconstructing prior user turns", () => {
+    const image = { data: new Uint8Array([9, 8, 7]), mimeType: "image/jpeg" };
+    const turns = [{ ...turn("what is this?", [assistantStep("a photo")]), userImages: [image] }];
+    const payload = buildCursorRequest("gpt-5", "system", "thanks", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
+    expect(decoded[0].userMsg.selectedContext.selectedImages).toHaveLength(1);
+    const selectedImage = decoded[0].userMsg.selectedContext.selectedImages[0];
+    expect(selectedImage.mimeType).toBe("image/jpeg");
+    expect(selectedImage.dataOrBlobId.case).toBe("data");
+    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual([9, 8, 7]);
+  });
+
   test("no checkpoint, with assistant-text turns — reconstructs protobuf turns without inline fallback", () => {
     const turns = [
       turn("first question", [assistantStep("first answer")]),
@@ -1363,6 +1419,37 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
 // ── Tool-aware parsing ──
 
 describe("parseMessages — structured tool turns", () => {
+  test("extracts OpenAI-style data URL images from user content", () => {
+    const parsed = parseMessages([
+      { role: "user", content: [
+        { type: "text", text: "describe this" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AQIDBA==" } },
+      ] },
+    ]);
+
+    expect(parsed.userText).toBe("describe this");
+    expect(parsed.userImages).toHaveLength(1);
+    expect(parsed.userImages[0].mimeType).toBe("image/png");
+    expect(Array.from(parsed.userImages[0].data)).toEqual([1, 2, 3, 4]);
+  });
+
+  test("preserves images on completed prior turns", () => {
+    const parsed = parseMessages([
+      { role: "user", content: [
+        { type: "text", text: "look" },
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64,CQgH" } },
+      ] },
+      { role: "assistant", content: "done" },
+      { role: "user", content: "next" },
+    ]);
+
+    expect(parsed.userText).toBe("next");
+    expect(parsed.turns).toHaveLength(1);
+    expect(parsed.turns[0].userImages).toHaveLength(1);
+    expect(parsed.turns[0].userImages?.[0].mimeType).toBe("image/jpeg");
+    expect(Array.from(parsed.turns[0].userImages![0].data)).toEqual([9, 8, 7]);
+  });
+
   test("preserves tool call, tool result, and final assistant text in a completed turn", () => {
     const parsed = parseMessages([
       { role: "system", content: "system" },

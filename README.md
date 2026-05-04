@@ -19,7 +19,8 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 1. **PKCE OAuth** — browser-based login to Cursor, no client secret needed
 2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
 3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol using Cursor's newer `requestedModel` request field
-4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
+4. **Image input** — forwards OpenAI-style `image_url` data URLs as Cursor `SelectedImage` entries in `UserMessage.selectedContext`
+5. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
 
 ## Install
 
@@ -166,6 +167,7 @@ Conversation state is stored in memory. If the proxy restarts, checkpoints are l
 
 That reconstruction preserves:
 
+- user image attachments
 - assistant messages
 - tool calls
 - tool results

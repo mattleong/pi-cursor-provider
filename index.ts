@@ -79,6 +79,11 @@ function summarizeContent(content: unknown): unknown {
         };
       case "image":
         return { type: "image", mimeType: typed.mimeType, data: `<redacted base64 ${String(typed.data ?? "").length} chars>` };
+      case "image_url": {
+        const url = (typed.image_url as Record<string, unknown> | undefined)?.url;
+        const text = typeof url === "string" ? url : "";
+        return { type: "image_url", image_url: { url: text.startsWith("data:image/") ? `<redacted data image ${text.length} chars>` : truncateDebugValue(text) } };
+      }
       default:
         return typed;
     }
@@ -471,6 +476,7 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
 }
 
 function modelConfig(m: ProcessedModel) {
+  const input = (m.supportsImages === false ? ["text"] : ["text", "image"]) as ("text" | "image")[];
   return {
     id: m.id,
     name: m.name,
@@ -478,7 +484,7 @@ function modelConfig(m: ProcessedModel) {
     ...(m.supportsEffort && m.effortMap && {
       thinkingLevelMap: m.effortMap,
     }),
-    input: ["text"] as ("text" | "image")[],
+    input,
     cost: estimateModelCost(m.id),
     contextWindow: m.contextWindow,
     maxTokens: m.maxTokens,
@@ -669,6 +675,7 @@ function buildParameterizedRowsFromGroup(options: {
       requestedModelId: options.model.name,
       requiresMaxMode: variant.isMaxMode,
       requestedMaxMode: options.requestedMaxMode,
+      supportsImages: options.model.supportsImages,
       parameters,
     } satisfies CursorModel];
   });
@@ -738,7 +745,19 @@ function normalizeDisplayModel(model: CursorModel): CursorModel {
 
 export function augmentCursorModels(raw: CursorModel[], parameterizedModels: CursorParameterizedModel[] = []): CursorModel[] {
   const byId = new Map<string, CursorModel>();
-  for (const model of raw.map(normalizeDisplayModel)) byId.set(model.id, model);
+  const imageSupportByModelId = new Map(
+    parameterizedModels
+      .filter((model) => typeof model.supportsImages === "boolean")
+      .map((model) => [model.name, model.supportsImages!]),
+  );
+  for (const model of raw.map(normalizeDisplayModel)) {
+    const lookupId = model.requestedModelId ?? model.id;
+    const metadataSupportsImages = imageSupportByModelId.get(lookupId);
+    byId.set(model.id, {
+      ...model,
+      ...(model.supportsImages === undefined && metadataSupportsImages !== undefined ? { supportsImages: metadataSupportsImages } : {}),
+    });
+  }
 
   const metadataRows = modelsFromParameterizedMetadata(parameterizedModels).map(normalizeDisplayModel);
   for (const model of metadataRows) byId.set(model.id, model);

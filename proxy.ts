@@ -56,6 +56,7 @@ import {
   RequestContextSchema,
   RequestContextSuccessSchema,
   SelectedContextSchema,
+  SelectedImageSchema,
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
@@ -93,6 +94,9 @@ interface OpenAIToolCall {
 interface ContentPart {
   type: string;
   text?: string;
+  data?: string;
+  mimeType?: string;
+  image_url?: { url?: string };
 }
 
 interface OpenAIMessage {
@@ -149,6 +153,7 @@ export interface CursorParameterizedModel {
   serverModelName?: string;
   supportsMaxMode?: boolean;
   supportsNonMaxMode?: boolean;
+  supportsImages?: boolean;
   contextTokenLimit?: number;
   contextTokenLimitForMaxMode?: number;
   variants: CursorParameterizedVariant[];
@@ -213,6 +218,11 @@ export interface ParsedToolResult {
   isError: boolean;
 }
 
+export interface ParsedImageContent {
+  data: Uint8Array;
+  mimeType: string;
+}
+
 export interface ParsedAssistantTextStep {
   kind: "assistantText";
   text: string;
@@ -231,11 +241,13 @@ export type ParsedTurnStep = ParsedAssistantTextStep | ParsedToolCallStep;
 export interface ParsedTurn {
   userText: string;
   steps: ParsedTurnStep[];
+  userImages?: ParsedImageContent[];
 }
 
 interface ParsedMessages {
   systemPrompt: string;
   userText: string;
+  userImages: ParsedImageContent[];
   turns: ParsedTurn[];
   toolResults: ToolResultInfo[];
 }
@@ -282,6 +294,9 @@ function sanitizeForDebug(value: unknown): unknown {
     const entries = Object.entries(value as Record<string, unknown>).map(([key, inner]) => {
       if (key === "accessToken") return [key, "<redacted>"] as const;
       if (key === "data" && typeof inner === "string") return [key, `<redacted base64 ${inner.length} chars>`] as const;
+      if (key === "url" && typeof inner === "string" && inner.startsWith("data:image/")) {
+        return [key, `<redacted data image ${inner.length} chars>`] as const;
+      }
       return [key, sanitizeForDebug(inner)] as const;
     });
     return Object.fromEntries(entries);
@@ -475,6 +490,7 @@ export interface CursorModel {
   parameters?: CursorModelParameter[];
   requiresMaxMode?: boolean;
   requestedMaxMode?: boolean;
+  supportsImages?: boolean;
 }
 
 let cachedModels: { tokenHash: string; models: CursorModel[] } | null = null;
@@ -654,6 +670,7 @@ function decodeParameterizedModel(bytes: Uint8Array): CursorParameterizedModel {
     const fieldNo = tag >>> 3;
     const wireType = tag & 0x7;
     if (fieldNo === 1 && wireType === 2) model.name = decodeString(readLengthDelimited(reader));
+    else if (fieldNo === 10 && wireType === 0) model.supportsImages = readVarint(reader) !== 0;
     else if (fieldNo === 14 && wireType === 0) model.supportsMaxMode = readVarint(reader) !== 0;
     else if (fieldNo === 19 && wireType === 0) model.supportsNonMaxMode = readVarint(reader) !== 0;
     else if (fieldNo === 15 && wireType === 0) model.contextTokenLimit = readVarint(reader);
@@ -675,7 +692,7 @@ function decodeAvailableModelsResponse(bytes: Uint8Array): CursorParameterizedMo
     const wireType = tag & 0x7;
     if (fieldNo === 2 && wireType === 2) {
       const model = decodeParameterizedModel(readLengthDelimited(reader));
-      if (model.name && model.variants.length > 0) models.push(model);
+      if (model.name) models.push(model);
     } else {
       skipWireField(reader, wireType);
     }
@@ -865,7 +882,7 @@ async function handleChatCompletion(
   res: ServerResponse,
   requestId: string,
 ): Promise<void> {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const { systemPrompt, userText, userImages, turns, toolResults } = parseMessages(body.messages);
   const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
   if (body.reasoning_effort && !body.cursor_model_id && !body.cursor_model_parameters) {
     debugLog("model_routing.fallback_suffix_generation", {
@@ -953,12 +970,13 @@ async function handleChatCompletion(
   const effectiveUserText = userText || (toolResults.length > 0
     ? toolResults.map((r) => r.content).join("\n")
     : "");
+  const effectiveUserImages = userText || userImages.length > 0 ? userImages : [];
   if (!stored.checkpoint) {
     debugLog("chat.no_checkpoint", { requestId, convKey, conversationId: stored.conversationId });
   }
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
-    stored.conversationId, stored.checkpoint, stored.blobStore, maxMode, body.cursor_model_parameters, mcpTools,
+    stored.conversationId, stored.checkpoint, stored.blobStore, maxMode, body.cursor_model_parameters, mcpTools, effectiveUserImages,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -973,6 +991,7 @@ async function handleChatCompletion(
   const currentTurn: ParsedTurn = {
     userText: effectiveUserText,
     steps: [],
+    ...(effectiveUserImages.length > 0 ? { userImages: effectiveUserImages } : {}),
   };
 
   if (body.stream === false) {
@@ -990,6 +1009,37 @@ function textContent(content: OpenAIMessage["content"]): string {
   if (content == null) return "";
   if (typeof content === "string") return content;
   return content.filter((p) => p.type === "text" && p.text).map((p) => p.text!).join("\n");
+}
+
+function decodeBase64Image(data: string, mimeType: string): ParsedImageContent | undefined {
+  const normalizedMimeType = mimeType.trim().toLowerCase();
+  if (!normalizedMimeType.startsWith("image/")) return undefined;
+  const base64 = data.replace(/\s/g, "");
+  if (!base64) return undefined;
+  const bytes = Buffer.from(base64, "base64");
+  if (bytes.length === 0) return undefined;
+  return { data: new Uint8Array(bytes), mimeType: normalizedMimeType };
+}
+
+function parseImageDataUrl(url: string): ParsedImageContent | undefined {
+  const match = url.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
+  if (!match) return undefined;
+  return decodeBase64Image(match[2]!, match[1]!);
+}
+
+function imageContent(content: OpenAIMessage["content"]): ParsedImageContent[] {
+  if (content == null || typeof content === "string") return [];
+  const images: ParsedImageContent[] = [];
+  for (const part of content) {
+    if (part.type === "image_url" && part.image_url?.url) {
+      const image = parseImageDataUrl(part.image_url.url);
+      if (image) images.push(image);
+    } else if (part.type === "image" && part.data && part.mimeType) {
+      const image = decodeBase64Image(part.data, part.mimeType);
+      if (image) images.push(image);
+    }
+  }
+  return images;
 }
 
 function parseToolCallArguments(raw: string): Record<string, unknown> {
@@ -1031,7 +1081,11 @@ function stripTurnRuntimeState(turn: ParsedTurn & {
   sawToolResult?: boolean;
   sawAssistantAfterToolResult?: boolean;
 }): ParsedTurn {
-  return { userText: turn.userText, steps: turn.steps };
+  return {
+    userText: turn.userText,
+    steps: turn.steps,
+    ...(turn.userImages?.length ? { userImages: turn.userImages } : {}),
+  };
 }
 
 export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
@@ -1059,9 +1113,11 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   for (const msg of nonSystem) {
     if (msg.role === "user") {
       finalizeCurrentTurn();
+      const userImages = imageContent(msg.content);
       currentTurn = {
         userText: textContent(msg.content),
         steps: [],
+        ...(userImages.length > 0 ? { userImages } : {}),
         toolCallById: new Map(),
         sawToolResult: false,
         sawAssistantAfterToolResult: false,
@@ -1113,6 +1169,7 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   }
 
   let userText = "";
+  let userImages: ParsedImageContent[] = [];
   let toolResults: ToolResultInfo[] = [];
 
   if (currentTurn) {
@@ -1123,6 +1180,7 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
     if (currentTurn.steps.length === 0 || isToolContinuation) {
       userText = currentTurn.userText;
+      userImages = currentTurn.userImages ?? [];
       if (hasAnyToolResults) {
         toolResults = toolCallSteps
           .filter((step) => step.result)
@@ -1133,7 +1191,7 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     }
   }
 
-  const parsed = { systemPrompt, userText, turns, toolResults };
+  const parsed = { systemPrompt, userText, userImages, turns, toolResults };
   debugLog("parse_messages.end", parsed);
   return parsed;
 }
@@ -1210,12 +1268,24 @@ function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint
   return id;
 }
 
-function createUserMessage(text: string, selectedContextBlob: Uint8Array): UserMessage {
+function createSelectedImages(images: ParsedImageContent[]) {
+  // Matches Cursor CLI's ACP image path for inline image data:
+  // new SelectedImage({ dataOrBlobId: { case: "data", value }, uuid, mimeType })
+  return images.map((image) => create(SelectedImageSchema, {
+    uuid: crypto.randomUUID(),
+    mimeType: image.mimeType,
+    dataOrBlobId: { case: "data", value: image.data },
+  }));
+}
+
+function createUserMessage(text: string, selectedContextBlob: Uint8Array, images: ParsedImageContent[] = []): UserMessage {
   const messageId = crypto.randomUUID();
   return create(UserMessageSchema, {
     text,
     messageId,
-    selectedContext: create(SelectedContextSchema, {}),
+    selectedContext: create(SelectedContextSchema, {
+      selectedImages: createSelectedImages(images),
+    }),
     mode: 1,
     selectedContextBlob,
     correlationId: messageId,
@@ -1290,6 +1360,7 @@ export function buildCursorRequest(
   maxMode = false,
   cursorModelParameters: CursorModelParameter[] = [],
   mcpTools: McpToolDefinition[] = [],
+  userImages: ParsedImageContent[] = [],
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -1302,6 +1373,7 @@ export function buildCursorRequest(
     maxMode,
     cursorModelParameters,
     mcpToolCount: mcpTools.length,
+    userImageCount: userImages.length,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
@@ -1317,7 +1389,7 @@ export function buildCursorRequest(
   } else {
     const turnBlobIds: Uint8Array[] = [];
     for (const turn of turns) {
-      const userMsg = createUserMessage(turn.userText, selectedCtxBlob);
+      const userMsg = createUserMessage(turn.userText, selectedCtxBlob, turn.userImages ?? []);
       const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
       const stepBlobIds = turn.steps.map(s => storeAsBlob(buildTurnStepBytes(s), blobStore));
 
@@ -1350,7 +1422,7 @@ export function buildCursorRequest(
     });
   }
 
-  const userMessage = createUserMessage(userText, selectedCtxBlob);
+  const userMessage = createUserMessage(userText, selectedCtxBlob, userImages);
   const action = create(ConversationActionSchema, {
     action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) },
   });
