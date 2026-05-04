@@ -46,6 +46,9 @@ The repository currently commits the generated TypeScript only; the upstream `.p
   - variant field 5: is default non-max config
   - variant field 8: display name outside picker
   - variant field 9: variant string representation
+- MCP schema compatibility:
+  - Cursor CLI's current `agent.v1.McpToolDefinition.input_schema` and `McpArgs.args` map values are `google.protobuf.Value` messages.
+  - The committed generated `proto/agent_pb.ts` still exposes those length-delimited fields as `bytes`, so the proxy writes and reads serialized `Value` bytes at those positions.
 - `selectedContextBlob` encoder:
   - field 1: repeated root prompt blob ids
   - field 22: client name

@@ -124,6 +124,7 @@ const headers = {
   ":method": "POST",
   ":path": rpcPath || "/agent.v1.AgentService/Run",
   "content-type": unary ? "application/proto" : "application/connect+proto",
+  "connect-protocol-version": "1",
   te: "trailers",
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
@@ -131,9 +132,6 @@ const headers = {
   "x-cursor-client-type": "cli",
   "x-request-id": crypto.randomUUID(),
 };
-if (!unary) {
-  headers["connect-protocol-version"] = "1";
-}
 const h2Stream = client.request(headers);
 let responseStatus = 0;
 let responseStatusText = "";

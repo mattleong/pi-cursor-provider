@@ -488,6 +488,11 @@ export function buildRawModelLookup(
   for (const model of models) {
     if (model.supportsEffort && model.rawRoutingByEffort) {
       const routes = { ...model.rawRoutingByEffort };
+      if (model.effortMap) {
+        for (const [piEffort, cursorEffort] of Object.entries(model.effortMap)) {
+          if (!routes[piEffort] && routes[cursorEffort]) routes[piEffort] = routes[cursorEffort];
+        }
+      }
       const defaultEffort = defaultRoutingEffort(model);
       if (defaultEffort !== undefined && !routes[""])
         routes[""] = model.rawRoutingByEffort[defaultEffort]!;

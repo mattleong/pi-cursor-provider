@@ -25,6 +25,8 @@ import {
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
+  ComputerUseErrorSchema,
+  ComputerUseResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
   DiagnosticsResultSchema,
@@ -35,6 +37,8 @@ import {
   GrepErrorSchema,
   GrepResultSchema,
   KvClientMessageSchema,
+  ListMcpResourcesExecResultSchema,
+  ListMcpResourcesRejectedSchema,
   LsRejectedSchema,
   LsResultSchema,
   McpArgsSchema,
@@ -50,8 +54,12 @@ import {
   McpToolsSchema,
   RequestedModelSchema,
   RequestedModel_ModelParameterbytesSchema,
+  ReadMcpResourceExecResultSchema,
+  ReadMcpResourceRejectedSchema,
   ReadRejectedSchema,
   ReadResultSchema,
+  RecordScreenFailureSchema,
+  RecordScreenResultSchema,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
@@ -1624,6 +1632,11 @@ function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
       fn.parameters && typeof fn.parameters === "object"
         ? (fn.parameters as JsonValue)
         : { type: "object", properties: {}, required: [] };
+    // Cursor CLI's current schema uses google.protobuf.Value for
+    // McpToolDefinition.input_schema. The committed generated schema still
+    // exposes that field as bytes, but the outer wire encoding is identical
+    // for bytes and message fields (length-delimited field #3), so place the
+    // serialized Value bytes here.
     const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
     return create(McpToolDefinitionSchema, {
       name: fn.name,
@@ -2189,16 +2202,69 @@ function handleExecMessage(
     return;
   }
 
-  // Unknown exec types
-  const miscCaseMap: Record<string, string> = {
-    listMcpResourcesExecArgs: "listMcpResourcesExecResult",
-    readMcpResourceExecArgs: "readMcpResourceExecResult",
-    recordScreenArgs: "recordScreenResult",
-    computerUseArgs: "computerUseResult",
-  };
-  const resultCase = miscCaseMap[execCase as string];
-  if (resultCase) {
-    sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
+  if (execCase === "listMcpResourcesExecArgs") {
+    sendExecResult(
+      execMsg,
+      "listMcpResourcesExecResult",
+      create(ListMcpResourcesExecResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(ListMcpResourcesRejectedSchema, { reason: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
+    return;
+  }
+  if (execCase === "readMcpResourceExecArgs") {
+    const args = (execMsg as any).message.value;
+    sendExecResult(
+      execMsg,
+      "readMcpResourceExecResult",
+      create(ReadMcpResourceExecResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(ReadMcpResourceRejectedSchema, {
+            uri: args.uri ?? "",
+            reason: REJECT_REASON,
+          }),
+        },
+      }),
+      sendFrame,
+    );
+    return;
+  }
+  if (execCase === "recordScreenArgs") {
+    sendExecResult(
+      execMsg,
+      "recordScreenResult",
+      create(RecordScreenResultSchema, {
+        result: {
+          case: "failure",
+          value: create(RecordScreenFailureSchema, { error: REJECT_REASON }),
+        },
+      }),
+      sendFrame,
+    );
+    return;
+  }
+  if (execCase === "computerUseArgs") {
+    const args = (execMsg as any).message.value;
+    sendExecResult(
+      execMsg,
+      "computerUseResult",
+      create(ComputerUseResultSchema, {
+        result: {
+          case: "error",
+          value: create(ComputerUseErrorSchema, {
+            error: REJECT_REASON,
+            actionCount: Array.isArray(args.actions) ? args.actions.length : 0,
+            durationMs: 0,
+          }),
+        },
+      }),
+      sendFrame,
+    );
     return;
   }
 

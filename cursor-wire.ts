@@ -58,21 +58,30 @@ function readVarint(reader: WireReader): number {
   let shift = 0;
   while (reader.offset < reader.bytes.length) {
     const byte = reader.bytes[reader.offset++]!;
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) return result >>> 0;
+    // Avoid JS bitwise operators here: they truncate to 32 bits, but protobuf
+    // varints can legally carry 64-bit values on fields we merely skip.
+    if (shift < 53) result += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) return result;
     shift += 7;
-    if (shift > 35) throw new Error("varint too long");
+    if (shift >= 70) throw new Error("varint too long");
   }
   throw new Error("unexpected EOF while reading varint");
 }
 
 function readLengthDelimited(reader: WireReader): Uint8Array {
   const length = readVarint(reader);
+  if (!Number.isSafeInteger(length)) throw new Error("length-delimited size is too large");
   const end = reader.offset + length;
   if (end > reader.bytes.length) throw new Error("length-delimited field exceeds buffer");
   const value = reader.bytes.subarray(reader.offset, end);
   reader.offset = end;
   return value;
+}
+
+function skipBytes(reader: WireReader, length: number): void {
+  const end = reader.offset + length;
+  if (end > reader.bytes.length) throw new Error("fixed-width field exceeds buffer");
+  reader.offset = end;
 }
 
 function skipWireField(reader: WireReader, wireType: number): void {
@@ -81,13 +90,13 @@ function skipWireField(reader: WireReader, wireType: number): void {
       readVarint(reader);
       return;
     case 1:
-      reader.offset += 8;
+      skipBytes(reader, 8);
       return;
     case 2:
       readLengthDelimited(reader);
       return;
     case 5:
-      reader.offset += 4;
+      skipBytes(reader, 4);
       return;
     default:
       throw new Error(`unsupported wire type ${wireType}`);

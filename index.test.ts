@@ -40,7 +40,8 @@ import {
   writeSSEStreamForTests,
 } from "./proxy.ts";
 import type { CursorModel, ParsedTurn } from "./proxy.ts";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, fromJson, toBinary, toJson } from "@bufbuild/protobuf";
+import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -762,6 +763,13 @@ describe("processModels", () => {
     };
     applyRawCursorModelId(payload, buildRawModelLookup(processed));
     expect(payload.cursor_model_id).toBe("claude-opus-4-7-thinking-max");
+  });
+
+  test("raw model lookup tolerates unmapped Pi effort values by applying the effort map", () => {
+    const processed = processModels([m("claude-4.6-opus-high"), m("claude-4.6-opus-max")]);
+    const payload: Record<string, unknown> = { model: "claude-4.6-opus", reasoning_effort: "low" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("claude-4.6-opus-high");
   });
 
   test("raw model lookup routes suffix-style fast models through exact Cursor IDs", () => {
@@ -2297,7 +2305,10 @@ function makeMcpExecMessage(toolCallId: string, toolName: string, args: Record<s
             toolCallId,
             providerIdentifier: "pi",
             args: Object.fromEntries(
-              Object.entries(args).map(([key, value]) => [key, new TextEncoder().encode(value)]),
+              Object.entries(args).map(([key, value]) => [
+                key,
+                toBinary(ValueSchema, fromJson(ValueSchema, value)),
+              ]),
             ),
           }),
         },
@@ -2610,6 +2621,49 @@ describe("proxy integration — session handling", () => {
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
     expect(runRequests[0].mcpTools.mcpTools).toHaveLength(0);
+  });
+
+  test("MCP tool definitions encode input_schema as Cursor's google.protobuf.Value", async () => {
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      messages: [{ role: "user", content: "inspect file" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "read",
+            description: "Read a file",
+            parameters: {
+              type: "object",
+              properties: { path: { type: "string", description: "File path" } },
+              required: ["path"],
+            },
+          },
+        },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+    const tool = runRequests[0].mcpTools.mcpTools[0];
+    const decodedValue = fromBinary(ValueSchema, tool.inputSchema);
+    expect(toJson(ValueSchema, decodedValue)).toEqual({
+      type: "object",
+      properties: { path: { type: "string", description: "File path" } },
+      required: ["path"],
+    });
   });
 
   test("max_tokens compatibility field is accepted as a no-op", async () => {
