@@ -80,11 +80,13 @@ Cursor CLI exposes some choices as model parameters rather than standalone model
 
 | Pi model | Cursor `requestedModel` |
 |---|---|
-| `gpt-5.5` | `modelId: "gpt-5.5"`, `context: "272k"` |
-| `gpt-5.5-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"` |
+| `gpt-5.5` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "false"`, `maxMode: false` |
+| `gpt-5.5-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"`, `maxMode: false` |
+| `gpt-5.5-max` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "false"`, `maxMode: true` |
+| `gpt-5.5-max-fast` | `modelId: "gpt-5.5"`, `context: "272k"`, `fast: "true"`, `maxMode: true` |
 | `gpt-5.5-1m` | `modelId: "gpt-5.5"`, `context: "1m"`, `fast: "false"`, `maxMode: true` |
 
-Pi's thinking level supplies the Cursor `reasoning` parameter for those rows (`none`, `low`, `medium`, `high`, or `extra-high`). The 1M rows internally send Cursor `maxMode: true` because Cursor only returns a 1M `tokenDetails.maxTokens` window when `maxMode` is true. There is no separate `/max` toggle: Cursor-specific flags like `maxMode` and `fast` are determined by the selected model row so invalid combinations are not created. Cursor's own model metadata does not include any `context=1m` + `fast=true` GPT-5.5 variant; sending that invalid combination is sanitized by Cursor to the default 1M medium configuration, so this extension intentionally does not expose `gpt-5.5-1m-fast`.
+Pi's thinking level supplies the Cursor `reasoning` parameter for those rows (`none`, `low`, `medium`, `high`, or `extra-high`). There is no separate `/max` toggle: Cursor-specific flags like `maxMode` and `fast` are determined by the selected model row. Cursor's own model metadata does not include any `context=1m` + `fast=true` GPT-5.5 variant; sending that invalid combination is sanitized by Cursor to the default 1M medium configuration, so this extension intentionally does not expose `gpt-5.5-1m-fast`.
 
 For deduped models, the extension keeps an exact map from `(displayed model, effort)` back to the raw Cursor model ID or parameter set returned/derived from Cursor. That avoids guessing where the effort segment belongs:
 

@@ -458,9 +458,10 @@ function modelConfig(m: ProcessedModel) {
 }
 
 
-const GPT55_CONTEXTS = [
-  { idPart: "", label: "272K", value: "272k", contextWindow: 272_000 },
-  { idPart: "-1m", label: "1M", value: "1m", contextWindow: 1_000_000 },
+const GPT55_VARIANTS = [
+  { idPart: "", label: "272K", context: "272k", contextWindow: 272_000, requestedMaxMode: false, fastOptions: [false, true] },
+  { idPart: "-max", label: "272K Max", context: "272k", contextWindow: 272_000, requestedMaxMode: true, fastOptions: [false, true] },
+  { idPart: "-1m", label: "1M", context: "1m", contextWindow: 1_000_000, requestedMaxMode: true, fastOptions: [false] },
 ] as const;
 
 const GPT55_REASONING_LEVELS = [
@@ -473,27 +474,26 @@ const GPT55_REASONING_LEVELS = [
 
 function gpt55ParameterizedModels(): CursorModel[] {
   const models: CursorModel[] = [];
-  for (const context of GPT55_CONTEXTS) {
-    // Cursor's parameter metadata only allows fast=true with 272K context.
-    // The 1M variants are Max Mode variants and all have fast=false; sending
-    // context=1m plus fast=true is sanitized by Cursor to the default 1M medium
-    // configuration, so do not expose impossible 1M-fast rows.
-    const fastOptions = context.value === "1m" ? [false] : [false, true];
-    for (const fast of fastOptions) {
+  for (const variant of GPT55_VARIANTS) {
+    // Cursor treats maxMode as an orthogonal request flag. The model picker
+    // cannot toggle Cursor-specific flags, so expose useful maxMode states as
+    // explicit rows. Cursor's metadata does not include context=1m + fast=true,
+    // so the 1M variant intentionally has fast=false only.
+    for (const fast of variant.fastOptions) {
       for (const reasoning of GPT55_REASONING_LEVELS) {
-        const id = `gpt-5.5${context.idPart}-${reasoning.suffix}${fast ? "-fast" : ""}`;
-        const nameParts = ["GPT-5.5", context.label, reasoning.label, fast ? "Fast" : ""].filter(Boolean);
+        const id = `gpt-5.5${variant.idPart}-${reasoning.suffix}${fast ? "-fast" : ""}`;
+        const nameParts = ["GPT-5.5", variant.label, reasoning.label, fast ? "Fast" : ""].filter(Boolean);
         models.push({
           id,
           name: nameParts.join(" "),
           reasoning: true,
-          contextWindow: context.contextWindow,
+          contextWindow: variant.contextWindow,
           maxTokens: 64_000,
           requestedModelId: "gpt-5.5",
-          requiresMaxMode: context.value === "1m",
-          requestedMaxMode: context.value === "1m",
+          requiresMaxMode: variant.context === "1m",
+          requestedMaxMode: variant.requestedMaxMode,
           parameters: [
-            { id: "context", value: context.value },
+            { id: "context", value: variant.context },
             { id: "reasoning", value: reasoning.value },
             { id: "fast", value: String(fast) },
           ],

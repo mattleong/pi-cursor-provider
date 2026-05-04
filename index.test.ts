@@ -308,10 +308,12 @@ describe("processModels", () => {
     expect(result[0].effortMap!.xhigh).toBe("xhigh");
   });
 
-  test("GPT-5.5 augmentation does not synthesize impossible 1M fast variants", () => {
+  test("GPT-5.5 augmentation exposes max-mode rows but not impossible 1M fast variants", () => {
     const augmented = augmentCursorModels([m("gpt-5.5", "GPT-5.5")]);
     const processed = processModels(augmented);
     expect(processed.some(model => model.id === "gpt-5.5-fast")).toBe(true);
+    expect(processed.some(model => model.id === "gpt-5.5-max")).toBe(true);
+    expect(processed.some(model => model.id === "gpt-5.5-max-fast")).toBe(true);
     expect(processed.some(model => model.id === "gpt-5.5-1m")).toBe(true);
     expect(processed.some(model => model.id === "gpt-5.5-1m-fast")).toBe(false);
     expect(augmented.some(model => /^gpt-5\.5-1m-.*-fast$/.test(model.id))).toBe(false);
@@ -443,6 +445,41 @@ describe("processModels", () => {
       { id: "fast", value: "false" },
     ]);
     expect(payload.cursor_requires_max_mode).toBe(true);
+    expect(payload.cursor_model_max_mode).toBe(true);
+  });
+
+  test("raw model lookup routes GPT-5.5 272K max fast mode through maxMode=true and fast=true", () => {
+    const processed = processModels([
+      {
+        ...m("gpt-5.5-max-medium-fast", "GPT-5.5 272K Max Fast"),
+        requestedModelId: "gpt-5.5",
+        requestedMaxMode: true,
+        parameters: [
+          { id: "context", value: "272k" },
+          { id: "reasoning", value: "medium" },
+          { id: "fast", value: "true" },
+        ],
+      },
+      {
+        ...m("gpt-5.5-max-high-fast", "GPT-5.5 272K Max High Fast"),
+        requestedModelId: "gpt-5.5",
+        requestedMaxMode: true,
+        parameters: [
+          { id: "context", value: "272k" },
+          { id: "reasoning", value: "high" },
+          { id: "fast", value: "true" },
+        ],
+      },
+    ]);
+    const payload: Record<string, unknown> = { model: "gpt-5.5-max-fast", reasoning_effort: "high" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("gpt-5.5");
+    expect(payload.cursor_model_parameters).toEqual([
+      { id: "context", value: "272k" },
+      { id: "reasoning", value: "high" },
+      { id: "fast", value: "true" },
+    ]);
+    expect(payload.cursor_requires_max_mode).toBeUndefined();
     expect(payload.cursor_model_max_mode).toBe(true);
   });
 
@@ -597,6 +634,19 @@ describe("processModels", () => {
     expect(gpt55Fast).toBeDefined();
     expect(gpt55Fast!.contextWindow).toBe(272_000);
     expect(gpt55Fast!.rawRoutingByEffort!.high!.requestedMaxMode).toBe(false);
+
+    const gpt55MaxFast = result.find(r => r.id === "gpt-5.5-max-fast");
+    expect(gpt55MaxFast).toBeDefined();
+    expect(gpt55MaxFast!.contextWindow).toBe(272_000);
+    expect(gpt55MaxFast!.rawRoutingByEffort!.high).toEqual({
+      modelId: "gpt-5.5",
+      requestedMaxMode: true,
+      parameters: [
+        { id: "context", value: "272k" },
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "true" },
+      ],
+    });
 
     expect(result.find(r => r.id === "gpt-5.5-1m-fast")).toBeUndefined();
 
