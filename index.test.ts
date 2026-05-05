@@ -474,6 +474,26 @@ describe("processModels", () => {
     expect(payload.cursor_model_id).toBe("default");
   });
 
+  test("raw -max-mode and -max-max IDs are normalized to -max while routing to the original ID", () => {
+    const augmented = augmentCursorModels([
+      m("composer-2-max-mode-fast", "Composer 2 Max Mode Fast"),
+      m("composer-3-max-max-fast", "Composer 3 Max Max Fast"),
+    ]);
+    const processed = processModels(augmented);
+    expect(processed.map((model) => model.id)).toEqual([
+      "composer-2-max-fast",
+      "composer-3-max-fast",
+    ]);
+
+    const payload: Record<string, unknown> = { model: "composer-2-max-fast" };
+    applyRawCursorModelId(payload, buildRawModelLookup(processed));
+    expect(payload.cursor_model_id).toBe("composer-2-max-mode-fast");
+
+    const duplicateMaxPayload: Record<string, unknown> = { model: "composer-3-max-fast" };
+    applyRawCursorModelId(duplicateMaxPayload, buildRawModelLookup(processed));
+    expect(duplicateMaxPayload.cursor_model_id).toBe("composer-3-max-max-fast");
+  });
+
   test("GPT-5.5 augmentation exposes max-mode rows but not impossible 1M fast variants", () => {
     const augmented = augmentCursorModels([m("gpt-5.5", "GPT-5.5")]);
     const processed = processModels(augmented);
@@ -605,6 +625,21 @@ describe("processModels", () => {
         ],
       },
       {
+        name: "gpt-5.1-codex-max",
+        clientDisplayName: "Codex 5.1 Max",
+        supportsMaxMode: true,
+        supportsNonMaxMode: true,
+        variants: [
+          {
+            isMaxMode: false,
+            parameters: [
+              { id: "reasoning", value: "high" },
+              { id: "fast", value: "true" },
+            ],
+          },
+        ],
+      },
+      {
         name: "claude-opus-4-7",
         clientDisplayName: "Opus 4.7",
         supportsMaxMode: true,
@@ -630,10 +665,12 @@ describe("processModels", () => {
       },
     ] as any);
     const processed = processModels(generated);
+    expect(generated.some((model) => model.id.includes("max-mode"))).toBe(false);
+    expect(generated.some((model) => model.id.includes("max-max"))).toBe(false);
     expect(processed.some((model) => model.id === "composer-2-fast")).toBe(true);
-    expect(
-      processed.find((model) => model.id === "composer-2-max-mode-fast")!.requestedMaxMode,
-    ).toBe(true);
+    expect(processed.find((model) => model.id === "composer-2-max-fast")!.requestedMaxMode).toBe(
+      true,
+    );
     expect(
       processed.find((model) => model.id === "gpt-5.3-codex-fast")!.rawRoutingByEffort!.high,
     ).toEqual({
@@ -648,6 +685,9 @@ describe("processModels", () => {
       processed.find((model) => model.id === "gpt-5.3-codex-max-fast")!.rawRoutingByEffort!.high!
         .requestedMaxMode,
     ).toBe(true);
+    expect(
+      processed.find((model) => model.id === "gpt-5.1-codex-max-fast")!.rawRoutingByEffort!.high,
+    ).toMatchObject({ modelId: "gpt-5.1-codex-max", requestedMaxMode: true });
     expect(
       processed.find((model) => model.id === "claude-opus-4-7-thinking")!.rawRoutingByEffort!.xhigh,
     ).toEqual({
@@ -894,13 +934,13 @@ describe("processModels", () => {
   test("raw model lookup routes non-effort parameterized rows", () => {
     const processed = processModels([
       {
-        ...m("composer-2-max-mode-fast", "Composer 2 Max Mode Fast"),
+        ...m("composer-2-max-fast", "Composer 2 Max Fast"),
         requestedModelId: "composer-2",
         requestedMaxMode: true,
         parameters: [{ id: "fast", value: "true" }],
       },
     ]);
-    const payload: Record<string, unknown> = { model: "composer-2-max-mode-fast" };
+    const payload: Record<string, unknown> = { model: "composer-2-max-fast" };
     applyRawCursorModelId(payload, buildRawModelLookup(processed));
     expect(payload.cursor_model_id).toBe("composer-2");
     expect(payload.cursor_model_parameters).toEqual([{ id: "fast", value: "true" }]);
@@ -1511,6 +1551,50 @@ function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>) {
   return clientMsg.message.value as InstanceType<(typeof AgentRunRequestSchema)["$typeName"]> & any;
 }
 
+function requestedModelSummary(req: any) {
+  return {
+    modelId: req.requestedModel.modelId,
+    maxMode: req.requestedModel.maxMode,
+    parameters: req.requestedModel.parameters.map((parameter: any) => ({
+      id: parameter.id,
+      value: parameter.value,
+    })),
+  };
+}
+
+function routedRequestSummary(rawModels: CursorModel[], model: string, reasoningEffort?: string) {
+  const processed = processModels(rawModels);
+  const body: Record<string, unknown> = {
+    model,
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+  };
+  applyRawCursorModelId(body, buildRawModelLookup(processed));
+  const modelId = resolveRequestedModelId(
+    String(body.model),
+    typeof body.reasoning_effort === "string" ? body.reasoning_effort : undefined,
+    typeof body.cursor_model_id === "string" ? body.cursor_model_id : undefined,
+  );
+  const maxMode =
+    typeof body.cursor_model_max_mode === "boolean"
+      ? body.cursor_model_max_mode
+      : body.cursor_requires_max_mode === true;
+  return requestedModelSummary(
+    decodeRunRequest(
+      buildCursorRequest(
+        modelId,
+        "system",
+        "hello",
+        [],
+        "conv-1",
+        null,
+        undefined,
+        maxMode,
+        (body.cursor_model_parameters as any) ?? [],
+      ),
+    ),
+  );
+}
+
 function resolveBlob(data: Uint8Array, blobStore?: Map<string, Uint8Array>): Uint8Array {
   if (blobStore && data.length === 32) {
     const resolved = blobStore.get(Buffer.from(data).toString("hex"));
@@ -1618,6 +1702,102 @@ describe("buildCursorRequest — turn reconstruction", () => {
       { id: "reasoning", value: "high" },
       { id: "fast", value: "true" },
     ]);
+  });
+
+  test("routed fast/max model selections produce the expected Cursor requestedModel", () => {
+    expect(
+      routedRequestSummary(
+        [m("gpt-5.4-medium-fast"), m("gpt-5.4-high-fast")],
+        "gpt-5.4-fast",
+        "high",
+      ),
+    ).toEqual({
+      modelId: "gpt-5.4-high-fast",
+      maxMode: false,
+      parameters: [],
+    });
+
+    expect(
+      routedRequestSummary(
+        [
+          {
+            ...m("gpt-5.5-medium-fast", "GPT-5.5 Fast"),
+            requestedModelId: "gpt-5.5",
+            requestedMaxMode: false,
+            parameters: [
+              { id: "context", value: "272k" },
+              { id: "reasoning", value: "medium" },
+              { id: "fast", value: "true" },
+            ],
+          },
+          {
+            ...m("gpt-5.5-high-fast", "GPT-5.5 High Fast"),
+            requestedModelId: "gpt-5.5",
+            requestedMaxMode: false,
+            parameters: [
+              { id: "context", value: "272k" },
+              { id: "reasoning", value: "high" },
+              { id: "fast", value: "true" },
+            ],
+          },
+        ],
+        "gpt-5.5-fast",
+        "high",
+      ),
+    ).toEqual({
+      modelId: "gpt-5.5",
+      maxMode: false,
+      parameters: [
+        { id: "context", value: "272k" },
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "true" },
+      ],
+    });
+
+    expect(
+      routedRequestSummary(
+        [
+          {
+            ...m("gpt-5.5-max-high-fast", "GPT-5.5 Max High Fast"),
+            requestedModelId: "gpt-5.5",
+            requestedMaxMode: true,
+            parameters: [
+              { id: "context", value: "272k" },
+              { id: "reasoning", value: "high" },
+              { id: "fast", value: "true" },
+            ],
+          },
+        ],
+        "gpt-5.5-max-fast",
+        "high",
+      ),
+    ).toEqual({
+      modelId: "gpt-5.5",
+      maxMode: true,
+      parameters: [
+        { id: "context", value: "272k" },
+        { id: "reasoning", value: "high" },
+        { id: "fast", value: "true" },
+      ],
+    });
+
+    expect(
+      routedRequestSummary(
+        [
+          {
+            ...m("composer-2-max-fast", "Composer 2 Max Fast"),
+            requestedModelId: "composer-2",
+            requestedMaxMode: true,
+            parameters: [{ id: "fast", value: "true" }],
+          },
+        ],
+        "composer-2-max-fast",
+      ),
+    ).toEqual({
+      modelId: "composer-2",
+      maxMode: true,
+      parameters: [{ id: "fast", value: "true" }],
+    });
   });
 
   test("includes MCP tools in the initial AgentRunRequest like Cursor CLI", () => {

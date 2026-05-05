@@ -76,7 +76,7 @@ Models sharing the same `(base, variant)` with **≥2 effort levels** and a sens
 
 ### Parameterized Cursor models
 
-Cursor exposes some choices as model parameters rather than standalone model IDs. The extension queries Cursor's `AiService.AvailableModels(useModelParameters=true)` endpoint when authenticated and generates rows for all advertised parameterized model variants; where Cursor marks a model as supporting Max Mode, GPT-style rows may also expose explicit `-max` entries over the same advertised parameter sets. At startup, it attempts live discovery with Pi's stored Cursor OAuth credentials (or a `CURSOR_ACCESS_TOKEN` override for testing) so models are available in `pi --list-models` and the model picker without requiring a fresh `/login cursor`. It falls back to the bundled static list when live metadata is unavailable. For example, GPT-5.5 has separate **Context** settings (`272K` and `1M`), **Reasoning** settings, and a **Fast** toggle for 272K variants. Pi's model picker cannot edit those Cursor-specific parameters directly, so this extension exposes them as separate selectable rows:
+Cursor exposes some choices as model parameters rather than standalone model IDs. The extension queries Cursor's `AiService.AvailableModels(useModelParameters=true)` endpoint when authenticated and generates rows for all advertised parameterized model variants; where Cursor marks a model as supporting Max Mode, rows expose normalized `-max` entries (not `-max-mode`, and never duplicated as `-max-max`) over the same advertised parameter sets. At startup, it attempts live discovery with Pi's stored Cursor OAuth credentials (or a `CURSOR_ACCESS_TOKEN` override for testing) so models are available in `pi --list-models` and the model picker without requiring a fresh `/login cursor`. It falls back to the bundled static list when live metadata is unavailable. For example, GPT-5.5 has separate **Context** settings (`272K` and `1M`), **Reasoning** settings, and a **Fast** toggle for 272K variants. Pi's model picker cannot edit those Cursor-specific parameters directly, so this extension exposes them as separate selectable rows:
 
 | Pi model           | Cursor `requestedModel`                                                    |
 | ------------------ | -------------------------------------------------------------------------- |
@@ -97,6 +97,7 @@ pi selects: gpt-5.5-max-fast          + effort: high   → Cursor receives: gpt-
 pi selects: gpt-5.5-1m                + effort: high   → Cursor receives: gpt-5.5 + context=1m + reasoning=high + fast=false + maxMode=true
 pi selects: claude-opus-4-7-thinking  + effort: xhigh  → Cursor receives: claude-opus-4-7 + thinking=true + context=300k + effort=xhigh
 pi selects: composer-2-fast           + no effort      → Cursor receives: composer-2 + fast=true
+pi selects: composer-2-max-fast       + no effort      → Cursor receives: composer-2 + fast=true + maxMode=true
 ```
 
 When a group is **collapsed**, the provider registers one model with Pi thinking-level support and an internal effort map (see table above).

@@ -387,6 +387,31 @@ export function parseModelId(id: string): ParsedModelId {
   return { base: remaining, effort, fast, thinking };
 }
 
+function hasCursorEffortParameter(model: CursorModel): boolean {
+  return Boolean(
+    model.parameters?.some(
+      (parameter) => parameter.id === "reasoning" || parameter.id === "effort",
+    ),
+  );
+}
+
+function parseModelForProcessing(model: CursorModel): ParsedModelId {
+  const parsed = parseModelId(model.id);
+  // Parameterized Max Mode rows without a Cursor effort/reasoning parameter use
+  // a display suffix like `composer-2-max-fast`. In that case `-max` is the
+  // orthogonal Max Mode toggle, not an effort suffix to deduplicate away.
+  if (
+    (model.requestedMaxMode === true ||
+      model.requestedModelId?.includes("-max-mode") ||
+      model.requestedModelId?.includes("-max-max")) &&
+    parsed.effort === "max" &&
+    !hasCursorEffortParameter(model)
+  ) {
+    return { ...parsed, base: `${parsed.base}-max`, effort: "" };
+  }
+  return parsed;
+}
+
 export interface CursorModelRouting {
   modelId: string;
   parameters?: CursorModelParameter[];
@@ -551,7 +576,7 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
   >();
 
   for (const model of raw) {
-    const p = parseModelId(model.id);
+    const p = parseModelForProcessing(model);
     const key = `${p.base}|${p.fast}|${p.thinking}`;
     let g = groups.get(key);
     if (!g) {
@@ -761,19 +786,24 @@ function contextLabel(context: string | undefined): string | undefined {
   return context.toUpperCase();
 }
 
+function hasMaxToken(value: string): boolean {
+  return /(^|-)max($|-)/i.test(value);
+}
+
 function maxModeIdPart(
   modelName: string,
   context: string | undefined,
   requestedMaxMode: boolean,
-  hasEffortParameter: boolean,
+  _hasEffortParameter: boolean,
 ): string {
   // 1M context already names the Max/extended-context selection. For default
-  // context windows, expose maxMode as an explicit row suffix. If the Cursor
-  // model ID already contains "max" (for example gpt-5.1-codex-max), or if
-  // this row has no effort parameter, use a clearer suffix so the model parser
-  // does not confuse Max Mode with a Cursor effort value.
-  if (!requestedMaxMode || context === "1m") return "";
-  return !hasEffortParameter || /(^|-)max($|-)/i.test(modelName) ? "-max-mode" : "-max";
+  // context windows, expose maxMode as a normalized `-max` row suffix. If the
+  // Cursor model ID already contains a `max` token, do not append another one
+  // (`gpt-...-max-max`); the existing token is enough for the display ID.
+  // During processing, no-effort parameterized rows treat this suffix as Max
+  // Mode rather than as a Cursor effort value.
+  if (!requestedMaxMode || context === "1m" || hasMaxToken(modelName)) return "";
+  return "-max";
 }
 
 function maxModeLabel(
@@ -784,7 +814,7 @@ function maxModeLabel(
 ): string | undefined {
   const idPart = maxModeIdPart(modelName, context, requestedMaxMode, hasEffortParameter);
   if (!idPart) return undefined;
-  return idPart === "-max-mode" ? "Max Mode" : "Max";
+  return "Max";
 }
 
 function parameterizedBaseId(
@@ -970,13 +1000,27 @@ export function modelsFromParameterizedMetadata(
   return rows;
 }
 
+function normalizeMaxModeModelId(id: string): string {
+  let normalized = id.replace(/(^|-)max-mode(?=$|-)/g, "$1max");
+  while (/(^|-)max-max(?=$|-)/.test(normalized)) {
+    normalized = normalized.replace(/(^|-)max-max(?=$|-)/g, "$1max");
+  }
+  return normalized;
+}
+
 function normalizeDisplayModel(model: CursorModel): CursorModel {
-  if (model.id !== "default") return model;
+  const normalizedId = normalizeMaxModeModelId(model.id);
+  const normalizedModel =
+    normalizedId === model.id
+      ? model
+      : { ...model, id: normalizedId, requestedModelId: model.requestedModelId ?? model.id };
+  if (normalizedModel.id !== "default") return normalizedModel;
   return {
-    ...model,
+    ...normalizedModel,
     id: "auto",
-    name: model.name && model.name !== "default" ? model.name : "Auto",
-    requestedModelId: model.requestedModelId ?? "default",
+    name:
+      normalizedModel.name && normalizedModel.name !== "default" ? normalizedModel.name : "Auto",
+    requestedModelId: normalizedModel.requestedModelId ?? "default",
   };
 }
 
