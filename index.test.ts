@@ -3,6 +3,7 @@ import gpt55ParameterizedFixture from "./fixtures/cursor-gpt55-parameterized.jso
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
+import { spawnBridge } from "./bridge.ts";
 import {
   applyNoReasoningEffort,
   buildEffortMap,
@@ -15,6 +16,7 @@ import {
   modelsFromParameterizedMetadata,
   parseModelId,
   processModels,
+  registerCursorModelSwitchCleanup,
   registerSessionLifecycleCleanup,
   supportsReasoningModelId,
 } from "./index.ts";
@@ -72,6 +74,25 @@ afterEach(() => {
 function m(id: string, name?: string): CursorModel {
   return { id, name: name ?? id, reasoning: true, contextWindow: 200_000, maxTokens: 64_000 };
 }
+
+// ── bridge process ──
+
+describe("spawnBridge", () => {
+  test("ignores writes after stdin is ended", async () => {
+    const bridge = spawnBridge({
+      accessToken: "test-token",
+      rpcPath: "/agent.v1.AgentService/Run",
+      url: "http://127.0.0.1:1",
+    });
+    bridge.end();
+    expect(() => bridge.write(new Uint8Array([1, 2, 3]))).not.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(() => bridge.end()).not.toThrow();
+    const closed = new Promise((resolve) => bridge.onClose(resolve));
+    bridge.proc.kill();
+    await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 250))]);
+  });
+});
 
 // ── model metadata ──
 
@@ -1475,6 +1496,53 @@ describe("session cleanup hook wiring", () => {
       expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
       expect(__testInternals.conversationStates.has(convKey)).toBe(false);
     }
+  });
+});
+
+describe("model switch cleanup hook", () => {
+  test("cleans cursor session state when crossing the cursor provider boundary", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerCursorModelSwitchCleanup(pi);
+
+    const sessionId = "session-model-switch";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const seedConversation = () => {
+      __testInternals.conversationStates.set(convKey, {
+        conversationId: "conv-model-switch",
+        checkpoint: null,
+        sessionScoped: true,
+        blobStore: new Map(),
+        lastAccessMs: Date.now(),
+      });
+    };
+    const ctx = { sessionManager: { getSessionId: () => sessionId } };
+
+    seedConversation();
+    await handlers.get("model_select")?.(
+      { previousModel: { provider: "anthropic" }, model: { provider: "cursor" } },
+      ctx,
+    );
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+
+    seedConversation();
+    await handlers.get("model_select")?.(
+      { previousModel: { provider: "cursor" }, model: { provider: "openai" } },
+      ctx,
+    );
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+
+    seedConversation();
+    await handlers.get("model_select")?.(
+      { previousModel: { provider: "anthropic" }, model: { provider: "openai" } },
+      ctx,
+    );
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
   });
 });
 
@@ -3960,6 +4028,68 @@ describe("proxy integration — session handling", () => {
     ).not.toEqual(priorCheckpoint);
     expect(runRequests[0].conversationState.turns).toHaveLength(2);
     expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
+  });
+
+  test("provider switch history growth discards prior cursor checkpoint and reconstructs transcript", async () => {
+    const runRequests: any[] = [];
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
+
+    const sessionId = "session-provider-switch";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const storedTurns = [turn("hi", [assistantStep("Hi from Cursor")])];
+    const priorPayload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "next",
+      storedTurns,
+      "conv-provider-switch",
+      null,
+    );
+    const priorCheckpoint = toBinary(
+      ConversationStateStructureSchema,
+      decodeRunRequest(priorPayload).conversationState,
+    );
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-provider-switch",
+      checkpoint: priorCheckpoint,
+      checkpointTurnCount: storedTurns.length,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(storedTurns),
+
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "Hi from Cursor" },
+        { role: "user", content: "second turn on another provider" },
+        { role: "assistant", content: "Reply from another provider" },
+        { role: "user", content: "now continue on cursor" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+    expect(
+      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
+    ).not.toEqual(priorCheckpoint);
+    expect(runRequests[0].conversationState.turns).toHaveLength(2);
+    expect(runRequests[0].action.action.value.userMessage.text).toBe("now continue on cursor");
   });
 
   test("same-depth branch with different assistant text discards stale checkpoint", async () => {

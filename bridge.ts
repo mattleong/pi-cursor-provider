@@ -62,15 +62,62 @@ export function spawnBridge(
     path: options.rpcPath,
     unary: options.unary ?? false,
   });
-  proc.stdin!.write(lpEncode(new TextEncoder().encode(config)));
+  const stdin = proc.stdin!;
+  let exited = false;
+  let exitCode = 1;
+  let stdinUnavailable = false;
+  let stdinEnded = false;
+
+  const markStdinUnavailable = (reason: string, error?: unknown) => {
+    stdinUnavailable = true;
+    debugLog("bridge.stdin_unavailable", {
+      reason,
+      message: error instanceof Error ? error.message : undefined,
+      code:
+        error && typeof error === "object" && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : undefined,
+    });
+  };
+
+  stdin.on("error", (error) => markStdinUnavailable("error", error));
+  stdin.on("close", () => markStdinUnavailable("close"));
+
+  const canWriteStdin = () =>
+    !exited &&
+    !stdinUnavailable &&
+    !stdinEnded &&
+    !stdin.destroyed &&
+    !stdin.writableEnded &&
+    !stdin.writableFinished;
+
+  const writeToStdin = (data: Uint8Array, kind: string): boolean => {
+    if (!canWriteStdin()) {
+      debugLog("bridge.stdin_write_skipped", {
+        kind,
+        exited,
+        stdinUnavailable,
+        stdinEnded,
+        destroyed: stdin.destroyed,
+        writableEnded: stdin.writableEnded,
+        writableFinished: stdin.writableFinished,
+      });
+      return false;
+    }
+    try {
+      return stdin.write(lpEncode(data));
+    } catch (error) {
+      markStdinUnavailable("write_failed", error);
+      return false;
+    }
+  };
+
+  writeToStdin(new TextEncoder().encode(config), "config");
 
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
   };
-
-  let exited = false;
-  let exitCode = 1;
 
   let pending = Buffer.alloc(0);
   proc.stdout!.on("data", (chunk: Buffer) => {
@@ -97,15 +144,25 @@ export function spawnBridge(
       return !exited;
     },
     write(data: Uint8Array) {
-      try {
-        proc.stdin!.write(lpEncode(data));
-      } catch {}
+      writeToStdin(data, "data");
     },
     end() {
-      try {
-        proc.stdin!.write(lpEncode(new Uint8Array(0)));
-        proc.stdin!.end();
-      } catch {}
+      if (stdinEnded) return;
+      if (canWriteStdin()) {
+        try {
+          stdin.write(lpEncode(new Uint8Array(0)));
+        } catch (error) {
+          markStdinUnavailable("end_write_failed", error);
+        }
+      }
+      stdinEnded = true;
+      if (!stdin.destroyed && !stdin.writableEnded && !stdin.writableFinished) {
+        try {
+          stdin.end();
+        } catch (error) {
+          markStdinUnavailable("end_failed", error);
+        }
+      }
     },
     onData(cb: (chunk: Buffer) => void) {
       cbs.data = cb;

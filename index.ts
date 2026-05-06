@@ -1113,6 +1113,29 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
   pi.on("session_shutdown", cleanupCurrentSession);
 }
 
+export function registerCursorModelSwitchCleanup(pi: ExtensionAPI) {
+  pi.on(
+    "model_select",
+    async (
+      event: { model?: { provider?: string }; previousModel?: { provider?: string } },
+      ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } },
+    ) => {
+      const nextProvider = event.model?.provider;
+      const previousProvider = event.previousModel?.provider;
+      if (nextProvider === previousProvider) return;
+      if (nextProvider !== "cursor" && previousProvider !== "cursor") return;
+
+      debugExtensionLog("model_select.cursor_boundary_cleanup", {
+        sessionId: ctx.sessionManager.getSessionId(),
+        leafId: ctx.sessionManager.getLeafId?.(),
+        previousProvider,
+        nextProvider,
+      });
+      cleanupSessionState(ctx.sessionManager.getSessionId());
+    },
+  );
+}
+
 function registerCursorPayloadContextHook(pi: ExtensionAPI) {
   pi.on("before_provider_request", async (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
@@ -1232,6 +1255,7 @@ export default async function (pi: ExtensionAPI) {
   const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
 
   registerSessionLifecycleCleanup(pi);
+  registerCursorModelSwitchCleanup(pi);
   registerCursorPayloadContextHook(pi);
   registerExtensionDebugHooks(pi);
   debugExtensionLog("extension.start", {

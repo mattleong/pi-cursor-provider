@@ -3467,7 +3467,16 @@ function startBridge(accessToken: string, requestBytes: Uint8Array) {
   const bridge = bridgeFactory({ accessToken, rpcPath: "/agent.v1.AgentService/Run" });
   debugLog("bridge.start_run", { requestBytes });
   bridge.write(frameConnectMessage(requestBytes));
-  const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
+  const heartbeatTimer = setInterval(() => {
+    if (!bridge.alive) return;
+    try {
+      bridge.write(makeHeartbeatBytes());
+    } catch (error) {
+      debugLog("bridge.heartbeat_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, 5_000);
   return { bridge, heartbeatTimer };
 }
 
@@ -3511,7 +3520,13 @@ function sendCancelAction(bridge: BridgeHandle): void {
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "conversationAction", value: action },
   });
-  bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  try {
+    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  } catch (error) {
+    debugLog("bridge.cancel_action_failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 function cleanupBridge(
