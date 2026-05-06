@@ -1113,6 +1113,25 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
   pi.on("session_shutdown", cleanupCurrentSession);
 }
 
+function registerCursorPayloadContextHook(pi: ExtensionAPI) {
+  pi.on("before_provider_request", async (event, ctx) => {
+    if (ctx.model?.provider !== "cursor") return;
+    const payload = (event as { payload?: unknown }).payload;
+    if (!payload || typeof payload !== "object") return;
+    const typedPayload = payload as Record<string, unknown>;
+    if (!Array.isArray(typedPayload.messages)) return;
+
+    const nextPayload: Record<string, unknown> = { ...typedPayload };
+    if (typeof ctx.cwd === "string" && ctx.cwd.trim()) {
+      nextPayload.cursor_workspace_path = ctx.cwd;
+    }
+
+    const imagePayloads = extractToolResultImagePayloads(ctx, nextPayload);
+    if (imagePayloads.length > 0) nextPayload.cursor_tool_result_images = imagePayloads;
+    return nextPayload;
+  });
+}
+
 function registerExtensionDebugHooks(pi: ExtensionAPI) {
   if (!isExtensionDebugEnabled()) return;
 
@@ -1213,6 +1232,7 @@ export default async function (pi: ExtensionAPI) {
   const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
 
   registerSessionLifecycleCleanup(pi);
+  registerCursorPayloadContextHook(pi);
   registerExtensionDebugHooks(pi);
   debugExtensionLog("extension.start", {
     mode: "native-streamSimple",

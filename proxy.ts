@@ -24,8 +24,8 @@ import {
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join as pathJoin } from "node:path";
+import { homedir, release as osRelease, tmpdir, type as osType } from "node:os";
+import { isAbsolute, join as pathJoin, resolve as pathResolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   AgentClientMessageSchema,
@@ -75,6 +75,7 @@ import {
   ReadResultSchema,
   RecordScreenFailureSchema,
   RecordScreenResultSchema,
+  RequestContextEnvSchema,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
@@ -186,6 +187,17 @@ interface ChatCompletionRequest {
   cursor_tool_result_images?: CursorToolResultImagePayload[];
   cursor_requires_max_mode?: boolean;
   cursor_model_max_mode?: boolean;
+  cursor_workspace_path?: string;
+}
+
+interface CursorWorkspaceContext {
+  workspacePath: string;
+  workspaceUri: string;
+  projectFolder: string;
+  terminalsFolder: string;
+  agentSharedNotesFolder: string;
+  agentConversationNotesFolder: string;
+  agentTranscriptsFolder: string;
 }
 
 interface CursorRequestPayload {
@@ -210,6 +222,7 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
   currentTurn: ParsedTurn;
+  workspaceContext?: CursorWorkspaceContext;
 }
 
 export interface StoredConversation {
@@ -1216,13 +1229,28 @@ async function handleCursorNativeRequest(
   const sessionId = derivePiSessionId(body);
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
+  const workspaceContext = createWorkspaceContext(body.cursor_workspace_path);
   const activeBridge = activeBridges.get(bridgeKey);
+
+  if (options?.signal?.aborted) {
+    debugLog("native.request.aborted_before_dispatch", {
+      requestId,
+      sessionId,
+      bridgeKey,
+      convKey,
+      hasActiveBridge: !!activeBridge,
+    });
+    if (activeBridge) cleanupBridge(activeBridge.bridge, activeBridge.heartbeatTimer, bridgeKey);
+    writer.error("Aborted", "aborted");
+    return;
+  }
 
   debugLog("native.request", {
     requestId,
     sessionId,
     bridgeKey,
     convKey,
+    workspaceContext,
     model: body.model,
     resolvedModelId: modelId,
     cursorModelId: body.cursor_model_id,
@@ -1254,6 +1282,7 @@ async function handleCursorNativeRequest(
           bridgeKey,
           convKey,
           turns,
+          workspaceContext,
           writer,
           options,
           requestId,
@@ -1311,6 +1340,7 @@ async function handleCursorNativeRequest(
     body.cursor_model_parameters,
     mcpTools,
     effectiveUserImages,
+    workspaceContext,
   );
   payload.mcpTools = mcpTools;
 
@@ -1340,6 +1370,7 @@ async function handleCursorNativeRequest(
     convKey,
     turns,
     currentTurn,
+    workspaceContext,
     writer,
     options,
     requestId,
@@ -1357,11 +1388,12 @@ function writeNativeStream(
   convKey: string,
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
+  workspaceContext: CursorWorkspaceContext,
   writer: NativeStreamWriter,
   options?: CursorNativeStreamOptions,
   requestId?: string,
 ): void {
-  debugLog("native.stream.start", { requestId, bridgeKey, convKey, modelId });
+  debugLog("native.stream.start", { requestId, bridgeKey, convKey, modelId, workspaceContext });
   const state: StreamState = {
     toolCallIndex: 0,
     pendingExecs: [],
@@ -1375,12 +1407,16 @@ function writeNativeStream(
   let latestCheckpoint: Uint8Array | null = null;
 
   const abort = () => {
-    if (cancelled || writer.closed) return;
+    if (cancelled) return;
     cancelled = true;
-    debugLog("native.stream.abort", { requestId, bridgeKey, convKey });
+    debugLog("native.stream.abort", { requestId, bridgeKey, convKey, writerClosed: writer.closed });
     cleanupBridge(bridge, heartbeatTimer, bridgeKey);
-    writer.error("Aborted", "aborted", state);
+    if (!writer.closed) writer.error("Aborted", "aborted", state);
   };
+  if (options?.signal?.aborted) {
+    abort();
+    return;
+  }
   options?.signal?.addEventListener("abort", abort, { once: true });
 
   const emitText = (text: string, isThinking?: boolean) => {
@@ -1414,6 +1450,7 @@ function writeNativeStream(
           serverMessage,
           blobStore,
           mcpTools,
+          workspaceContext,
           (data) => bridge.write(data),
           state,
           emitText,
@@ -1435,6 +1472,7 @@ function writeNativeStream(
               mcpTools,
               pendingExecs: state.pendingExecs,
               currentTurn,
+              workspaceContext,
             });
             debugLog("native.stream.tool_call_pause", {
               requestId,
@@ -1524,11 +1562,18 @@ function handleNativeToolResultResume(
   bridgeKey: string,
   convKey: string,
   completedTurns: ParsedTurn[],
+  workspaceContext: CursorWorkspaceContext,
   writer: NativeStreamWriter,
   options?: CursorNativeStreamOptions,
   requestId?: string,
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
+  if (options?.signal?.aborted) {
+    debugLog("native.tool_resume.aborted_before_result", { requestId, bridgeKey, convKey });
+    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+    writer.error("Aborted", "aborted");
+    return;
+  }
   debugLog("native.tool_resume.start", {
     requestId,
     bridgeKey,
@@ -1558,6 +1603,7 @@ function handleNativeToolResultResume(
       mcpTools,
       pendingExecs,
       currentTurn,
+      workspaceContext,
     });
     debugLog("native.tool_resume.partial_wait", {
       requestId,
@@ -1606,6 +1652,7 @@ function handleNativeToolResultResume(
     convKey,
     completedTurns,
     currentTurn,
+    workspaceContext,
     writer,
     options,
     requestId,
@@ -1621,6 +1668,40 @@ export function evictStaleConversations(now = Date.now()): void {
       conversationStates.delete(key);
     }
   }
+}
+
+function normalizeWorkspacePath(raw: unknown): string {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return process.cwd();
+  return isAbsolute(text) ? text : pathResolve(text);
+}
+
+function cursorProjectSlug(workspacePath: string): string {
+  const slug = workspacePath
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "workspace";
+}
+
+function createWorkspaceContext(rawWorkspacePath?: unknown): CursorWorkspaceContext {
+  const workspacePath = normalizeWorkspacePath(rawWorkspacePath);
+  const projectFolder = pathJoin(
+    homedir(),
+    ".cursor",
+    "projects",
+    cursorProjectSlug(workspacePath),
+  );
+  return {
+    workspacePath,
+    workspaceUri: pathToFileURL(workspacePath).href,
+    projectFolder,
+    terminalsFolder: pathJoin(projectFolder, "terminals"),
+    agentSharedNotesFolder: pathJoin(homedir(), ".cursor", "agent-shared-notes"),
+    agentConversationNotesFolder: pathJoin(projectFolder, "conversation-notes"),
+    agentTranscriptsFolder: pathJoin(projectFolder, "transcripts"),
+  };
 }
 
 function stableNormalizeForHash(value: unknown): unknown {
@@ -1947,12 +2028,14 @@ async function handleChatCompletion(
   const sessionId = derivePiSessionId(body);
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
+  const workspaceContext = createWorkspaceContext(body.cursor_workspace_path);
   const activeBridge = activeBridges.get(bridgeKey);
   debugLog("chat.session_keys", {
     requestId,
     sessionId,
     bridgeKey,
     convKey,
+    workspaceContext,
     hasActiveBridge: !!activeBridge,
   });
 
@@ -1973,6 +2056,7 @@ async function handleChatCompletion(
           bridgeKey,
           convKey,
           turns,
+          workspaceContext,
           req,
           res,
           body.stream !== false,
@@ -2041,6 +2125,7 @@ async function handleChatCompletion(
     body.cursor_model_parameters,
     mcpTools,
     effectiveUserImages,
+    workspaceContext,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -2067,6 +2152,7 @@ async function handleChatCompletion(
       convKey,
       turns,
       currentTurn,
+      workspaceContext,
       req,
       res,
       requestId,
@@ -2081,6 +2167,7 @@ async function handleChatCompletion(
       convKey,
       turns,
       currentTurn,
+      workspaceContext,
       req,
       res,
       requestId,
@@ -2675,6 +2762,7 @@ export function buildCursorRequest(
   cursorModelParameters: CursorModelParameter[] = [],
   mcpTools: McpToolDefinition[] = [],
   userImages: ParsedImageContent[] = [],
+  workspaceContext: CursorWorkspaceContext = createWorkspaceContext(),
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -2688,6 +2776,7 @@ export function buildCursorRequest(
     cursorModelParameters,
     mcpToolCount: mcpTools.length,
     userImageCount: userImages.length,
+    workspaceContext,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
@@ -2725,7 +2814,7 @@ export function buildCursorRequest(
       turns: turnBlobIds,
       todos: [],
       pendingToolCalls: [],
-      previousWorkspaceUris: [pathToFileURL(process.cwd()).href],
+      previousWorkspaceUris: [workspaceContext.workspaceUri],
       mode: 1,
       fileStates: {},
       fileStatesV2: {},
@@ -2781,6 +2870,7 @@ function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  workspaceContext: CursorWorkspaceContext,
   sendFrame: (data: Uint8Array) => void,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
@@ -2805,7 +2895,13 @@ function processServerMessage(
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
-    handleExecMessage(msg.message.value as ExecServerMessage, mcpTools, sendFrame, onMcpExec);
+    handleExecMessage(
+      msg.message.value as ExecServerMessage,
+      mcpTools,
+      workspaceContext,
+      sendFrame,
+      onMcpExec,
+    );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if ((stateStructure as any).tokenDetails) {
@@ -2859,6 +2955,7 @@ function handleKvMessage(
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
+  workspaceContext: CursorWorkspaceContext,
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
 ): void {
@@ -2869,6 +2966,18 @@ function handleExecMessage(
   if (execCase === "requestContextArgs") {
     const requestContext = create(RequestContextSchema, {
       rules: [],
+      env: create(RequestContextEnvSchema, {
+        osVersion: `${osType()} ${osRelease()}`.trim(),
+        workspacePaths: [workspaceContext.workspacePath],
+        shell: process.env.SHELL ?? "",
+        sandboxEnabled: false,
+        terminalsFolder: workspaceContext.terminalsFolder,
+        agentSharedNotesFolder: workspaceContext.agentSharedNotesFolder,
+        agentConversationNotesFolder: workspaceContext.agentConversationNotesFolder,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? "",
+        projectFolder: workspaceContext.projectFolder,
+        agentTranscriptsFolder: workspaceContext.agentTranscriptsFolder,
+      }),
       repositoryInfo: [],
       tools: mcpTools,
       gitRepos: [],
@@ -3370,11 +3479,12 @@ function handleStreamingResponse(
   convKey: string,
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
+  workspaceContext: CursorWorkspaceContext,
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
 ): void {
-  debugLog("stream.start", { requestId, bridgeKey, convKey, modelId });
+  debugLog("stream.start", { requestId, bridgeKey, convKey, modelId, workspaceContext });
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   writeSSEStream(
     bridge,
@@ -3386,6 +3496,7 @@ function handleStreamingResponse(
     convKey,
     completedTurns,
     currentTurn,
+    workspaceContext,
     req,
     res,
     requestId,
@@ -3428,6 +3539,7 @@ function writeSSEStream(
   convKey: string,
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
+  workspaceContext: CursorWorkspaceContext,
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
@@ -3437,6 +3549,7 @@ function writeSSEStream(
     bridgeKey,
     convKey,
     modelId,
+    workspaceContext,
     completedTurnCount: completedTurns.length,
     currentTurn,
   });
@@ -3515,6 +3628,7 @@ function writeSSEStream(
           serverMessage,
           blobStore,
           mcpTools,
+          workspaceContext,
           (data) => bridge.write(data),
           state,
           (text, isThinking) => {
@@ -3568,6 +3682,7 @@ function writeSSEStream(
               mcpTools,
               pendingExecs: state.pendingExecs,
               currentTurn,
+              workspaceContext,
             });
             debugLog("stream.tool_call_pause", {
               requestId,
@@ -3674,6 +3789,7 @@ export function writeSSEStreamForTests(args: {
   convKey: string;
   completedTurns: ParsedTurn[];
   currentTurn: ParsedTurn;
+  workspaceContext?: CursorWorkspaceContext;
   req: IncomingMessage;
   res: ServerResponse;
   requestId?: string;
@@ -3688,6 +3804,7 @@ export function writeSSEStreamForTests(args: {
     args.convKey,
     args.completedTurns,
     args.currentTurn,
+    args.workspaceContext ?? createWorkspaceContext(),
     args.req,
     args.res,
     args.requestId,
@@ -3703,6 +3820,7 @@ function handleToolResultResume(
   bridgeKey: string,
   convKey: string,
   completedTurns: ParsedTurn[],
+  workspaceContext: CursorWorkspaceContext,
   req: IncomingMessage,
   res: ServerResponse,
   stream: boolean,
@@ -3738,6 +3856,7 @@ function handleToolResultResume(
       mcpTools,
       pendingExecs,
       currentTurn,
+      workspaceContext,
     });
     debugLog("tool_resume.partial_wait", { requestId, bridgeKey, unresolvedExecs, currentTurn });
     respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res);
@@ -3782,6 +3901,7 @@ function handleToolResultResume(
     convKey,
     completedTurns,
     currentTurn,
+    workspaceContext,
     req,
     res,
     requestId,
@@ -3797,6 +3917,7 @@ async function handleNonStreamingResponse(
   convKey: string,
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
+  workspaceContext: CursorWorkspaceContext,
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
@@ -3805,6 +3926,7 @@ async function handleNonStreamingResponse(
     requestId,
     convKey,
     modelId,
+    workspaceContext,
     currentTurn,
     completedTurnCount: completedTurns.length,
   });
@@ -3847,6 +3969,7 @@ async function handleNonStreamingResponse(
               serverMessage,
               payload.blobStore,
               payload.mcpTools,
+              workspaceContext,
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {

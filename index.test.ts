@@ -55,6 +55,7 @@ import {
   KvServerMessageSchema,
   McpArgsSchema,
   McpToolDefinitionSchema,
+  RequestContextArgsSchema,
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   UserMessageSchema,
@@ -2498,6 +2499,19 @@ function makeMcpExecMessage(toolCallId: string, toolName: string, args: Record<s
   });
 }
 
+function makeRequestContextMessage() {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "execServerMessage",
+      value: create(ExecServerMessageSchema, {
+        id: 1,
+        execId: "exec-context",
+        message: { case: "requestContextArgs", value: create(RequestContextArgsSchema, {}) },
+      }),
+    },
+  });
+}
+
 async function postChatCompletion(port: number, body: Record<string, unknown>) {
   return new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
     const req = httpRequest(
@@ -2693,6 +2707,141 @@ describe("native streamSimple provider", () => {
     expect(execClientMessages[0].message.case).toBe("mcpResult");
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
     expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toBeTruthy();
+  });
+
+  test("aborting after a native tool-call pause cancels the live Cursor bridge", async () => {
+    const bridges: FakeBridge[] = [];
+    const sessionId = "native-abort-after-tool-pause";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case === "runRequest") {
+          fake.emitServerMessage(makeMcpExecMessage("tc-abort", "bash", { command: "rg foo" }));
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+
+    const controller = new AbortController();
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [{ role: "user", content: "search", timestamp: Date.now() }],
+          tools: [{ name: "bash", description: "Run shell", parameters: {} }],
+        } as any,
+        { sessionId, signal: controller.signal },
+      ),
+    );
+
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(
+      bridges[0].clientMessages.some(
+        (message) =>
+          message.message.case === "conversationAction" &&
+          message.message.value.action.case === "cancelAction",
+      ),
+    ).toBe(true);
+  });
+
+  test("already-aborted native tool continuation reports aborted instead of lost continuation", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "search", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "toolCall",
+                  id: "tc-aborted",
+                  name: "bash",
+                  arguments: { command: "rg foo" },
+                },
+              ],
+              timestamp: Date.now(),
+            },
+            {
+              role: "toolResult",
+              toolCallId: "tc-aborted",
+              toolName: "bash",
+              content: [{ type: "text", text: "Operation aborted" }],
+              isError: true,
+              timestamp: Date.now(),
+            },
+          ],
+        } as any,
+        { sessionId: "native-already-aborted", signal: controller.signal },
+      ),
+    );
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      reason: "aborted",
+      error: { errorMessage: "Aborted" },
+    });
+  });
+
+  test("native request context reports the injected Pi workspace path", async () => {
+    const runRequests: any[] = [];
+    const execClientMessages: any[] = [];
+    const workspacePath = "/tmp/pi-cursor-provider-workspace";
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.emitServerMessage(makeRequestContextMessage());
+            return;
+          }
+          if (clientMessage.message.case === "execClientMessage") {
+            execClientMessages.push(clientMessage.message.value);
+            fake.emitServerMessage(makeTextDeltaMessage("workspace ready"));
+            fake.emitServerMessage(makeCheckpointMessage());
+            fake.close(0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        { messages: [{ role: "user", content: "check context", timestamp: Date.now() }] } as any,
+        {
+          sessionId: "native-workspace-context",
+          onPayload: (payload) => ({
+            ...(payload as Record<string, unknown>),
+            cursor_workspace_path: workspacePath,
+          }),
+        },
+      ),
+    );
+
+    expect(
+      events.some((event) => event.type === "text_delta" && event.delta === "workspace ready"),
+    ).toBe(true);
+    expect(runRequests[0].conversationState.previousWorkspaceUris).toEqual([
+      "file:///tmp/pi-cursor-provider-workspace",
+    ]);
+    const requestContext = execClientMessages[0].message.value.result.value.requestContext;
+    expect(requestContext.env.workspacePaths).toEqual([workspacePath]);
   });
 
   test("native routing applies reasoning/model parameter maps without before_provider_request", async () => {
