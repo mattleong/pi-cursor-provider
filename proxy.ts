@@ -154,6 +154,8 @@ interface OpenAIMessage {
   content: string | null | ContentPart[];
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
+  isError?: boolean;
+  is_error?: boolean;
 }
 
 interface OpenAIToolDef {
@@ -246,6 +248,7 @@ interface ToolResultInfo {
   toolCallId: string;
   content: string;
   images?: ParsedImageContent[];
+  isError?: boolean;
 }
 
 export interface ParsedToolResult {
@@ -1027,6 +1030,13 @@ function assistantTextFromPiContent(content: AssistantMessage["content"]): strin
     .join("\n");
 }
 
+function cursorAssistantTextFromPiMessage(message: AssistantMessage): string {
+  const text = assistantTextFromPiContent(message.content);
+  if (message.stopReason !== "aborted" || !text.trim()) return text;
+  const reason = message.errorMessage?.trim() || "Operation aborted";
+  return `${text}\n\n[Interrupted: the user aborted this assistant response before it completed (${reason}). Do not treat it as a completed answer.]`;
+}
+
 function assistantToolCallsFromPiContent(content: AssistantMessage["content"]): OpenAIToolCall[] {
   return content.filter(isPiToolCall).map((block) => ({
     id: block.id,
@@ -1098,7 +1108,7 @@ function contextToCursorChatCompletionRequest(
       const tool_calls = assistantToolCallsFromPiContent(message.content);
       messages.push({
         role: "assistant",
-        content: assistantTextFromPiContent(message.content),
+        content: cursorAssistantTextFromPiMessage(message),
         ...(tool_calls.length > 0 ? { tool_calls } : {}),
       });
       continue;
@@ -1109,6 +1119,7 @@ function contextToCursorChatCompletionRequest(
         role: "tool",
         tool_call_id: message.toolCallId,
         content: piContentToOpenAIContent(message.content),
+        ...(message.isError ? { isError: true } : {}),
       });
     }
   }
@@ -1589,7 +1600,11 @@ function handleNativeToolResultResume(
         step.kind === "toolCall" && step.toolCallId === result.toolCallId,
     );
     if (turnToolStep) {
-      turnToolStep.result = { content: result.content, images: result.images, isError: false };
+      turnToolStep.result = {
+        content: result.content,
+        images: result.images,
+        isError: result.isError === true,
+      };
     }
   }
 
@@ -1619,15 +1634,7 @@ function handleNativeToolResultResume(
   for (const exec of pendingExecs) {
     const result = turnResults.get(exec.toolCallId);
     if (!result) continue;
-    const mcpResult = create(McpResultSchema, {
-      result: {
-        case: "success",
-        value: create(McpSuccessSchema, {
-          content: buildMcpSuccessContent(result),
-          isError: false,
-        }),
-      },
-    });
+    const mcpResult = mcpResultFromParsedToolResult(result);
 
     const execClientMessage = create(ExecClientMessageSchema, {
       id: exec.execMsgId,
@@ -2521,16 +2528,17 @@ export function parseMessages(
       const inlineImages = imageContent(msg.content, { enforceCursorCliLimits: true });
       const images = mergeImages(inlineImages, toolResultImagesById.get(toolCallId));
       const content = normalizeToolResultText(textContent(msg.content), images);
+      const isError = msg.isError === true || msg.is_error === true;
       const existing = toolCallId ? currentTurn.toolCallById.get(toolCallId) : undefined;
       if (existing) {
-        existing.result = { content, images, isError: false };
+        existing.result = { content, images, isError };
       } else {
         const step: ParsedToolCallStep = {
           kind: "toolCall",
           toolCallId,
           toolName: "",
           arguments: {},
-          result: { content, images, isError: false },
+          result: { content, images, isError },
         };
         currentTurn.steps.push(step);
         if (toolCallId) currentTurn.toolCallById.set(toolCallId, step);
@@ -2559,6 +2567,7 @@ export function parseMessages(
             toolCallId: step.toolCallId,
             content: step.result!.content,
             ...(step.result!.images?.length ? { images: step.result!.images } : {}),
+            ...(step.result!.isError ? { isError: true } : {}),
           }));
       }
     } else {
@@ -2694,6 +2703,23 @@ function buildMcpSuccessContent(result: ParsedToolResult) {
   return content;
 }
 
+function mcpResultFromParsedToolResult(result: ParsedToolResult) {
+  return create(McpToolResultSchema, {
+    result: result.isError
+      ? {
+          case: "error",
+          value: create(McpToolErrorSchema, { error: result.content }),
+        }
+      : {
+          case: "success",
+          value: create(McpSuccessSchema, {
+            content: buildMcpSuccessContent(result),
+            isError: false,
+          }),
+        },
+  });
+}
+
 function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
   if (step.kind === "assistantText") {
     return toBinary(
@@ -2716,22 +2742,7 @@ function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
       providerIdentifier: "pi",
       toolName,
     }),
-    ...(step.result && {
-      result: create(McpToolResultSchema, {
-        result: step.result.isError
-          ? {
-              case: "error",
-              value: create(McpToolErrorSchema, { error: step.result.content }),
-            }
-          : {
-              case: "success",
-              value: create(McpSuccessSchema, {
-                content: buildMcpSuccessContent(step.result),
-                isError: false,
-              }),
-            },
-      }),
-    }),
+    ...(step.result && { result: mcpResultFromParsedToolResult(step.result) }),
   });
 
   return toBinary(
@@ -3857,7 +3868,11 @@ function handleToolResultResume(
         step.kind === "toolCall" && step.toolCallId === result.toolCallId,
     );
     if (turnToolStep) {
-      turnToolStep.result = { content: result.content, images: result.images, isError: false };
+      turnToolStep.result = {
+        content: result.content,
+        images: result.images,
+        isError: result.isError === true,
+      };
     }
   }
 
@@ -3881,15 +3896,7 @@ function handleToolResultResume(
   for (const exec of pendingExecs) {
     const result = turnResults.get(exec.toolCallId);
     if (!result) continue;
-    const mcpResult = create(McpResultSchema, {
-      result: {
-        case: "success",
-        value: create(McpSuccessSchema, {
-          content: buildMcpSuccessContent(result),
-          isError: false,
-        }),
-      },
-    });
+    const mcpResult = mcpResultFromParsedToolResult(result);
 
     const execClientMessage = create(ExecClientMessageSchema, {
       id: exec.execMsgId,

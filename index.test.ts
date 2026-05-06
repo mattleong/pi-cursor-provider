@@ -2287,6 +2287,56 @@ describe("parseMessages — structured tool turns", () => {
     );
   });
 
+  test("preserves failed tool-result status for continuations and reconstructed turns", () => {
+    const continuation = parseMessages([
+      { role: "user" as const, content: "run command" },
+      {
+        role: "assistant" as const,
+        content: null,
+        tool_calls: [
+          {
+            id: "tc-error",
+            type: "function" as const,
+            function: { name: "bash", arguments: "{}" },
+          },
+        ],
+      },
+      {
+        role: "tool" as const,
+        content: "Operation aborted",
+        tool_call_id: "tc-error",
+        isError: true,
+      },
+    ]);
+    expect(continuation.toolResults).toEqual([
+      { toolCallId: "tc-error", content: "Operation aborted", isError: true },
+    ]);
+
+    const reconstructed = parseMessages([
+      { role: "user" as const, content: "run command" },
+      {
+        role: "assistant" as const,
+        content: null,
+        tool_calls: [
+          {
+            id: "tc-error",
+            type: "function" as const,
+            function: { name: "bash", arguments: "{}" },
+          },
+        ],
+      },
+      {
+        role: "tool" as const,
+        content: "Operation aborted",
+        tool_call_id: "tc-error",
+        isError: true,
+      },
+      { role: "assistant" as const, content: "The command was aborted." },
+      { role: "user" as const, content: "continue" },
+    ]);
+    expect((reconstructed.turns[0].steps[0] as any).result.isError).toBe(true);
+  });
+
   test("tool result continuation does not inflate completed turn count", () => {
     const initialMsgs = [
       { role: "system" as const, content: "system" },
@@ -2605,6 +2655,17 @@ async function postChatCompletion(port: number, body: Record<string, unknown>) {
   });
 }
 
+function emptyUsage() {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
 function nativeModel(id = "gpt-5") {
   return {
     id,
@@ -2912,6 +2973,56 @@ describe("native streamSimple provider", () => {
     expect(requestContext.env.workspacePaths).toEqual([workspacePath]);
   });
 
+  test("native reconstruction marks aborted assistant text as interrupted", async () => {
+    const runRequests: any[] = [];
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
+
+    const sessionId = "native-aborted-reconstruction";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "create the PR", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "I found the template and I am creating it." }],
+              provider: "cursor",
+              model: "gpt-5",
+              api: "cursor-native",
+              usage: emptyUsage(),
+              stopReason: "aborted",
+              errorMessage: "Operation aborted",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "use this template", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    expect(runRequests).toHaveLength(1);
+    const blobStore = __testInternals.conversationStates.get(convKey)?.blobStore;
+    expect(blobStore).toBeTruthy();
+    const decoded = decodeTurns(runRequests[0].conversationState, blobStore);
+    const step = decoded[0].steps[0];
+    expect(step.message.case).toBe("assistantMessage");
+    expect(step.message.value.text).toContain("I found the template");
+    expect(step.message.value.text).toContain("Interrupted: the user aborted");
+  });
+
   test("native routing applies reasoning/model parameter maps without before_provider_request", async () => {
     const runRequests: any[] = [];
     setBridgeFactoryForTests(
@@ -3087,6 +3198,60 @@ describe("proxy integration — session handling", () => {
 
     const stored = __testInternals.conversationStates.get(convKey);
     expect(stored?.checkpoint).toBeTruthy();
+  });
+
+  test("tool-call continuation forwards failed tool results as MCP errors", async () => {
+    const execClientMessages: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(makeMcpExecMessage("tc-error", "bash", { command: "rg x" }));
+            return;
+          }
+          if (clientMessage.message.case === "execClientMessage") {
+            execClientMessages.push(clientMessage.message.value);
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("The command was aborted."));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const port = await startProxy(async () => "test-token");
+    const sessionId = "session-tool-error";
+    const first = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "run command" }],
+      tools: [{ type: "function", function: { name: "bash" } }],
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.body).toContain('"finish_reason":"tool_calls"');
+
+    const second = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "run command" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "tc-error", type: "function", function: { name: "bash", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", content: "Operation aborted", tool_call_id: "tc-error", isError: true },
+      ],
+    });
+
+    expect(second.statusCode).toBe(200);
+    expect(execClientMessages).toHaveLength(1);
+    const result = execClientMessages[0].message.value.result;
+    expect(result.case).toBe("error");
+    expect(result.value.error).toBe("Operation aborted");
   });
 
   test("tool-call continuation forwards tool result images as MCP image content", async () => {
