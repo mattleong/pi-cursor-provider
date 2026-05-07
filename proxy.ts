@@ -224,6 +224,7 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
   currentTurn: ParsedTurn;
+  convKey?: string;
   workspaceContext?: CursorWorkspaceContext;
 }
 
@@ -232,6 +233,7 @@ export interface StoredConversation {
   checkpoint: Uint8Array | null;
   checkpointTurnCount?: number;
   checkpointHistoryFingerprint?: string;
+  checkpointSystemPromptFingerprint?: string;
   sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
@@ -453,6 +455,7 @@ export const __testInternals = {
   activeBridges,
   conversationStates,
   fingerprintCompletedTurns,
+  fingerprintSystemPrompt,
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
@@ -730,18 +733,51 @@ function removeActiveBridge(bridgeKey: string): void {
   activeBridges.delete(bridgeKey);
 }
 
-function setActiveBridge(bridgeKey: string, active: Omit<ActiveBridge, "toolTimeoutTimer">): void {
-  clearActiveBridgeToolTimeout(activeBridges.get(bridgeKey));
+function createActiveBridgeToolTimeout(
+  bridgeKey: string,
+  active: Pick<ActiveBridge, "bridge" | "heartbeatTimer" | "convKey">,
+): ReturnType<typeof setTimeout> {
   const toolTimeoutTimer = setTimeout(() => {
-    debugLog("bridge.active_ttl_expired", { bridgeKey, ttlMs: ACTIVE_BRIDGE_TTL_MS });
+    debugLog("bridge.active_ttl_expired", {
+      bridgeKey,
+      convKey: active.convKey,
+      ttlMs: ACTIVE_BRIDGE_TTL_MS,
+    });
     cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
   }, ACTIVE_BRIDGE_TTL_MS);
   toolTimeoutTimer.unref?.();
+  return toolTimeoutTimer;
+}
+
+function setActiveBridge(bridgeKey: string, active: Omit<ActiveBridge, "toolTimeoutTimer">): void {
+  clearActiveBridgeToolTimeout(activeBridges.get(bridgeKey));
+  const toolTimeoutTimer = createActiveBridgeToolTimeout(bridgeKey, active);
   activeBridges.set(bridgeKey, { ...active, toolTimeoutTimer });
+}
+
+export function touchActiveBridgeForSession(
+  sessionId?: string,
+  reason = "tool_execution",
+): boolean {
+  if (!sessionId) return false;
+  const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+  const active = activeBridges.get(bridgeKey);
+  if (!active) return false;
+  clearActiveBridgeToolTimeout(active);
+  active.toolTimeoutTimer = createActiveBridgeToolTimeout(bridgeKey, active);
+  debugLog("bridge.active_ttl_refreshed", {
+    sessionId,
+    bridgeKey,
+    convKey: active.convKey,
+    ttlMs: ACTIVE_BRIDGE_TTL_MS,
+    reason,
+  });
+  return true;
 }
 
 export function cleanupAllSessionState(): void {
   debugLog("session.cleanup_all", {
+    cleanupKind: "all",
     activeBridgeCount: activeBridges.size,
     conversationCount: conversationStates.size,
   });
@@ -1232,6 +1268,7 @@ async function handleCursorNativeRequest(
   }
 
   const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
+  const systemPromptFingerprint = fingerprintSystemPrompt(systemPrompt);
   const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
   const maxMode =
     typeof body.cursor_model_max_mode === "boolean"
@@ -1294,6 +1331,7 @@ async function handleCursorNativeRequest(
           convKey,
           turns,
           workspaceContext,
+          systemPromptFingerprint,
           writer,
           options,
           requestId,
@@ -1334,7 +1372,7 @@ async function handleCursorNativeRequest(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
-  discardStaleCheckpointIfNeeded(stored, turns, requestId, convKey);
+  discardStaleCheckpointIfNeeded(stored, turns, systemPromptFingerprint, requestId, convKey);
 
   const mcpTools = buildMcpToolDefinitions(toolResolution.tools);
   const effectiveUserText = userText;
@@ -1382,6 +1420,7 @@ async function handleCursorNativeRequest(
     turns,
     currentTurn,
     workspaceContext,
+    systemPromptFingerprint,
     writer,
     options,
     requestId,
@@ -1400,6 +1439,7 @@ function writeNativeStream(
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
   workspaceContext: CursorWorkspaceContext,
+  systemPromptFingerprint: string,
   writer: NativeStreamWriter,
   options?: CursorNativeStreamOptions,
   requestId?: string,
@@ -1483,6 +1523,7 @@ function writeNativeStream(
               mcpTools,
               pendingExecs: state.pendingExecs,
               currentTurn,
+              convKey,
               workspaceContext,
             });
             debugLog("native.stream.tool_call_pause", {
@@ -1504,9 +1545,11 @@ function writeNativeStream(
           },
         );
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        debugLog("native.stream.process_error", { requestId, message });
+        streamError = err instanceof Error ? err : new Error(String(err));
+        const message = streamError.message;
+        debugLog("native.stream.process_error", { requestId, bridgeKey, convKey, message });
         if (!writer.closed) writer.error(message, "error", state);
+        cleanupBridge(bridge, heartbeatTimer, bridgeKey);
       }
     },
     (endStreamBytes) => {
@@ -1552,7 +1595,14 @@ function writeNativeStream(
       emitFlushed();
       if (stored) {
         if (latestCheckpoint) {
-          commitStoredCheckpoint(stored, latestCheckpoint, blobStore, completedTurns, currentTurn);
+          commitStoredCheckpoint(
+            stored,
+            latestCheckpoint,
+            blobStore,
+            completedTurns,
+            currentTurn,
+            systemPromptFingerprint,
+          );
           debugLog("native.stream.checkpoint_committed", { requestId, convKey, stored });
         } else {
           mergeBlobStore(stored, blobStore);
@@ -1574,6 +1624,7 @@ function handleNativeToolResultResume(
   convKey: string,
   completedTurns: ParsedTurn[],
   workspaceContext: CursorWorkspaceContext,
+  systemPromptFingerprint: string,
   writer: NativeStreamWriter,
   options?: CursorNativeStreamOptions,
   requestId?: string,
@@ -1618,6 +1669,7 @@ function handleNativeToolResultResume(
       mcpTools,
       pendingExecs,
       currentTurn,
+      convKey,
       workspaceContext,
     });
     debugLog("native.tool_resume.partial_wait", {
@@ -1660,6 +1712,7 @@ function handleNativeToolResultResume(
     completedTurns,
     currentTurn,
     workspaceContext,
+    systemPromptFingerprint,
     writer,
     options,
     requestId,
@@ -1742,6 +1795,10 @@ function fingerprintImage(image: ParsedImageContent): Record<string, unknown> {
   };
 }
 
+export function fingerprintSystemPrompt(systemPrompt: string): string {
+  return createHash("sha256").update(systemPrompt).digest("hex");
+}
+
 export function fingerprintCompletedTurns(turns: ParsedTurn[]): string {
   const normalized = turns.map((turn) => ({
     userText: turn.userText,
@@ -1770,40 +1827,67 @@ function clearStoredCheckpoint(stored: StoredConversation, clearBlobStore = fals
   stored.checkpoint = null;
   delete stored.checkpointTurnCount;
   delete stored.checkpointHistoryFingerprint;
+  delete stored.checkpointSystemPromptFingerprint;
   if (clearBlobStore) stored.blobStore.clear();
 }
 
 function discardStaleCheckpointIfNeeded(
   stored: StoredConversation,
   turns: ParsedTurn[],
+  systemPromptFingerprint: string,
   requestId: string,
   convKey: string,
 ): void {
-  if (!stored.checkpoint) return;
+  if (!stored.checkpoint) {
+    debugLog("checkpoint.decision", {
+      requestId,
+      convKey,
+      checkpointDecision: "none",
+    });
+    return;
+  }
 
   const currentTurnCount = turns.length;
   const currentHistoryFingerprint = fingerprintCompletedTurns(turns);
   const storedCheckpointTurnCount = stored.checkpointTurnCount;
   const storedCheckpointHistoryFingerprint = stored.checkpointHistoryFingerprint;
+  const storedCheckpointSystemPromptFingerprint = stored.checkpointSystemPromptFingerprint;
   const reason =
     storedCheckpointTurnCount === undefined || !storedCheckpointHistoryFingerprint
       ? "missing_checkpoint_metadata"
-      : storedCheckpointTurnCount !== currentTurnCount
-        ? "completed_turn_count_mismatch"
-        : storedCheckpointHistoryFingerprint !== currentHistoryFingerprint
-          ? "completed_history_fingerprint_mismatch"
-          : undefined;
+      : !storedCheckpointSystemPromptFingerprint
+        ? "missing_checkpoint_system_prompt_fingerprint"
+        : storedCheckpointTurnCount !== currentTurnCount
+          ? "completed_turn_count_mismatch"
+          : storedCheckpointHistoryFingerprint !== currentHistoryFingerprint
+            ? "completed_history_fingerprint_mismatch"
+            : storedCheckpointSystemPromptFingerprint !== systemPromptFingerprint
+              ? "system_prompt_fingerprint_mismatch"
+              : undefined;
 
-  if (!reason) return;
+  if (!reason) {
+    debugLog("checkpoint.decision", {
+      requestId,
+      convKey,
+      checkpointDecision: "reuse",
+      currentTurnCount,
+      currentHistoryFingerprint,
+      systemPromptFingerprint,
+    });
+    return;
+  }
 
   debugLog("chat.discard_checkpoint", {
     requestId,
     convKey,
+    checkpointDecision: "discard",
     reason,
     storedCheckpointTurnCount,
     currentTurnCount,
     storedCheckpointHistoryFingerprint,
     currentHistoryFingerprint,
+    storedCheckpointSystemPromptFingerprint,
+    systemPromptFingerprint,
   });
   clearStoredCheckpoint(stored, true);
 }
@@ -1819,12 +1903,14 @@ function commitStoredCheckpoint(
   blobStore: Map<string, Uint8Array>,
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
+  systemPromptFingerprint: string,
 ): void {
   const completedHistory = [...completedTurns, currentTurn];
   mergeBlobStore(stored, blobStore);
   stored.checkpoint = checkpointBytes;
   stored.checkpointTurnCount = completedHistory.length;
   stored.checkpointHistoryFingerprint = fingerprintCompletedTurns(completedHistory);
+  stored.checkpointSystemPromptFingerprint = systemPromptFingerprint;
 }
 
 /**
@@ -1960,6 +2046,7 @@ async function handleChatCompletion(
     return;
   }
   const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
+  const systemPromptFingerprint = fingerprintSystemPrompt(systemPrompt);
   const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
   if (body.reasoning_effort && !body.cursor_model_id && !body.cursor_model_parameters) {
     debugLog("model_routing.fallback_suffix_generation", {
@@ -2064,6 +2151,7 @@ async function handleChatCompletion(
           convKey,
           turns,
           workspaceContext,
+          systemPromptFingerprint,
           req,
           res,
           body.stream !== false,
@@ -2111,7 +2199,7 @@ async function handleChatCompletion(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
-  discardStaleCheckpointIfNeeded(stored, turns, requestId, convKey);
+  discardStaleCheckpointIfNeeded(stored, turns, systemPromptFingerprint, requestId, convKey);
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText =
@@ -2160,6 +2248,7 @@ async function handleChatCompletion(
       turns,
       currentTurn,
       workspaceContext,
+      systemPromptFingerprint,
       req,
       res,
       requestId,
@@ -2175,6 +2264,7 @@ async function handleChatCompletion(
       turns,
       currentTurn,
       workspaceContext,
+      systemPromptFingerprint,
       req,
       res,
       requestId,
@@ -3314,20 +3404,66 @@ export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: str
     .slice(0, 16);
 }
 
-export function cleanupSessionState(sessionId?: string): void {
+export function cleanupSessionActiveBridge(
+  sessionId?: string,
+  reason = "explicit",
+  details: Record<string, unknown> = {},
+): void {
   if (!sessionId) return;
   const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
   const convKey = deriveConversationKeyFromSessionId(sessionId);
   const active = activeBridges.get(bridgeKey);
   debugLog("session.cleanup", {
+    cleanupKind: "activeBridge",
+    reason,
+    ...details,
     sessionId,
     bridgeKey,
     convKey,
-    hasActiveBridge: !!active,
+    hadActiveBridge: !!active,
     hadConversation: conversationStates.has(convKey),
   });
   if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+}
+
+export function cleanupSessionConversationState(
+  sessionId?: string,
+  reason = "explicit",
+  details: Record<string, unknown> = {},
+): void {
+  if (!sessionId) return;
+  const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const hadConversation = conversationStates.has(convKey);
+  debugLog("session.cleanup", {
+    cleanupKind: "conversationState",
+    reason,
+    ...details,
+    sessionId,
+    bridgeKey,
+    convKey,
+    hadActiveBridge: activeBridges.has(bridgeKey),
+    hadConversation,
+  });
   conversationStates.delete(convKey);
+}
+
+export function cleanupSessionState(
+  sessionId?: string,
+  reason = "explicit",
+  details: Record<string, unknown> = {},
+): void {
+  if (!sessionId) return;
+  debugLog("session.cleanup", {
+    cleanupKind: "full",
+    reason,
+    ...details,
+    sessionId,
+    bridgeKey: deriveBridgeKeyFromSessionId(sessionId),
+    convKey: deriveConversationKeyFromSessionId(sessionId),
+  });
+  cleanupSessionActiveBridge(sessionId, reason, details);
+  cleanupSessionConversationState(sessionId, reason, details);
 }
 
 export function deterministicConversationId(convKey: string): string {
@@ -3500,6 +3636,7 @@ function handleStreamingResponse(
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
   workspaceContext: CursorWorkspaceContext,
+  systemPromptFingerprint: string,
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
@@ -3517,6 +3654,7 @@ function handleStreamingResponse(
     completedTurns,
     currentTurn,
     workspaceContext,
+    systemPromptFingerprint,
     req,
     res,
     requestId,
@@ -3566,6 +3704,7 @@ function writeSSEStream(
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
   workspaceContext: CursorWorkspaceContext,
+  systemPromptFingerprint: string,
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
@@ -3708,6 +3847,7 @@ function writeSSEStream(
               mcpTools,
               pendingExecs: state.pendingExecs,
               currentTurn,
+              convKey,
               workspaceContext,
             });
             debugLog("stream.tool_call_pause", {
@@ -3728,10 +3868,19 @@ function writeSSEStream(
           },
         );
       } catch (err) {
-        console.error(
-          "[cursor-provider] Stream message processing error:",
-          err instanceof Error ? err.message : err,
-        );
+        streamError = err instanceof Error ? err : new Error(String(err));
+        console.error("[cursor-provider] Stream message processing error:", streamError.message);
+        debugLog("stream.process_error", {
+          requestId,
+          bridgeKey,
+          convKey,
+          message: streamError.message,
+        });
+        sendSSE(makeChunk({ content: streamError.message }, "error"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeResponse();
+        cleanupBridge(bridge, heartbeatTimer, bridgeKey);
       }
     },
     (endStreamBytes) => {
@@ -3789,7 +3938,14 @@ function writeSSEStream(
       }
       if (stored) {
         if (latestCheckpoint) {
-          commitStoredCheckpoint(stored, latestCheckpoint, blobStore, completedTurns, currentTurn);
+          commitStoredCheckpoint(
+            stored,
+            latestCheckpoint,
+            blobStore,
+            completedTurns,
+            currentTurn,
+            systemPromptFingerprint,
+          );
           debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
         } else {
           mergeBlobStore(stored, blobStore);
@@ -3816,6 +3972,7 @@ export function writeSSEStreamForTests(args: {
   completedTurns: ParsedTurn[];
   currentTurn: ParsedTurn;
   workspaceContext?: CursorWorkspaceContext;
+  systemPromptFingerprint?: string;
   req: IncomingMessage;
   res: ServerResponse;
   requestId?: string;
@@ -3831,6 +3988,7 @@ export function writeSSEStreamForTests(args: {
     args.completedTurns,
     args.currentTurn,
     args.workspaceContext ?? createWorkspaceContext(),
+    args.systemPromptFingerprint ?? fingerprintSystemPrompt(""),
     args.req,
     args.res,
     args.requestId,
@@ -3847,6 +4005,7 @@ function handleToolResultResume(
   convKey: string,
   completedTurns: ParsedTurn[],
   workspaceContext: CursorWorkspaceContext,
+  systemPromptFingerprint: string,
   req: IncomingMessage,
   res: ServerResponse,
   stream: boolean,
@@ -3886,6 +4045,7 @@ function handleToolResultResume(
       mcpTools,
       pendingExecs,
       currentTurn,
+      convKey,
       workspaceContext,
     });
     debugLog("tool_resume.partial_wait", { requestId, bridgeKey, unresolvedExecs, currentTurn });
@@ -3924,6 +4084,7 @@ function handleToolResultResume(
     completedTurns,
     currentTurn,
     workspaceContext,
+    systemPromptFingerprint,
     req,
     res,
     requestId,
@@ -3940,6 +4101,7 @@ async function handleNonStreamingResponse(
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
   workspaceContext: CursorWorkspaceContext,
+  systemPromptFingerprint: string,
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
@@ -4007,10 +4169,21 @@ async function handleNonStreamingResponse(
               },
             );
           } catch (err) {
+            nonStreamError = err instanceof Error ? err : new Error(String(err));
             console.error(
               "[cursor-provider] Non-stream message processing error:",
-              err instanceof Error ? err.message : err,
+              nonStreamError.message,
             );
+            debugLog("nonstream.process_error", {
+              requestId,
+              convKey,
+              message: nonStreamError.message,
+            });
+            clearInterval(heartbeatTimer);
+            if (bridge.alive) {
+              sendCancelAction(bridge);
+              bridge.end();
+            }
           }
         },
         (endStreamBytes) => {
@@ -4085,6 +4258,7 @@ async function handleNonStreamingResponse(
             payload.blobStore,
             completedTurns,
             currentTurn,
+            systemPromptFingerprint,
           );
           debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
         } else {

@@ -27,10 +27,12 @@ import {
   refreshCursorToken,
 } from "./auth.js";
 import {
+  cleanupSessionActiveBridge,
   cleanupSessionState,
   createCursorNativeStream,
   getCursorModels,
   getCursorParameterizedModels,
+  touchActiveBridgeForSession,
   type CursorModel,
   type CursorModelParameter,
   type CursorParameterizedModel,
@@ -1096,21 +1098,39 @@ async function getStartupCursorAccessToken(): Promise<
 }
 
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
-  const cleanupCurrentSession = (
-    _event: unknown,
+  const cleanupFullCurrentSession = (
+    event: { type?: string; reason?: string },
     ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } },
   ) => {
     debugExtensionLog("session.cleanup_hook", {
+      cleanupKind: "full",
+      eventType: event?.type,
+      reason: event?.reason,
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
     });
-    cleanupSessionState(ctx.sessionManager.getSessionId());
+    cleanupSessionState(ctx.sessionManager.getSessionId(), event?.reason ?? "session_shutdown", {
+      eventType: event?.type ?? "session_shutdown",
+    });
   };
 
-  pi.on("session_before_switch", cleanupCurrentSession);
-  pi.on("session_before_fork", cleanupCurrentSession);
-  pi.on("session_before_tree", cleanupCurrentSession);
-  pi.on("session_shutdown", cleanupCurrentSession);
+  const cleanupActiveBridgeForTreeNavigation = (
+    event: { type?: string },
+    ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } },
+  ) => {
+    debugExtensionLog("session.cleanup_hook", {
+      cleanupKind: "activeBridge",
+      eventType: event?.type,
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId?.(),
+    });
+    cleanupSessionActiveBridge(ctx.sessionManager.getSessionId(), "session_tree", {
+      eventType: event?.type ?? "session_tree",
+    });
+  };
+
+  pi.on("session_shutdown", cleanupFullCurrentSession);
+  pi.on("session_tree", cleanupActiveBridgeForTreeNavigation);
 }
 
 export function registerCursorModelSwitchCleanup(pi: ExtensionAPI) {
@@ -1126,14 +1146,47 @@ export function registerCursorModelSwitchCleanup(pi: ExtensionAPI) {
       if (nextProvider !== "cursor" && previousProvider !== "cursor") return;
 
       debugExtensionLog("model_select.cursor_boundary_cleanup", {
+        cleanupKind: "activeBridge",
         sessionId: ctx.sessionManager.getSessionId(),
         leafId: ctx.sessionManager.getLeafId?.(),
         previousProvider,
         nextProvider,
       });
-      cleanupSessionState(ctx.sessionManager.getSessionId());
+      cleanupSessionActiveBridge(
+        ctx.sessionManager.getSessionId(),
+        "model_select_cursor_boundary",
+        { eventType: "model_select", previousProvider, nextProvider },
+      );
     },
   );
+}
+
+export function registerCursorToolExecutionTtlRefresh(pi: ExtensionAPI) {
+  const refresh = (
+    event: { type?: string; toolCallId?: string; toolName?: string },
+    ctx: {
+      model?: { provider?: string };
+      sessionManager: { getSessionId(): string; getLeafId?: () => string };
+    },
+  ) => {
+    if (ctx.model?.provider !== "cursor") return;
+    const refreshed = touchActiveBridgeForSession(
+      ctx.sessionManager.getSessionId(),
+      event?.type ?? "tool_execution",
+    );
+    if (!refreshed) return;
+    debugExtensionLog("tool_execution.cursor_active_bridge_ttl_refreshed", {
+      eventType: event?.type,
+      toolCallId: event?.toolCallId,
+      toolName: event?.toolName,
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId?.(),
+    });
+  };
+
+  pi.on("tool_execution_start", refresh);
+  pi.on("tool_execution_update", refresh);
+  pi.on("tool_execution_end", refresh);
 }
 
 function registerCursorPayloadContextHook(pi: ExtensionAPI) {
@@ -1256,6 +1309,7 @@ export default async function (pi: ExtensionAPI) {
 
   registerSessionLifecycleCleanup(pi);
   registerCursorModelSwitchCleanup(pi);
+  registerCursorToolExecutionTtlRefresh(pi);
   registerCursorPayloadContextHook(pi);
   registerExtensionDebugHooks(pi);
   debugExtensionLog("extension.start", {

@@ -17,6 +17,7 @@ import {
   parseModelId,
   processModels,
   registerCursorModelSwitchCleanup,
+  registerCursorToolExecutionTtlRefresh,
   registerSessionLifecycleCleanup,
   supportsReasoningModelId,
 } from "./index.ts";
@@ -1420,7 +1421,7 @@ describe("session cleanup", () => {
 });
 
 describe("session cleanup hook wiring", () => {
-  test("registerSessionLifecycleCleanup wires switch/fork/tree/shutdown to cleanup current session", async () => {
+  test("registerSessionLifecycleCleanup ignores cancellable before-events, cleans active bridge on tree, and fully cleans on shutdown", async () => {
     const handlers = new Map<string, Function>();
     const pi = {
       on(event: string, handler: Function) {
@@ -1434,39 +1435,7 @@ describe("session cleanup hook wiring", () => {
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const heartbeatTimer = setInterval(() => {}, 60_000);
-    __testInternals.activeBridges.set(bridgeKey, {
-      bridge: {
-        get alive() {
-          return false;
-        },
-        write() {},
-        end() {},
-        onData() {},
-        onClose() {},
-        proc: {} as any,
-      } as any,
-      heartbeatTimer,
-      blobStore: new Map(),
-      mcpTools: [],
-      pendingExecs: [],
-      currentTurn: turn("current"),
-    });
-    __testInternals.conversationStates.set(convKey, {
-      conversationId: "conv",
-      checkpoint: null,
-
-      sessionScoped: true,
-      blobStore: new Map(),
-      lastAccessMs: Date.now(),
-    });
-
-    const ctx = { sessionManager: { getSessionId: () => sessionId } };
-    for (const event of [
-      "session_before_switch",
-      "session_before_fork",
-      "session_before_tree",
-      "session_shutdown",
-    ]) {
+    const seed = () => {
       __testInternals.activeBridges.set(bridgeKey, {
         bridge: {
           get alive() {
@@ -1487,20 +1456,37 @@ describe("session cleanup hook wiring", () => {
       __testInternals.conversationStates.set(convKey, {
         conversationId: "conv",
         checkpoint: null,
-
         sessionScoped: true,
         blobStore: new Map(),
         lastAccessMs: Date.now(),
       });
+    };
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId } };
+
+    for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"]) {
+      seed();
       await handlers.get(event)?.({}, ctx);
-      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
-      expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+      expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+      cleanupSessionState(sessionId);
     }
+
+    seed();
+    await handlers.get("session_tree")?.({}, ctx);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    cleanupSessionState(sessionId);
+
+    seed();
+    await handlers.get("session_shutdown")?.({}, ctx);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
   });
 });
 
 describe("model switch cleanup hook", () => {
-  test("cleans cursor session state when crossing the cursor provider boundary", async () => {
+  test("cleans only the active cursor bridge when crossing the cursor provider boundary", async () => {
     const handlers = new Map<string, Function>();
     const pi = {
       on(event: string, handler: Function) {
@@ -1511,11 +1497,31 @@ describe("model switch cleanup hook", () => {
     registerCursorModelSwitchCleanup(pi);
 
     const sessionId = "session-model-switch";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
     const convKey = deriveConversationKeyFromSessionId(sessionId);
-    const seedConversation = () => {
+    const checkpoint = new Uint8Array([1, 2, 3]);
+    const seedState = () => {
+      const heartbeatTimer = setInterval(() => {}, 60_000);
+      __testInternals.activeBridges.set(bridgeKey, {
+        bridge: {
+          get alive() {
+            return false;
+          },
+          write() {},
+          end() {},
+          onData() {},
+          onClose() {},
+          proc: {} as any,
+        } as any,
+        heartbeatTimer,
+        blobStore: new Map(),
+        mcpTools: [],
+        pendingExecs: [],
+        currentTurn: turn("current"),
+      });
       __testInternals.conversationStates.set(convKey, {
         conversationId: "conv-model-switch",
-        checkpoint: null,
+        checkpoint,
         sessionScoped: true,
         blobStore: new Map(),
         lastAccessMs: Date.now(),
@@ -1523,26 +1529,78 @@ describe("model switch cleanup hook", () => {
     };
     const ctx = { sessionManager: { getSessionId: () => sessionId } };
 
-    seedConversation();
+    seedState();
     await handlers.get("model_select")?.(
       { previousModel: { provider: "anthropic" }, model: { provider: "cursor" } },
       ctx,
     );
-    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(checkpoint);
+    cleanupSessionState(sessionId);
 
-    seedConversation();
+    seedState();
     await handlers.get("model_select")?.(
       { previousModel: { provider: "cursor" }, model: { provider: "openai" } },
       ctx,
     );
-    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(checkpoint);
+    cleanupSessionState(sessionId);
 
-    seedConversation();
+    seedState();
     await handlers.get("model_select")?.(
       { previousModel: { provider: "anthropic" }, model: { provider: "openai" } },
       ctx,
     );
-    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(checkpoint);
+  });
+});
+
+describe("tool execution TTL refresh hook", () => {
+  test("refreshes active cursor bridge TTL during tool execution events", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerCursorToolExecutionTtlRefresh(pi);
+
+    const sessionId = "session-tool-ttl";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const originalTimer = setTimeout(() => {}, 60_000);
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: {
+        get alive() {
+          return false;
+        },
+        write() {},
+        end() {},
+        onData() {},
+        onClose() {},
+        proc: {} as any,
+      } as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      toolTimeoutTimer: originalTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [],
+      currentTurn: turn("current"),
+    });
+
+    await handlers.get("tool_execution_update")?.(
+      { toolCallId: "tc", toolName: "bash" },
+      {
+        model: { provider: "cursor" },
+        sessionManager: { getSessionId: () => sessionId },
+      },
+    );
+
+    const active = __testInternals.activeBridges.get(bridgeKey);
+    expect(active?.toolTimeoutTimer).toBeDefined();
+    expect(active?.toolTimeoutTimer).not.toBe(originalTimer);
   });
 });
 
@@ -3532,6 +3590,7 @@ describe("proxy integration — session handling", () => {
       checkpoint: priorCheckpoint,
       checkpointTurnCount: priorTurns.length,
       checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(priorTurns),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
       sessionScoped: true,
       blobStore: new Map(priorPayload.blobStore),
       lastAccessMs: Date.now(),
@@ -3570,6 +3629,36 @@ describe("proxy integration — session handling", () => {
     );
   });
 
+  test("local stream processing errors prevent committing buffered checkpoints", async () => {
+    const sessionId = "session-stream-process-error";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const malformedServerMessage = new Uint8Array([10, 5, 1]);
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(makeCheckpointMessage());
+            (fake as any).emitChunk(frameConnectMessageForTest(malformedServerMessage));
+            fake.close(0);
+          }
+        }),
+    );
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "hello" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toBeNull();
+  });
+
   test("upstream non-stream errors preserve the last committed conversation checkpoint", async () => {
     const sessionId = "session-nonstream-error-preserve";
     const convKey = deriveConversationKeyFromSessionId(sessionId);
@@ -3592,6 +3681,7 @@ describe("proxy integration — session handling", () => {
       checkpoint: priorCheckpoint,
       checkpointTurnCount: priorTurns.length,
       checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(priorTurns),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
       sessionScoped: true,
       blobStore: new Map(priorPayload.blobStore),
       lastAccessMs: Date.now(),
@@ -4113,6 +4203,7 @@ describe("proxy integration — session handling", () => {
       checkpoint: priorCheckpoint,
       checkpointTurnCount: priorTurns.length,
       checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(priorTurns),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
       sessionScoped: true,
       blobStore: new Map(priorPayload.blobStore),
       lastAccessMs: Date.now(),
@@ -4228,6 +4319,7 @@ describe("proxy integration — session handling", () => {
       checkpoint: priorCheckpoint,
       checkpointTurnCount: storedTurns.length,
       checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(storedTurns),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
 
       sessionScoped: true,
       blobStore: new Map(),
@@ -4255,6 +4347,65 @@ describe("proxy integration — session handling", () => {
     ).not.toEqual(priorCheckpoint);
     expect(runRequests[0].conversationState.turns).toHaveLength(2);
     expect(runRequests[0].action.action.value.userMessage.text).toBe("now continue on cursor");
+  });
+
+  test("system prompt changes discard stale cursor checkpoint", async () => {
+    const runRequests: any[] = [];
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.close(0);
+          }
+        }),
+    );
+
+    const sessionId = "session-system-prompt-change";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const storedTurns = [turn("first", [assistantStep("done")])];
+    const priorPayload = buildCursorRequest(
+      "gpt-5",
+      "old system",
+      "next",
+      storedTurns,
+      "conv-system-prompt-change",
+      null,
+    );
+    const priorCheckpoint = toBinary(
+      ConversationStateStructureSchema,
+      decodeRunRequest(priorPayload).conversationState,
+    );
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-system-prompt-change",
+      checkpoint: priorCheckpoint,
+      checkpointTurnCount: storedTurns.length,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(storedTurns),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("old system"),
+      sessionScoped: true,
+      blobStore: new Map(priorPayload.blobStore),
+      lastAccessMs: Date.now(),
+    });
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "new system" },
+        { role: "user", content: "first" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "next" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+    expect(
+      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
+    ).not.toEqual(priorCheckpoint);
+    expect(runRequests[0].conversationState.turns).toHaveLength(1);
   });
 
   test("same-depth branch with different assistant text discards stale checkpoint", async () => {
@@ -4289,6 +4440,7 @@ describe("proxy integration — session handling", () => {
       checkpoint: toBinary(ConversationStateStructureSchema, priorRequest.conversationState),
       checkpointTurnCount: storedTurns.length,
       checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(storedTurns),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
 
       sessionScoped: true,
       blobStore: new Map(),
