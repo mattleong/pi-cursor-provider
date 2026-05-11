@@ -314,11 +314,16 @@ const configuredActiveBridgeTtlMs = Number(
 const ACTIVE_BRIDGE_TTL_MS = Number.isFinite(configuredActiveBridgeTtlMs)
   ? Math.max(1_000, configuredActiveBridgeTtlMs)
   : DEFAULT_ACTIVE_BRIDGE_TTL_MS;
-const DEFAULT_INLINE_HISTORY_MAX_CHARS = 32_000;
-const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = 4_000;
+const DEFAULT_INLINE_HISTORY_MAX_CHARS = Number.POSITIVE_INFINITY;
+const DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS = Number.POSITIVE_INFINITY;
+const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = Number.POSITIVE_INFINITY;
 const INLINE_HISTORY_MAX_CHARS = readNonNegativeIntegerEnv(
   "PI_CURSOR_INLINE_HISTORY_MAX_CHARS",
   DEFAULT_INLINE_HISTORY_MAX_CHARS,
+);
+const INLINE_HISTORY_HEAD_MAX_CHARS = readNonNegativeIntegerEnv(
+  "PI_CURSOR_INLINE_HISTORY_HEAD_MAX_CHARS",
+  DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS,
 );
 const INLINE_HISTORY_SEGMENT_MAX_CHARS = readNonNegativeIntegerEnv(
   "PI_CURSOR_INLINE_HISTORY_SEGMENT_MAX_CHARS",
@@ -330,8 +335,11 @@ let debugRequestCounter = 0;
 let debugLogFilePath: string | undefined;
 
 function readNonNegativeIntegerEnv(name: string, fallback: number): number {
-  const raw = process.env[name]?.trim();
+  const raw = process.env[name]?.trim().toLowerCase();
   if (!raw) return fallback;
+  if (["full", "infinite", "infinity", "unbounded"].includes(raw)) {
+    return Number.POSITIVE_INFINITY;
+  }
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
 }
@@ -1278,6 +1286,16 @@ function lostToolContinuationMessage(): string {
   return "Cursor tool continuation was lost because the live upstream bridge is no longer available. Retry from before the tool call or start a new turn.";
 }
 
+function estimateInlineHistoryPromptTokens(body: ChatCompletionRequest): number {
+  try {
+    const parsed = parseMessages(body.messages, body.cursor_tool_result_images, false);
+    const historyPrompt = inlineHistoryPrompt(parsed.turns, parsed.userText);
+    return historyPrompt ? estimateTextTokens(historyPrompt) : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export function createCursorNativeStream(
   config: CursorNativeStreamConfig,
 ): (
@@ -1287,18 +1305,18 @@ export function createCursorNativeStream(
 ) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
-    const initialContextTokens = estimateInFlightContextTokens(context);
+    let body = contextToCursorChatCompletionRequest(
+      model,
+      context,
+      options as CursorNativeStreamOptions | undefined,
+      config,
+    );
+    const initialContextTokens =
+      estimateInFlightContextTokens(context) + estimateInlineHistoryPromptTokens(body);
     const writer = createNativeStreamWriter(stream, model, initialContextTokens);
     writer.start();
 
     (async () => {
-      let body = contextToCursorChatCompletionRequest(
-        model,
-        context,
-        options as CursorNativeStreamOptions | undefined,
-        config,
-      );
-
       if (options?.onPayload) {
         const replacement = await options.onPayload(body, model);
         if (replacement && typeof replacement === "object")
@@ -2837,12 +2855,13 @@ function stripTurnRuntimeState(
 export function parseMessages(
   messages: OpenAIMessage[],
   toolResultImagePayloads?: CursorToolResultImagePayload[],
+  debug = true,
 ): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const turns: ParsedTurn[] = [];
   const toolResultImagesById = parseToolResultImagePayloads(toolResultImagePayloads);
 
-  debugLog("parse_messages.start", { messages });
+  if (debug) debugLog("parse_messages.start", { messages });
 
   const systemParts = messages
     .filter((m) => m.role === "system")
@@ -2879,10 +2898,18 @@ export function parseMessages(
     }
 
     if (msg.role === "user") {
-      finalizeCurrentTurn();
+      const text = textContent(msg.content);
       const userImages = imageContent(msg.content, { enforceCursorCliLimits: true });
+      if (currentTurn && currentTurn.steps.length === 0) {
+        currentTurn.userText = [currentTurn.userText, text].filter(Boolean).join("\n\n");
+        if (userImages.length > 0) {
+          currentTurn.userImages = [...(currentTurn.userImages ?? []), ...userImages];
+        }
+        continue;
+      }
+      finalizeCurrentTurn();
       currentTurn = {
-        userText: textContent(msg.content),
+        userText: text,
         steps: [],
         ...(userImages.length > 0 ? { userImages } : {}),
         toolCallById: new Map(),
@@ -2967,7 +2994,7 @@ export function parseMessages(
   }
 
   const parsed = { systemPrompt, userText, userImages, turns, toolResults };
-  debugLog("parse_messages.end", parsed);
+  if (debug) debugLog("parse_messages.end", parsed);
   return parsed;
 }
 
@@ -3132,7 +3159,149 @@ function transcriptStepText(step: ParsedTurnStep): string {
   return `Tool call: ${step.toolName || "tool"}${args}${result}`;
 }
 
-function inlineHistoryPrompt(turns: ParsedTurn[]): string | undefined {
+function truncateInlineHistoryBlock(block: string, maxChars: number): string {
+  if (block.length <= maxChars) return block;
+  return `${block.slice(0, maxChars)}\n[truncated ${block.length - maxChars} chars]`;
+}
+
+function inlineHistorySearchTerms(currentUserText: string): Set<string> {
+  const terms = new Set<string>();
+  for (const match of currentUserText.matchAll(/[A-Za-z0-9_./@-]{4,}/g)) {
+    const term = match[0]!.toLowerCase();
+    if (
+      [
+        "what",
+        "when",
+        "where",
+        "which",
+        "continue",
+        "context",
+        "terms",
+        "turns",
+        "request",
+        "first",
+        "last",
+        "previous",
+      ].includes(term)
+    )
+      continue;
+    terms.add(term);
+  }
+  return terms;
+}
+
+function scoreInlineHistoryBlock(block: string, terms: Set<string>): number {
+  if (terms.size === 0) return 0;
+  const lower = block.toLowerCase();
+  let score = 0;
+  for (const term of terms) {
+    if (lower.includes(term)) score += term.includes("/") || term.includes(".") ? 3 : 1;
+  }
+  return score;
+}
+
+function inlineHistoryTurnPreview(block: string, index: number): string {
+  const userLine = block.split("\n").find((line) => line.startsWith("User: ")) ?? "User: [no text]";
+  return `Turn ${index + 1} preview: ${truncateInlineHistoryBlock(userLine, 240)}`;
+}
+
+function compressedInlineHistoryNotice(
+  turnBlocks: string[],
+  startIndex: number,
+  endIndex: number,
+): string {
+  const count = endIndex - startIndex + 1;
+  const previews: string[] = [];
+  let previewChars = 0;
+  for (let index = startIndex; index <= endIndex; index += 1) {
+    const preview = inlineHistoryTurnPreview(turnBlocks[index]!, index);
+    const nextLength = previewChars + (previews.length > 0 ? 1 : 0) + preview.length;
+    if (nextLength > 6_000) {
+      previews.push(`[${endIndex - index + 1} more compressed turn preview(s) omitted]`);
+      break;
+    }
+    previews.push(preview);
+    previewChars = nextLength;
+  }
+  return `[${count} turn(s) compressed to previews]\n${previews.join("\n")}`;
+}
+
+function selectedInlineHistoryBlocks(turnBlocks: string[], currentUserText: string): string[] {
+  const selected = new Map<number, string>();
+  let selectedLength = 0;
+  const addBlock = (index: number, block: string, maxChars: number): boolean => {
+    if (selected.has(index) || maxChars <= 0) return false;
+    const value = truncateInlineHistoryBlock(block, maxChars);
+    const separatorLength = selected.size > 0 ? 2 : 0;
+    if (selectedLength + separatorLength + value.length > INLINE_HISTORY_MAX_CHARS) return false;
+    selected.set(index, value);
+    selectedLength += separatorLength + value.length;
+    return true;
+  };
+
+  const headBudget = Number.isFinite(INLINE_HISTORY_MAX_CHARS)
+    ? Math.min(INLINE_HISTORY_HEAD_MAX_CHARS, Math.floor(INLINE_HISTORY_MAX_CHARS / 2))
+    : INLINE_HISTORY_HEAD_MAX_CHARS;
+  let headLength = 0;
+  if (headBudget > 0 && turnBlocks.length > 1) {
+    for (let index = 0; index < turnBlocks.length; index += 1) {
+      const block = turnBlocks[index]!;
+      const separatorLength = headLength > 0 ? 2 : 0;
+      const remainingHeadBudget = headBudget - headLength - separatorLength;
+      if (remainingHeadBudget <= 0) break;
+      const value = truncateInlineHistoryBlock(block, remainingHeadBudget);
+      if (!addBlock(index, value, remainingHeadBudget)) break;
+      headLength += separatorLength + value.length;
+      if (value.length < block.length) break;
+    }
+  }
+
+  const terms = inlineHistorySearchTerms(currentUserText);
+  const scored = turnBlocks
+    .map((block, index) => ({ index, score: scoreInlineHistoryBlock(block, terms) }))
+    .filter((item) => item.score > 0 && !selected.has(item.index))
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+  for (const { index } of scored) {
+    const remainingBudget = INLINE_HISTORY_MAX_CHARS - selectedLength - (selected.size > 0 ? 2 : 0);
+    if (remainingBudget <= 0) break;
+    addBlock(
+      index,
+      turnBlocks[index]!,
+      Math.min(INLINE_HISTORY_SEGMENT_MAX_CHARS, remainingBudget),
+    );
+  }
+
+  for (let index = turnBlocks.length - 1; index >= 0; index -= 1) {
+    const remainingBudget = INLINE_HISTORY_MAX_CHARS - selectedLength - (selected.size > 0 ? 2 : 0);
+    if (remainingBudget <= 0) break;
+    addBlock(index, turnBlocks[index]!, remainingBudget);
+  }
+
+  if (selected.size === 0) {
+    addBlock(turnBlocks.length - 1, turnBlocks.at(-1)!, INLINE_HISTORY_MAX_CHARS);
+  }
+
+  const sorted = [...selected.entries()].sort(([a], [b]) => a - b);
+  const bodyBlocks: string[] = [];
+  let previousIndex = -1;
+  for (const [index, block] of sorted) {
+    const omitted = index - previousIndex - 1;
+    if (omitted > 0) {
+      bodyBlocks.push(compressedInlineHistoryNotice(turnBlocks, previousIndex + 1, index - 1));
+    }
+    bodyBlocks.push(block);
+    previousIndex = index;
+  }
+  const trailingOmitted = turnBlocks.length - previousIndex - 1;
+  if (trailingOmitted > 0) {
+    bodyBlocks.push(
+      compressedInlineHistoryNotice(turnBlocks, previousIndex + 1, turnBlocks.length - 1),
+    );
+  }
+  return bodyBlocks;
+}
+
+function inlineHistoryPrompt(turns: ParsedTurn[], currentUserText: string): string | undefined {
   if (turns.length === 0 || INLINE_HISTORY_MAX_CHARS === 0) return undefined;
   const turnBlocks = turns.map((turn, index) => {
     const lines = [
@@ -3143,54 +3312,26 @@ function inlineHistoryPrompt(turns: ParsedTurn[]): string | undefined {
     return lines.join("\n");
   });
 
-  const selectedBlocks: string[] = [];
-  let selectedLength = 0;
-  for (let index = turnBlocks.length - 1; index >= 0; index -= 1) {
-    const block = turnBlocks[index]!;
-    const separatorLength = selectedBlocks.length > 0 ? 2 : 0;
-    if (selectedLength + separatorLength + block.length > INLINE_HISTORY_MAX_CHARS) break;
-    selectedBlocks.unshift(block);
-    selectedLength += separatorLength + block.length;
-  }
-
-  if (selectedBlocks.length === 0) {
-    const lastBlock = turnBlocks.at(-1)!;
-    selectedBlocks.push(
-      lastBlock.length > INLINE_HISTORY_MAX_CHARS
-        ? `${lastBlock.slice(0, INLINE_HISTORY_MAX_CHARS)}\n[truncated ${lastBlock.length - INLINE_HISTORY_MAX_CHARS} chars]`
-        : lastBlock,
-    );
-  }
-
-  const omittedTurnCount = turns.length - selectedBlocks.length;
-  const omittedNotice =
-    omittedTurnCount > 0 ? `[${omittedTurnCount} older turn(s) omitted]\n\n` : "";
-  const body = `${omittedNotice}${selectedBlocks.join("\n\n")}`;
+  const body = selectedInlineHistoryBlocks(turnBlocks, currentUserText).join("\n\n");
   return `Prior Pi conversation context follows. Use this transcript to resolve references in the current user message; the current user message is separate and comes after this context.\n\n<pi_conversation_history>\n${body}\n</pi_conversation_history>`;
 }
 
 function rootPromptBlobIdsForRequest(
   systemPrompt: string,
-  turns: ParsedTurn[],
-  checkpoint: Uint8Array | null,
   blobStore: Map<string, Uint8Array>,
 ): Uint8Array[] {
   const systemBytes = new TextEncoder().encode(
     JSON.stringify({ role: "system", content: systemPrompt }),
   );
-  const rootPromptBlobIds = [storeAsBlob(systemBytes, blobStore)];
-  if (!checkpoint) {
-    const historyPrompt = inlineHistoryPrompt(turns);
-    if (historyPrompt) {
-      rootPromptBlobIds.push(
-        storeAsBlob(
-          new TextEncoder().encode(JSON.stringify({ role: "user", content: historyPrompt })),
-          blobStore,
-        ),
-      );
-    }
-  }
-  return rootPromptBlobIds;
+  return [storeAsBlob(systemBytes, blobStore)];
+}
+
+function userTextWithInlineHistory(userText: string, historyPrompt: string | undefined): string {
+  if (!historyPrompt) return userText;
+  const currentUserText = userText.trim()
+    ? userText
+    : "[The current user message has no text. Use any attached images as the current request.]";
+  return `${historyPrompt}\n\nCurrent user message:\n<current_user_message>\n${currentUserText}\n</current_user_message>`;
 }
 
 function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
@@ -3263,7 +3404,8 @@ export function buildCursorRequest(
     workspaceContext,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
-  const rootPromptBlobIds = rootPromptBlobIdsForRequest(systemPrompt, turns, checkpoint, blobStore);
+  const historyPrompt = inlineHistoryPrompt(turns, userText);
+  const rootPromptBlobIds = rootPromptBlobIdsForRequest(systemPrompt, blobStore);
   const selectedCtxBlob = storeAsBlob(buildSelectedContextBlob(rootPromptBlobIds, "pi"), blobStore);
 
   let conversationState;
@@ -3307,7 +3449,11 @@ export function buildCursorRequest(
     });
   }
 
-  const userMessage = createUserMessage(userText, selectedCtxBlob, userImages);
+  const userMessage = createUserMessage(
+    userTextWithInlineHistory(userText, historyPrompt),
+    selectedCtxBlob,
+    userImages,
+  );
   const action = create(ConversationActionSchema, {
     action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) },
   });

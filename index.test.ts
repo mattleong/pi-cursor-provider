@@ -2016,8 +2016,10 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect((decoded[1].steps[0].message.value as any).text).toBe("second answer");
 
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("third question");
-    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
+    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
+    expect(userAction.userMessage.text).toContain("first question");
+    expect(userAction.userMessage.text).toContain("second answer");
+    expect(userAction.userMessage.text).toContain("<current_user_message>\nthird question");
   });
 
   test("no checkpoint, reconstructs tool-call steps and final assistant text", () => {
@@ -2058,7 +2060,10 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect((finalAssistantStep.message.value as any).text).toBe("I found the issue.");
 
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("fix it");
+    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
+    expect(userAction.userMessage.text).toContain("inspect file");
+    expect(userAction.userMessage.text).toContain("file contents");
+    expect(userAction.userMessage.text).toContain("<current_user_message>\nfix it");
   });
 
   test("no checkpoint, reconstructs tool-call image result content", () => {
@@ -2124,26 +2129,61 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(blobData.content).toBe("You are helpful");
   });
 
-  test("inline history root prompt is not attached to every reconstructed turn", () => {
+  test("inline history is placed in current user message, not every reconstructed turn", () => {
     const turns = [turn("first", [assistantStep("done")]), turn("second", [assistantStep("ok")])];
     const payload = buildCursorRequest("gpt-5", "system", "continue", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
 
-    expect(req.conversationState.rootPromptMessagesJson).toHaveLength(2);
-    const historyBlobId = Buffer.from(req.conversationState.rootPromptMessagesJson[1]).toString(
-      "hex",
-    );
-    const historyBlob = JSON.parse(new TextDecoder().decode(payload.blobStore.get(historyBlobId)!));
-    expect(historyBlob.content).toContain("<pi_conversation_history>");
-    expect(historyBlob.content).toContain("first");
-    expect(historyBlob.content).toContain("second");
+    expect(req.conversationState.rootPromptMessagesJson).toHaveLength(1);
 
     const decoded = decodeTurns(req.conversationState, payload.blobStore);
     expect(decoded[0].userMsg.selectedContextBlob).toHaveLength(0);
     expect(decoded[1].userMsg.selectedContextBlob).toHaveLength(0);
     const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
+    expect(userAction.userMessage.text).toContain("first");
+    expect(userAction.userMessage.text).toContain("second");
     expect(userAction.userMessage.selectedContextBlob).toBeInstanceOf(Uint8Array);
     expect(userAction.userMessage.selectedContextBlob.length).toBeGreaterThan(0);
+  });
+
+  test("inline history remains visible when using a checkpoint conversation state", () => {
+    const checkpointPayload = buildCursorRequest("gpt-5", "system", "old", [], "conv-1", null);
+    const checkpoint = toBinary(
+      ConversationStateStructureSchema,
+      decodeRunRequest(checkpointPayload).conversationState,
+    );
+    const turns = [turn("remember pineapple", [assistantStep("I will remember")])];
+    const payload = buildCursorRequest("gpt-5", "system", "continue", turns, "conv-1", checkpoint);
+    const req = decodeRunRequest(payload);
+
+    expect(req.conversationState.turns).toHaveLength(0);
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
+    expect(userAction.userMessage.text).toContain("remember pineapple");
+    expect(userAction.userMessage.text).toContain("I will remember");
+    expect(userAction.userMessage.text).toContain("<current_user_message>\ncontinue");
+  });
+
+  test("inline history includes all Pi turns by default", () => {
+    const turns = [
+      turn("SESSION PIN: remember pineapple", [assistantStep("acknowledged head context")]),
+      ...Array.from({ length: 12 }, (_, index) =>
+        turn(`middle-${index} ${"x".repeat(5_000)}`, [
+          assistantStep(`middle reply ${index} ${"y".repeat(5_000)}`),
+        ]),
+      ),
+      turn("recent issue context", [assistantStep("recent answer")]),
+    ];
+    const payload = buildCursorRequest("gpt-5", "system", "continue", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+    const userAction = req.action.action.value as any;
+
+    expect(userAction.userMessage.text).toContain("SESSION PIN: remember pineapple");
+    expect(userAction.userMessage.text).toContain("middle-5");
+    expect(userAction.userMessage.text).toContain("recent issue context");
+    expect(userAction.userMessage.text).not.toContain("turn(s) compressed to previews");
+    expect(userAction.userMessage.text).not.toContain("turn(s) omitted");
   });
 
   test("each reconstructed turn has a unique messageId", () => {
@@ -2169,8 +2209,10 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     expect((decoded[0].steps[0].message.value as any).text).toBe("response1");
 
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("forked question");
-    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
+    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
+    expect(userAction.userMessage.text).toContain("first");
+    expect(userAction.userMessage.text).toContain("response1");
+    expect(userAction.userMessage.text).toContain("<current_user_message>\nforked question");
   });
 
   test("fork to beginning — no turns, no reconstruction", () => {
@@ -2213,6 +2255,23 @@ describe("parseMessages — structured tool turns", () => {
     ]);
 
     expect(parsed.userText).toBe("");
+    expect(parsed.userImages).toHaveLength(1);
+    expect(parsed.userImages[0].mimeType).toBe("image/png");
+  });
+
+  test("merges consecutive user messages into the current request", () => {
+    const parsed = parseMessages([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64()}` } },
+        ],
+      },
+      { role: "user", content: "what is in this screenshot?" },
+    ]);
+
+    expect(parsed.turns).toHaveLength(0);
+    expect(parsed.userText).toBe("what is in this screenshot?");
     expect(parsed.userImages).toHaveLength(1);
     expect(parsed.userImages[0].mimeType).toBe("image/png");
   });
@@ -2886,21 +2945,11 @@ describe("native streamSimple provider", () => {
       expect(runRequests).toHaveLength(1);
       expect(runRequests[0].conversationId).not.toBe("conv-rebuild");
       expect(runRequests[0].conversationState.turns).toHaveLength(1);
-      expect(runRequests[0].conversationState.rootPromptMessagesJson).toHaveLength(2);
-      const rootPromptMessages = runRequests[0].conversationState.rootPromptMessagesJson.map(
-        (blobId: Uint8Array) =>
-          JSON.parse(
-            new TextDecoder().decode(
-              __testInternals.conversationStates
-                .get(convKey)!
-                .blobStore.get(Buffer.from(blobId).toString("hex"))!,
-            ),
-          ),
-      );
-      expect(rootPromptMessages[1].content).toContain("remember pineapple");
-      expect(rootPromptMessages[1].content).toContain("I will remember");
-      expect(runRequests[0].action.action.value.userMessage.text).toBe(
-        "what did I ask you to remember?",
+      expect(runRequests[0].conversationState.rootPromptMessagesJson).toHaveLength(1);
+      expect(runRequests[0].action.action.value.userMessage.text).toContain("remember pineapple");
+      expect(runRequests[0].action.action.value.userMessage.text).toContain("I will remember");
+      expect(runRequests[0].action.action.value.userMessage.text).toContain(
+        "<current_user_message>\nwhat did I ask you to remember?",
       );
     } finally {
       if (previousCheckpointSetting === undefined) delete process.env.PI_CURSOR_REUSE_CHECKPOINTS;
@@ -4248,8 +4297,9 @@ describe("proxy integration — session handling", () => {
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
     expect(runRequests[0].conversationId).not.toBe("conv-interrupt-after-checkpoint");
-    expect(runRequests[0].conversationState.turns).toHaveLength(1);
-    expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
+    expect(runRequests[0].conversationState.turns).toHaveLength(0);
+    expect(runRequests[0].action.action.value.userMessage.text).toContain("interrupt me");
+    expect(runRequests[0].action.action.value.userMessage.text).toContain("continue");
   });
 
   test("interrupt after checkpoint reconstructs resumed history with partial assistant text", async () => {
@@ -4339,7 +4389,9 @@ describe("proxy integration — session handling", () => {
     expect(runRequests).toHaveLength(1);
     expect(runRequests[0].conversationId).not.toBe("conv-partial-assistant");
     expect(runRequests[0].conversationState.turns).toHaveLength(1);
-    expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
+    expect(runRequests[0].action.action.value.userMessage.text).toContain(
+      "<current_user_message>\ncontinue",
+    );
   });
 
   test("interrupt before any new checkpoint discards prior checkpoint when resumed history includes the interrupted turn", async () => {
@@ -4444,8 +4496,9 @@ describe("proxy integration — session handling", () => {
     expect(
       toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
     ).not.toEqual(priorCheckpoint);
-    expect(runRequests[0].conversationState.turns).toHaveLength(2);
-    expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
+    expect(runRequests[0].conversationState.turns).toHaveLength(1);
+    expect(runRequests[0].action.action.value.userMessage.text).toContain("interrupt me");
+    expect(runRequests[0].action.action.value.userMessage.text).toContain("continue");
   });
 
   test("provider switch history growth discards prior cursor checkpoint and reconstructs transcript", async () => {
@@ -4508,7 +4561,9 @@ describe("proxy integration — session handling", () => {
       toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
     ).not.toEqual(priorCheckpoint);
     expect(runRequests[0].conversationState.turns).toHaveLength(2);
-    expect(runRequests[0].action.action.value.userMessage.text).toBe("now continue on cursor");
+    expect(runRequests[0].action.action.value.userMessage.text).toContain(
+      "<current_user_message>\nnow continue on cursor",
+    );
   });
 
   test("system prompt changes discard stale cursor checkpoint", async () => {
