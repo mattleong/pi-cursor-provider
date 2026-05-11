@@ -116,6 +116,19 @@ import {
   type CursorModelParameter,
   type CursorParameterizedModel,
 } from "./cursor-wire.js";
+import {
+  isCursorProviderDebugEnabled,
+  summarizeBase64ImageData,
+  summarizeByteData,
+  truncateDebugString,
+} from "./debug.js";
+import {
+  applyCursorModelRouting,
+  resolveCursorModelRouting,
+  type CursorModelRouting,
+  type CursorModelRoutingByEffort,
+  type CursorToolResultImagePayload,
+} from "./cursor-routing.js";
 export type {
   CursorModelParameter,
   CursorParameterizedModel,
@@ -165,11 +178,6 @@ interface OpenAIToolDef {
     description?: string;
     parameters?: Record<string, unknown>;
   };
-}
-
-interface CursorToolResultImagePayload {
-  toolCallId: string;
-  images: Array<{ data: string; mimeType: string }>;
 }
 
 interface ChatCompletionRequest {
@@ -312,36 +320,7 @@ let debugRequestCounter = 0;
 let debugLogFilePath: string | undefined;
 
 function isProxyDebugEnabled(): boolean {
-  const raw = process.env.PI_CURSOR_PROVIDER_DEBUG?.trim().toLowerCase();
-  return !!raw && raw !== "0" && raw !== "false" && raw !== "off";
-}
-
-function truncateDebugString(value: string, max = 4000): string {
-  return value.length > max
-    ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>`
-    : value;
-}
-
-function debugByteSummary(bytes: Uint8Array): { byteLength: number; sha256: string } {
-  return {
-    byteLength: bytes.length,
-    sha256: createHash("sha256").update(bytes).digest("hex").slice(0, 16),
-  };
-}
-
-function debugBase64ImageSummary(data: string): {
-  base64Length: number;
-  byteLength?: number;
-  sha256?: string;
-} {
-  const summary: { base64Length: number; byteLength?: number; sha256?: string } = {
-    base64Length: data.length,
-  };
-  try {
-    const bytes = Buffer.from(data.replace(/\s/g, ""), "base64");
-    if (bytes.length > 0) Object.assign(summary, debugByteSummary(new Uint8Array(bytes)));
-  } catch {}
-  return summary;
+  return isCursorProviderDebugEnabled();
 }
 
 function summarizeDebugImageUrl(url: string): unknown {
@@ -350,7 +329,7 @@ function summarizeDebugImageUrl(url: string): unknown {
   if (match) {
     return {
       mimeType: normalizeImageMimeType(match[1]!),
-      ...debugBase64ImageSummary(match[2]!),
+      ...summarizeBase64ImageData(match[2]!),
     };
   }
   return {
@@ -373,11 +352,11 @@ function summarizeDebugImageObject(value: Record<string, unknown>): unknown | un
   if (!mimeType?.startsWith("image/")) return undefined;
   const data = value.data;
   if (typeof data === "string") {
-    return { type: value.type, mimeType, ...debugBase64ImageSummary(data) };
+    return { type: value.type, mimeType, ...summarizeBase64ImageData(data) };
   }
   if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    return { type: value.type, mimeType, ...debugByteSummary(bytes) };
+    return { type: value.type, mimeType, ...summarizeByteData(bytes) };
   }
   return undefined;
 }
@@ -390,7 +369,7 @@ function sanitizeForDebug(value: unknown): unknown {
     const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
     return {
       __type: value instanceof Uint8Array ? "Uint8Array" : "Buffer",
-      ...debugByteSummary(bytes),
+      ...summarizeByteData(bytes),
     };
   }
   if (Array.isArray(value)) return value.map((item) => sanitizeForDebug(item));
@@ -820,17 +799,12 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 // ── Native pi streamSimple provider ──
 
-export interface CursorNativeModelRouting {
-  modelId: string;
-  parameters?: CursorModelParameter[];
-  requiresMaxMode?: boolean;
-  requestedMaxMode?: boolean;
-}
+export type CursorNativeModelRouting = CursorModelRouting;
 
 export interface CursorNativeStreamConfig {
   getAccessToken(): Promise<string>;
   getNoReasoningEffortByModelId?(): Map<string, string>;
-  getRawModelRoutingByModelId?(): Map<string, Record<string, CursorNativeModelRouting>>;
+  getRawModelRoutingByModelId?(): Map<string, CursorModelRoutingByEffort>;
 }
 
 type CursorNativeStreamOptions = SimpleStreamOptions & {
@@ -1112,17 +1086,14 @@ function resolveNativeReasoningEffort(
 
 function applyNativeCursorRouting(
   body: ChatCompletionRequest,
-  rawRoutingByModelId?: Map<string, Record<string, CursorNativeModelRouting>>,
+  rawRoutingByModelId?: Map<string, CursorModelRoutingByEffort>,
 ): void {
-  const routes = rawRoutingByModelId?.get(body.model);
-  const effort = body.reasoning_effort ?? "";
-  const routing = routes?.[effort] ?? routes?.[""];
-  if (!routing) return;
-  body.cursor_model_id = routing.modelId;
-  if (routing.parameters?.length) body.cursor_model_parameters = routing.parameters;
-  if (routing.requiresMaxMode) body.cursor_requires_max_mode = true;
-  if (typeof routing.requestedMaxMode === "boolean")
-    body.cursor_model_max_mode = routing.requestedMaxMode;
+  const payload = body as unknown as Record<string, unknown>;
+  const directRouting = rawRoutingByModelId
+    ? resolveCursorModelRouting(payload, rawRoutingByModelId)
+    : undefined;
+  const fallbackRouting = rawRoutingByModelId?.get(body.model)?.[""];
+  applyCursorModelRouting(payload, directRouting ?? fallbackRouting);
 }
 
 function contextToCursorChatCompletionRequest(
@@ -1185,6 +1156,38 @@ function nativeRequestParameterError(body: ChatCompletionRequest): string | unde
   if (body.temperature !== undefined)
     return "Unsupported Cursor provider parameter(s): temperature";
   return undefined;
+}
+
+interface PreparedCursorRequestContext {
+  systemPromptFingerprint: string;
+  modelId: string;
+  maxMode: boolean;
+  sessionId: string | undefined;
+  bridgeKey: string;
+  convKey: string;
+  workspaceContext: CursorWorkspaceContext;
+  activeBridge: ActiveBridge | undefined;
+}
+
+function prepareCursorRequestContext(
+  body: ChatCompletionRequest,
+  parsedMessages: Pick<ParsedMessages, "systemPrompt">,
+): PreparedCursorRequestContext {
+  const sessionId = derivePiSessionId(body);
+  const bridgeKey = deriveBridgeKey(body.messages, sessionId);
+  return {
+    systemPromptFingerprint: fingerprintSystemPrompt(parsedMessages.systemPrompt),
+    modelId: resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id),
+    maxMode:
+      typeof body.cursor_model_max_mode === "boolean"
+        ? body.cursor_model_max_mode
+        : body.cursor_requires_max_mode === true,
+    sessionId,
+    bridgeKey,
+    convKey: deriveConversationKey(body.messages, sessionId),
+    workspaceContext: createWorkspaceContext(body.cursor_workspace_path),
+    activeBridge: activeBridges.get(bridgeKey),
+  };
 }
 
 function lostToolContinuationMessage(): string {
@@ -1268,17 +1271,16 @@ async function handleCursorNativeRequest(
   }
 
   const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
-  const systemPromptFingerprint = fingerprintSystemPrompt(systemPrompt);
-  const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
-  const maxMode =
-    typeof body.cursor_model_max_mode === "boolean"
-      ? body.cursor_model_max_mode
-      : body.cursor_requires_max_mode === true;
-  const sessionId = derivePiSessionId(body);
-  const bridgeKey = deriveBridgeKey(body.messages, sessionId);
-  const convKey = deriveConversationKey(body.messages, sessionId);
-  const workspaceContext = createWorkspaceContext(body.cursor_workspace_path);
-  const activeBridge = activeBridges.get(bridgeKey);
+  const {
+    systemPromptFingerprint,
+    modelId,
+    maxMode,
+    sessionId,
+    bridgeKey,
+    convKey,
+    workspaceContext,
+    activeBridge,
+  } = prepareCursorRequestContext(body, parsedMessages);
 
   if (options?.signal?.aborted) {
     debugLog("native.request.aborted_before_dispatch", {
@@ -1427,6 +1429,103 @@ async function handleCursorNativeRequest(
   );
 }
 
+function createStreamState(): StreamState {
+  return {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+  };
+}
+
+function emitFilteredStreamText(
+  tagFilter: ReturnType<typeof createThinkingTagFilter>,
+  currentTurn: ParsedTurn,
+  text: string,
+  isThinking: boolean | undefined,
+  emitThinking: (text: string) => void,
+  emitText: (text: string) => void,
+): void {
+  if (isThinking) {
+    emitThinking(text);
+    return;
+  }
+  const { content, reasoning } = tagFilter.process(text);
+  if (reasoning) emitThinking(reasoning);
+  if (content) {
+    appendAssistantTextToTurn(currentTurn, content);
+    emitText(content);
+  }
+}
+
+function flushFilteredStreamText(
+  tagFilter: ReturnType<typeof createThinkingTagFilter>,
+  currentTurn: ParsedTurn,
+  emitThinking: (text: string) => void,
+  emitText: (text: string) => void,
+): void {
+  const flushed = tagFilter.flush();
+  if (flushed.reasoning) emitThinking(flushed.reasoning);
+  if (flushed.content) {
+    appendAssistantTextToTurn(currentTurn, flushed.content);
+    emitText(flushed.content);
+  }
+}
+
+function rememberToolCallPause(
+  bridgeKey: string,
+  bridge: BridgeHandle,
+  heartbeatTimer: ReturnType<typeof setInterval>,
+  blobStore: Map<string, Uint8Array>,
+  mcpTools: McpToolDefinition[],
+  state: StreamState,
+  currentTurn: ParsedTurn,
+  convKey: string,
+  workspaceContext: CursorWorkspaceContext,
+  exec: PendingExec,
+): void {
+  state.pendingExecs.push(exec);
+  currentTurn.steps.push({
+    kind: "toolCall",
+    toolCallId: exec.toolCallId,
+    toolName: exec.toolName,
+    arguments: parseToolCallArguments(exec.decodedArgs),
+  });
+  setActiveBridge(bridgeKey, {
+    bridge,
+    heartbeatTimer,
+    blobStore,
+    mcpTools,
+    pendingExecs: state.pendingExecs,
+    currentTurn,
+    convKey,
+    workspaceContext,
+  });
+}
+
+function commitOrMergeStoredCheckpoint(
+  stored: StoredConversation | undefined,
+  latestCheckpoint: Uint8Array | null,
+  blobStore: Map<string, Uint8Array>,
+  completedTurns: ParsedTurn[],
+  currentTurn: ParsedTurn,
+  systemPromptFingerprint: string,
+): void {
+  if (!stored) return;
+  if (latestCheckpoint) {
+    commitStoredCheckpoint(
+      stored,
+      latestCheckpoint,
+      blobStore,
+      completedTurns,
+      currentTurn,
+      systemPromptFingerprint,
+    );
+  } else {
+    mergeBlobStore(stored, blobStore);
+  }
+}
+
 function writeNativeStream(
   bridge: BridgeHandle,
   heartbeatTimer: ReturnType<typeof setInterval>,
@@ -1445,12 +1544,7 @@ function writeNativeStream(
   requestId?: string,
 ): void {
   debugLog("native.stream.start", { requestId, bridgeKey, convKey, modelId, workspaceContext });
-  const state: StreamState = {
-    toolCallIndex: 0,
-    pendingExecs: [],
-    outputTokens: 0,
-    totalTokens: 0,
-  };
+  const state = createStreamState();
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
@@ -1472,25 +1566,23 @@ function writeNativeStream(
 
   const emitText = (text: string, isThinking?: boolean) => {
     if (writer.closed) return;
-    if (isThinking) {
-      writer.thinking(text);
-      return;
-    }
-    const { content, reasoning } = tagFilter.process(text);
-    if (reasoning) writer.thinking(reasoning);
-    if (content) {
-      appendAssistantTextToTurn(currentTurn, content);
-      writer.text(content);
-    }
+    emitFilteredStreamText(
+      tagFilter,
+      currentTurn,
+      text,
+      isThinking,
+      (reasoning) => writer.thinking(reasoning),
+      (content) => writer.text(content),
+    );
   };
 
   const emitFlushed = () => {
-    const flushed = tagFilter.flush();
-    if (flushed.reasoning) writer.thinking(flushed.reasoning);
-    if (flushed.content) {
-      appendAssistantTextToTurn(currentTurn, flushed.content);
-      writer.text(flushed.content);
-    }
+    flushFilteredStreamText(
+      tagFilter,
+      currentTurn,
+      (reasoning) => writer.thinking(reasoning),
+      (content) => writer.text(content),
+    );
   };
 
   const processChunk = createConnectFrameParser(
@@ -1506,26 +1598,20 @@ function writeNativeStream(
           state,
           emitText,
           (exec) => {
-            state.pendingExecs.push(exec);
             mcpExecReceived = true;
             emitFlushed();
-            currentTurn.steps.push({
-              kind: "toolCall",
-              toolCallId: exec.toolCallId,
-              toolName: exec.toolName,
-              arguments: parseToolCallArguments(exec.decodedArgs),
-            });
-
-            setActiveBridge(bridgeKey, {
+            rememberToolCallPause(
+              bridgeKey,
               bridge,
               heartbeatTimer,
               blobStore,
               mcpTools,
-              pendingExecs: state.pendingExecs,
+              state,
               currentTurn,
               convKey,
               workspaceContext,
-            });
+              exec,
+            );
             debugLog("native.stream.tool_call_pause", {
               requestId,
               bridgeKey,
@@ -1593,26 +1679,69 @@ function writeNativeStream(
 
     if (!mcpExecReceived) {
       emitFlushed();
-      if (stored) {
-        if (latestCheckpoint) {
-          commitStoredCheckpoint(
-            stored,
-            latestCheckpoint,
-            blobStore,
-            completedTurns,
-            currentTurn,
-            systemPromptFingerprint,
-          );
-          debugLog("native.stream.checkpoint_committed", { requestId, convKey, stored });
-        } else {
-          mergeBlobStore(stored, blobStore);
-        }
-      }
+      commitOrMergeStoredCheckpoint(
+        stored,
+        latestCheckpoint,
+        blobStore,
+        completedTurns,
+        currentTurn,
+        systemPromptFingerprint,
+      );
+      if (stored && latestCheckpoint)
+        debugLog("native.stream.checkpoint_committed", { requestId, convKey, stored });
       writer.done("stop", state);
     } else {
       removeActiveBridge(bridgeKey);
     }
   });
+}
+
+function applyToolResultsToTurn(currentTurn: ParsedTurn, toolResults: ToolResultInfo[]): void {
+  for (const result of toolResults) {
+    const turnToolStep = currentTurn.steps.find(
+      (step): step is ParsedToolCallStep =>
+        step.kind === "toolCall" && step.toolCallId === result.toolCallId,
+    );
+    if (turnToolStep) {
+      turnToolStep.result = {
+        content: result.content,
+        images: result.images,
+        isError: result.isError === true,
+      };
+    }
+  }
+}
+
+function unresolvedPendingExecs(
+  pendingExecs: PendingExec[],
+  turnResults: Map<string, ParsedToolResult>,
+): PendingExec[] {
+  return pendingExecs.filter((exec) => !turnResults.has(exec.toolCallId));
+}
+
+function sendMcpResultsForPendingExecs(
+  bridge: BridgeHandle,
+  pendingExecs: PendingExec[],
+  turnResults: Map<string, ParsedToolResult>,
+  debugEvent: string,
+  requestId?: string,
+): void {
+  for (const exec of pendingExecs) {
+    const result = turnResults.get(exec.toolCallId);
+    if (!result) continue;
+    const mcpResult = mcpResultFromParsedToolResult(result);
+
+    const execClientMessage = create(ExecClientMessageSchema, {
+      id: exec.execMsgId,
+      execId: exec.execId,
+      message: { case: "mcpResult" as any, value: mcpResult as any },
+    });
+    const clientMessage = create(AgentClientMessageSchema, {
+      message: { case: "execClientMessage", value: execClientMessage },
+    });
+    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+    debugLog(debugEvent, { requestId, exec, result });
+  }
 }
 
 function handleNativeToolResultResume(
@@ -1645,22 +1774,10 @@ function handleNativeToolResultResume(
     currentTurn,
   });
 
-  for (const result of toolResults) {
-    const turnToolStep = currentTurn.steps.find(
-      (step): step is ParsedToolCallStep =>
-        step.kind === "toolCall" && step.toolCallId === result.toolCallId,
-    );
-    if (turnToolStep) {
-      turnToolStep.result = {
-        content: result.content,
-        images: result.images,
-        isError: result.isError === true,
-      };
-    }
-  }
+  applyToolResultsToTurn(currentTurn, toolResults);
 
   const turnResults = getTurnToolCallResults(currentTurn);
-  const unresolvedExecs = pendingExecs.filter((exec) => !turnResults.has(exec.toolCallId));
+  const unresolvedExecs = unresolvedPendingExecs(pendingExecs, turnResults);
   if (unresolvedExecs.length > 0) {
     setActiveBridge(bridgeKey, {
       bridge,
@@ -1683,22 +1800,13 @@ function handleNativeToolResultResume(
     return;
   }
 
-  for (const exec of pendingExecs) {
-    const result = turnResults.get(exec.toolCallId);
-    if (!result) continue;
-    const mcpResult = mcpResultFromParsedToolResult(result);
-
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: { case: "mcpResult" as any, value: mcpResult as any },
-    });
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
-    debugLog("native.tool_resume.sent_result", { requestId, exec, result });
-  }
+  sendMcpResultsForPendingExecs(
+    bridge,
+    pendingExecs,
+    turnResults,
+    "native.tool_resume.sent_result",
+    requestId,
+  );
 
   writeNativeStream(
     bridge,
@@ -1774,7 +1882,7 @@ function stableNormalizeForHash(value: unknown): unknown {
     return value;
   if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
     const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
-    return { __bytes: debugByteSummary(bytes) };
+    return { __bytes: summarizeByteData(bytes) };
   }
   if (Array.isArray(value)) return value.map((item) => stableNormalizeForHash(item));
   if (typeof value === "object") {
@@ -1791,7 +1899,7 @@ function stableNormalizeForHash(value: unknown): unknown {
 function fingerprintImage(image: ParsedImageContent): Record<string, unknown> {
   return {
     mimeType: image.mimeType,
-    ...debugByteSummary(image.data),
+    ...summarizeByteData(image.data),
   };
 }
 
@@ -2046,8 +2154,16 @@ async function handleChatCompletion(
     return;
   }
   const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
-  const systemPromptFingerprint = fingerprintSystemPrompt(systemPrompt);
-  const modelId = resolveRequestedModelId(body.model, body.reasoning_effort, body.cursor_model_id);
+  const {
+    systemPromptFingerprint,
+    modelId,
+    maxMode,
+    sessionId,
+    bridgeKey,
+    convKey,
+    workspaceContext,
+    activeBridge,
+  } = prepareCursorRequestContext(body, parsedMessages);
   if (body.reasoning_effort && !body.cursor_model_id && !body.cursor_model_parameters) {
     debugLog("model_routing.fallback_suffix_generation", {
       requestId,
@@ -2056,10 +2172,6 @@ async function handleChatCompletion(
       resolvedModelId: modelId,
     });
   }
-  const maxMode =
-    typeof body.cursor_model_max_mode === "boolean"
-      ? body.cursor_model_max_mode
-      : body.cursor_requires_max_mode === true;
   if (rejectUnsupportedRequestParameters(body, res, requestId)) return;
   const toolResolution = resolveToolsForToolChoice(body.tools ?? [], body.tool_choice);
   if ("error" in toolResolution) {
@@ -2119,11 +2231,6 @@ async function handleChatCompletion(
     return;
   }
 
-  const sessionId = derivePiSessionId(body);
-  const bridgeKey = deriveBridgeKey(body.messages, sessionId);
-  const convKey = deriveConversationKey(body.messages, sessionId);
-  const workspaceContext = createWorkspaceContext(body.cursor_workspace_path);
-  const activeBridge = activeBridges.get(bridgeKey);
   debugLog("chat.session_keys", {
     requestId,
     sessionId,
@@ -2163,13 +2270,19 @@ async function handleChatCompletion(
       activeBridge.bridge.end();
     }
 
-    debugLog("chat.lost_tool_continuation", { requestId, bridgeKey, convKey, toolResults });
+    const message = lostToolContinuationMessage();
+    debugLog("chat.lost_tool_continuation", {
+      requestId,
+      bridgeKey,
+      convKey,
+      toolResults,
+      message,
+    });
     res.writeHead(409, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         error: {
-          message:
-            "Cursor tool continuation was lost because the live upstream bridge is no longer available. Retry from before the tool call or start a new turn.",
+          message,
           type: "invalid_state_error",
           code: "tool_continuation_lost",
         },
@@ -3053,6 +3166,161 @@ function handleKvMessage(
   }
 }
 
+const NATIVE_TOOL_REJECT_REASON =
+  "Tool not available in this environment. Use the MCP tools provided instead.";
+
+type NativeExecResult = { messageCase: string; value: unknown };
+type NativeExecResultBuilder = (args: any) => NativeExecResult;
+
+function shellRejected(args: any) {
+  return create(ShellRejectedSchema, {
+    command: args.command ?? "",
+    workingDirectory: args.workingDirectory ?? "",
+    reason: NATIVE_TOOL_REJECT_REASON,
+    isReadonly: false,
+  });
+}
+
+const NATIVE_EXEC_RESULT_BUILDERS: Record<string, NativeExecResultBuilder> = {
+  readArgs: (args) => ({
+    messageCase: "readResult",
+    value: create(ReadResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ReadRejectedSchema, { path: args.path, reason: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  lsArgs: (args) => ({
+    messageCase: "lsResult",
+    value: create(LsResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(LsRejectedSchema, { path: args.path, reason: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  grepArgs: () => ({
+    messageCase: "grepResult",
+    value: create(GrepResultSchema, {
+      result: {
+        case: "error",
+        value: create(GrepErrorSchema, { error: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  writeArgs: (args) => ({
+    messageCase: "writeResult",
+    value: create(WriteResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(WriteRejectedSchema, { path: args.path, reason: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  deleteArgs: (args) => ({
+    messageCase: "deleteResult",
+    value: create(DeleteResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(DeleteRejectedSchema, { path: args.path, reason: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  shellArgs: (args) => ({
+    messageCase: "shellResult",
+    value: create(ShellResultSchema, {
+      result: { case: "rejected", value: shellRejected(args) },
+    }),
+  }),
+  shellStreamArgs: (args) => ({
+    messageCase: "shellStream",
+    value: create(ShellStreamSchema, {
+      event: { case: "rejected", value: shellRejected(args) },
+    }),
+  }),
+  backgroundShellSpawnArgs: (args) => ({
+    messageCase: "backgroundShellSpawnResult",
+    value: create(BackgroundShellSpawnResultSchema, {
+      result: { case: "rejected", value: shellRejected(args) },
+    }),
+  }),
+  writeShellStdinArgs: () => ({
+    messageCase: "writeShellStdinResult",
+    value: create(WriteShellStdinResultSchema, {
+      result: {
+        case: "error",
+        value: create(WriteShellStdinErrorSchema, { error: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  fetchArgs: (args) => ({
+    messageCase: "fetchResult",
+    value: create(FetchResultSchema, {
+      result: {
+        case: "error",
+        value: create(FetchErrorSchema, { url: args.url ?? "", error: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  diagnosticsArgs: () => ({
+    messageCase: "diagnosticsResult",
+    value: create(DiagnosticsResultSchema, {}),
+  }),
+  listMcpResourcesExecArgs: () => ({
+    messageCase: "listMcpResourcesExecResult",
+    value: create(ListMcpResourcesExecResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ListMcpResourcesRejectedSchema, { reason: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  readMcpResourceExecArgs: (args) => ({
+    messageCase: "readMcpResourceExecResult",
+    value: create(ReadMcpResourceExecResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ReadMcpResourceRejectedSchema, {
+          uri: args.uri ?? "",
+          reason: NATIVE_TOOL_REJECT_REASON,
+        }),
+      },
+    }),
+  }),
+  recordScreenArgs: () => ({
+    messageCase: "recordScreenResult",
+    value: create(RecordScreenResultSchema, {
+      result: {
+        case: "failure",
+        value: create(RecordScreenFailureSchema, { error: NATIVE_TOOL_REJECT_REASON }),
+      },
+    }),
+  }),
+  computerUseArgs: (args) => ({
+    messageCase: "computerUseResult",
+    value: create(ComputerUseResultSchema, {
+      result: {
+        case: "error",
+        value: create(ComputerUseErrorSchema, {
+          error: NATIVE_TOOL_REJECT_REASON,
+          actionCount: Array.isArray(args.actions) ? args.actions.length : 0,
+          durationMs: 0,
+        }),
+      },
+    }),
+  }),
+};
+
+function nativeExecResultFor(
+  execCase: string,
+  execMsg: ExecServerMessage,
+): NativeExecResult | undefined {
+  const builder = NATIVE_EXEC_RESULT_BUILDERS[execCase];
+  if (!builder) return undefined;
+  return builder((execMsg as any).message.value ?? {});
+}
+
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
@@ -3061,8 +3329,6 @@ function handleExecMessage(
   onMcpExec: (exec: PendingExec) => void,
 ): void {
   const execCase = (execMsg as any).message.case;
-  const REJECT_REASON =
-    "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "requestContextArgs") {
     const requestContext = create(RequestContextSchema, {
@@ -3107,235 +3373,10 @@ function handleExecMessage(
     return;
   }
 
-  // Reject native Cursor tools so model falls back to MCP tools
-  if (execCase === "readArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "readResult",
-      create(ReadResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "lsArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "lsResult",
-      create(LsResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "grepArgs") {
-    sendExecResult(
-      execMsg,
-      "grepResult",
-      create(GrepResultSchema, {
-        result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "writeArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "writeResult",
-      create(WriteResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(WriteRejectedSchema, { path: args.path, reason: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "deleteArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "deleteResult",
-      create(DeleteResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "shellArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "shellResult",
-      create(ShellResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ShellRejectedSchema, {
-            command: args.command ?? "",
-            workingDirectory: args.workingDirectory ?? "",
-            reason: REJECT_REASON,
-            isReadonly: false,
-          }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "shellStreamArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "shellStream",
-      create(ShellStreamSchema, {
-        event: {
-          case: "rejected",
-          value: create(ShellRejectedSchema, {
-            command: args.command ?? "",
-            workingDirectory: args.workingDirectory ?? "",
-            reason: REJECT_REASON,
-            isReadonly: false,
-          }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "backgroundShellSpawnArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "backgroundShellSpawnResult",
-      create(BackgroundShellSpawnResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ShellRejectedSchema, {
-            command: args.command ?? "",
-            workingDirectory: args.workingDirectory ?? "",
-            reason: REJECT_REASON,
-            isReadonly: false,
-          }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "writeShellStdinArgs") {
-    sendExecResult(
-      execMsg,
-      "writeShellStdinResult",
-      create(WriteShellStdinResultSchema, {
-        result: {
-          case: "error",
-          value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "fetchArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "fetchResult",
-      create(FetchResultSchema, {
-        result: {
-          case: "error",
-          value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "diagnosticsArgs") {
-    sendExecResult(execMsg, "diagnosticsResult", create(DiagnosticsResultSchema, {}), sendFrame);
-    return;
-  }
-
-  if (execCase === "listMcpResourcesExecArgs") {
-    sendExecResult(
-      execMsg,
-      "listMcpResourcesExecResult",
-      create(ListMcpResourcesExecResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ListMcpResourcesRejectedSchema, { reason: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "readMcpResourceExecArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "readMcpResourceExecResult",
-      create(ReadMcpResourceExecResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ReadMcpResourceRejectedSchema, {
-            uri: args.uri ?? "",
-            reason: REJECT_REASON,
-          }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "recordScreenArgs") {
-    sendExecResult(
-      execMsg,
-      "recordScreenResult",
-      create(RecordScreenResultSchema, {
-        result: {
-          case: "failure",
-          value: create(RecordScreenFailureSchema, { error: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
-    return;
-  }
-  if (execCase === "computerUseArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "computerUseResult",
-      create(ComputerUseResultSchema, {
-        result: {
-          case: "error",
-          value: create(ComputerUseErrorSchema, {
-            error: REJECT_REASON,
-            actionCount: Array.isArray(args.actions) ? args.actions.length : 0,
-            durationMs: 0,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+  // Reject native Cursor tools so model falls back to MCP tools.
+  const nativeResult = nativeExecResultFor(execCase, execMsg);
+  if (nativeResult) {
+    sendExecResult(execMsg, nativeResult.messageCase, nativeResult.value, sendFrame);
     return;
   }
 
@@ -3762,12 +3803,7 @@ function writeSSEStream(
     };
   };
 
-  const state: StreamState = {
-    toolCallIndex: 0,
-    pendingExecs: [],
-    outputTokens: 0,
-    totalTokens: 0,
-  };
+  const state = createStreamState();
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
@@ -3797,34 +3833,24 @@ function writeSSEStream(
           (data) => bridge.write(data),
           state,
           (text, isThinking) => {
-            if (isThinking) {
-              sendSSE(makeChunk({ reasoning_content: text }));
-            } else {
-              const { content, reasoning } = tagFilter.process(text);
-              if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
-              if (content) {
-                appendAssistantTextToTurn(currentTurn, content);
-                sendSSE(makeChunk({ content }));
-              }
-            }
+            emitFilteredStreamText(
+              tagFilter,
+              currentTurn,
+              text,
+              isThinking,
+              (reasoning) => sendSSE(makeChunk({ reasoning_content: reasoning })),
+              (content) => sendSSE(makeChunk({ content })),
+            );
           },
           (exec) => {
-            state.pendingExecs.push(exec);
             mcpExecReceived = true;
 
-            const flushed = tagFilter.flush();
-            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-            if (flushed.content) {
-              appendAssistantTextToTurn(currentTurn, flushed.content);
-              sendSSE(makeChunk({ content: flushed.content }));
-            }
-
-            currentTurn.steps.push({
-              kind: "toolCall",
-              toolCallId: exec.toolCallId,
-              toolName: exec.toolName,
-              arguments: parseToolCallArguments(exec.decodedArgs),
-            });
+            flushFilteredStreamText(
+              tagFilter,
+              currentTurn,
+              (reasoning) => sendSSE(makeChunk({ reasoning_content: reasoning })),
+              (content) => sendSSE(makeChunk({ content })),
+            );
 
             const toolCallIndex = state.toolCallIndex++;
             sendSSE(
@@ -3840,16 +3866,18 @@ function writeSSEStream(
               }),
             );
 
-            setActiveBridge(bridgeKey, {
+            rememberToolCallPause(
+              bridgeKey,
               bridge,
               heartbeatTimer,
               blobStore,
               mcpTools,
-              pendingExecs: state.pendingExecs,
+              state,
               currentTurn,
               convKey,
               workspaceContext,
-            });
+              exec,
+            );
             debugLog("stream.tool_call_pause", {
               requestId,
               bridgeKey,
@@ -3930,27 +3958,22 @@ function writeSSEStream(
     }
 
     if (!mcpExecReceived) {
-      const flushed = tagFilter.flush();
-      if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-      if (flushed.content) {
-        appendAssistantTextToTurn(currentTurn, flushed.content);
-        sendSSE(makeChunk({ content: flushed.content }));
-      }
-      if (stored) {
-        if (latestCheckpoint) {
-          commitStoredCheckpoint(
-            stored,
-            latestCheckpoint,
-            blobStore,
-            completedTurns,
-            currentTurn,
-            systemPromptFingerprint,
-          );
-          debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
-        } else {
-          mergeBlobStore(stored, blobStore);
-        }
-      }
+      flushFilteredStreamText(
+        tagFilter,
+        currentTurn,
+        (reasoning) => sendSSE(makeChunk({ reasoning_content: reasoning })),
+        (content) => sendSSE(makeChunk({ content })),
+      );
+      commitOrMergeStoredCheckpoint(
+        stored,
+        latestCheckpoint,
+        blobStore,
+        completedTurns,
+        currentTurn,
+        systemPromptFingerprint,
+      );
+      if (stored && latestCheckpoint)
+        debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
       sendSSE(makeChunk({}, "stop"));
       sendSSE(makeUsageChunk());
       sendDone();
@@ -4021,22 +4044,10 @@ function handleToolResultResume(
     currentTurn,
   });
 
-  for (const result of toolResults) {
-    const turnToolStep = currentTurn.steps.find(
-      (step): step is ParsedToolCallStep =>
-        step.kind === "toolCall" && step.toolCallId === result.toolCallId,
-    );
-    if (turnToolStep) {
-      turnToolStep.result = {
-        content: result.content,
-        images: result.images,
-        isError: result.isError === true,
-      };
-    }
-  }
+  applyToolResultsToTurn(currentTurn, toolResults);
 
   const turnResults = getTurnToolCallResults(currentTurn);
-  const unresolvedExecs = pendingExecs.filter((exec) => !turnResults.has(exec.toolCallId));
+  const unresolvedExecs = unresolvedPendingExecs(pendingExecs, turnResults);
   if (unresolvedExecs.length > 0) {
     setActiveBridge(bridgeKey, {
       bridge,
@@ -4053,22 +4064,13 @@ function handleToolResultResume(
     return;
   }
 
-  for (const exec of pendingExecs) {
-    const result = turnResults.get(exec.toolCallId);
-    if (!result) continue;
-    const mcpResult = mcpResultFromParsedToolResult(result);
-
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: { case: "mcpResult" as any, value: mcpResult as any },
-    });
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
-    debugLog("tool_resume.sent_result", { requestId, exec, result });
-  }
+  sendMcpResultsForPendingExecs(
+    bridge,
+    pendingExecs,
+    turnResults,
+    "tool_resume.sent_result",
+    requestId,
+  );
 
   // Tool results belong to the same user turn that initiated the tool calls.
   // parseMessages keeps tool continuations out of completed history, so completedTurns

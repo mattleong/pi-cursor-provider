@@ -23,8 +23,6 @@
 import http2 from "node:http2";
 import crypto from "node:crypto";
 
-const CURSOR_CLIENT_VERSION = process.env.PI_CURSOR_CLIENT_VERSION || "cli-2026.05.01-eea359f";
-
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {
   const lenBuf = Buffer.alloc(4);
@@ -96,7 +94,7 @@ const configBuf = await readMessage();
 if (!configBuf) process.exit(1);
 
 const config = JSON.parse(configBuf.toString("utf8"));
-const { accessToken, url, path: rpcPath, unary } = config;
+const { accessToken, url, path: rpcPath, unary, cursorClientVersion } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
@@ -128,7 +126,7 @@ const headers = {
   te: "trailers",
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
-  "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+  "x-cursor-client-version": cursorClientVersion,
   "x-cursor-client-type": "cli",
   "x-request-id": crypto.randomUUID(),
 };

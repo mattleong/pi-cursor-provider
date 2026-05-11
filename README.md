@@ -130,7 +130,7 @@ LIVE_CURSOR_METADATA=1 CURSOR_ACCESS_TOKEN=... npm run verify:cursor-live
 The HTTP/2 bridge sends Cursor's CLI client-version header. Override it when testing against a different installed Cursor Agent build:
 
 ```bash
-PI_CURSOR_CLIENT_VERSION=cli-2026.05.01-eea359f pi
+PI_CURSOR_CLIENT_VERSION=<cursor-cli-version> pi
 ```
 
 ## Image Support

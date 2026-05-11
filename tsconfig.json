@@ -12,5 +12,17 @@
     "strict": false,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["auth.ts", "bridge.ts", "cursor-wire.ts", "index.ts", "proxy.ts", "proto/**/*.ts"]
+  "include": [
+    "auth.ts",
+    "bridge.ts",
+    "cursor-defaults.ts",
+    "cursor-models.ts",
+    "cursor-routing.ts",
+    "cursor-wire.ts",
+    "debug.ts",
+    "index.ts",
+    "index.test.ts",
+    "proxy.ts",
+    "proto/**/*.ts"
+  ]
 }

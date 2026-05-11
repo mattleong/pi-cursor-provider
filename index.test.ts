@@ -48,7 +48,6 @@ import { create, fromBinary, fromJson, toBinary, toJson } from "@bufbuild/protob
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
-  AgentRunRequestSchema,
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
   ConversationTurnStructureSchema,
@@ -1672,10 +1671,10 @@ describe("derivePiSessionId", () => {
 
 // ── Turn reconstruction ──
 
-function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>) {
+function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>): any {
   const clientMsg = fromBinary(AgentClientMessageSchema, payload.requestBytes);
   expect(clientMsg.message.case).toBe("runRequest");
-  return clientMsg.message.value as InstanceType<(typeof AgentRunRequestSchema)["$typeName"]> & any;
+  return clientMsg.message.value as any;
 }
 
 function requestedModelSummary(req: any) {
@@ -1730,7 +1729,10 @@ function resolveBlob(data: Uint8Array, blobStore?: Map<string, Uint8Array>): Uin
   return data;
 }
 
-function decodeTurns(state: any, blobStore?: Map<string, Uint8Array>) {
+function decodeTurns(
+  state: any,
+  blobStore?: Map<string, Uint8Array>,
+): Array<{ userMsg: any; steps: any[] }> {
   return (state.turns as Uint8Array[]).map((turnRef: Uint8Array) => {
     const turnBytes = resolveBlob(turnRef, blobStore);
     const turnStruct = fromBinary(ConversationTurnStructureSchema, turnBytes);

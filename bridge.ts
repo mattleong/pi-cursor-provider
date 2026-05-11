@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { resolve as pathResolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getCursorClientVersion } from "./cursor-defaults.js";
 
 const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -46,11 +47,12 @@ export function spawnBridge(
   options: SpawnBridgeOptions,
   debugLog: BridgeDebugLog = noopDebugLog,
 ): BridgeHandle {
+  const cursorClientVersion = getCursorClientVersion();
   debugLog("bridge.spawn", {
     rpcPath: options.rpcPath,
     url: options.url ?? CURSOR_API_URL,
     unary: options.unary ?? false,
-    cursorClientVersion: process.env.PI_CURSOR_CLIENT_VERSION || "cli-2026.05.01-eea359f",
+    cursorClientVersion,
   });
   const proc = spawn(process.execPath, [BRIDGE_PATH], {
     stdio: ["pipe", "pipe", "ignore"],
@@ -61,6 +63,7 @@ export function spawnBridge(
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
     unary: options.unary ?? false,
+    cursorClientVersion,
   });
   const stdin = proc.stdin!;
   let exited = false;
