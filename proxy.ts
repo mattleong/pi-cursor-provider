@@ -1450,12 +1450,22 @@ async function handleCursorNativeRequest(
   const mcpTools = buildMcpToolDefinitions(toolResolution.tools);
   const effectiveUserText = userText;
   const effectiveUserImages = userText || userImages.length > 0 ? userImages : [];
+  const requestConversationId = conversationIdForRequest(
+    stored,
+    convKey,
+    turns,
+    systemPromptFingerprint,
+    effectiveUserText,
+    effectiveUserImages,
+    requestCheckpoint,
+  );
+  stored.conversationId = requestConversationId;
   const payload = buildCursorRequest(
     modelId,
     systemPrompt,
     effectiveUserText,
     turns,
-    stored.conversationId,
+    requestConversationId,
     requestCheckpoint,
     stored.blobStore,
     maxMode,
@@ -1476,7 +1486,7 @@ async function handleCursorNativeRequest(
     requestId,
     bridgeKey,
     convKey,
-    conversationId: stored.conversationId,
+    conversationId: requestConversationId,
     hasStoredCheckpoint: !!stored.checkpoint,
     hasRequestCheckpoint: !!requestCheckpoint,
     payload,
@@ -2105,6 +2115,32 @@ function checkpointForRequest(
   return null;
 }
 
+function conversationIdForRequest(
+  stored: StoredConversation,
+  convKey: string,
+  turns: ParsedTurn[],
+  systemPromptFingerprint: string,
+  userText: string,
+  userImages: ParsedImageContent[],
+  requestCheckpoint: Uint8Array | null,
+): string {
+  if (requestCheckpoint) return stored.conversationId;
+  const fingerprint = createHash("sha256")
+    .update(
+      JSON.stringify({
+        convKey,
+        systemPromptFingerprint,
+        completedHistoryFingerprint: fingerprintCompletedTurns(turns),
+        currentAction: {
+          userText,
+          userImages: userImages.map(fingerprintImage),
+        },
+      }),
+    )
+    .digest("hex");
+  return deterministicConversationId(`pi-context:${fingerprint}`);
+}
+
 function mergeBlobStore(stored: StoredConversation, blobStore: Map<string, Uint8Array>): void {
   for (const [k, v] of blobStore) stored.blobStore.set(k, v);
   stored.lastAccessMs = Date.now();
@@ -2429,11 +2465,21 @@ async function handleChatCompletion(
   const effectiveUserText =
     userText || (toolResults.length > 0 ? toolResults.map((r) => r.content).join("\n") : "");
   const effectiveUserImages = userText || userImages.length > 0 ? userImages : [];
+  const requestConversationId = conversationIdForRequest(
+    stored,
+    convKey,
+    turns,
+    systemPromptFingerprint,
+    effectiveUserText,
+    effectiveUserImages,
+    requestCheckpoint,
+  );
+  stored.conversationId = requestConversationId;
   if (!requestCheckpoint) {
     debugLog("chat.no_request_checkpoint", {
       requestId,
       convKey,
-      conversationId: stored.conversationId,
+      conversationId: requestConversationId,
       hasStoredCheckpoint: !!stored.checkpoint,
     });
   }
@@ -2442,7 +2488,7 @@ async function handleChatCompletion(
     systemPrompt,
     effectiveUserText,
     turns,
-    stored.conversationId,
+    requestConversationId,
     requestCheckpoint,
     stored.blobStore,
     maxMode,
@@ -2453,7 +2499,7 @@ async function handleChatCompletion(
   );
   debugLog("chat.cursor_request", {
     requestId,
-    conversationId: stored.conversationId,
+    conversationId: requestConversationId,
     effectiveUserText,
     turnCount: turns.length,
     hasStoredCheckpoint: !!stored.checkpoint,
@@ -3040,6 +3086,59 @@ function mcpResultFromParsedToolResult(result: ParsedToolResult) {
   });
 }
 
+function transcriptImageSummary(images: ParsedImageContent[] | undefined): string {
+  if (!images?.length) return "";
+  return `\n[images: ${images.map((image) => `${image.mimeType}, ${image.data.length} bytes`).join("; ")}]`;
+}
+
+function transcriptStepText(step: ParsedTurnStep): string {
+  if (step.kind === "assistantText") return `Assistant: ${step.text}`;
+  const args = Object.keys(step.arguments).length ? ` ${JSON.stringify(step.arguments)}` : "";
+  const result = step.result
+    ? `\nTool result${step.result.isError ? " (error)" : ""}: ${step.result.content}${transcriptImageSummary(step.result.images)}`
+    : "";
+  return `Tool call: ${step.toolName || "tool"}${args}${result}`;
+}
+
+function inlineHistoryPrompt(turns: ParsedTurn[]): string | undefined {
+  if (turns.length === 0) return undefined;
+  const body = turns
+    .map((turn, index) => {
+      const lines = [
+        `Turn ${index + 1}`,
+        `User: ${turn.userText}${transcriptImageSummary(turn.userImages)}`,
+        ...turn.steps.map(transcriptStepText),
+      ];
+      return lines.join("\n");
+    })
+    .join("\n\n");
+  return `Prior Pi conversation context follows. Use this transcript to resolve references in the current user message; the current user message is separate and comes after this context.\n\n<pi_conversation_history>\n${body}\n</pi_conversation_history>`;
+}
+
+function rootPromptBlobIdsForRequest(
+  systemPrompt: string,
+  turns: ParsedTurn[],
+  checkpoint: Uint8Array | null,
+  blobStore: Map<string, Uint8Array>,
+): Uint8Array[] {
+  const systemBytes = new TextEncoder().encode(
+    JSON.stringify({ role: "system", content: systemPrompt }),
+  );
+  const rootPromptBlobIds = [storeAsBlob(systemBytes, blobStore)];
+  if (!checkpoint) {
+    const historyPrompt = inlineHistoryPrompt(turns);
+    if (historyPrompt) {
+      rootPromptBlobIds.push(
+        storeAsBlob(
+          new TextEncoder().encode(JSON.stringify({ role: "user", content: historyPrompt })),
+          blobStore,
+        ),
+      );
+    }
+  }
+  return rootPromptBlobIds;
+}
+
 function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
   if (step.kind === "assistantText") {
     return toBinary(
@@ -3110,12 +3209,8 @@ export function buildCursorRequest(
     workspaceContext,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
-
-  const systemBytes = new TextEncoder().encode(
-    JSON.stringify({ role: "system", content: systemPrompt }),
-  );
-  const systemBlobId = storeAsBlob(systemBytes, blobStore);
-  const selectedCtxBlob = storeAsBlob(buildSelectedContextBlob([systemBlobId], "pi"), blobStore);
+  const rootPromptBlobIds = rootPromptBlobIdsForRequest(systemPrompt, turns, checkpoint, blobStore);
+  const selectedCtxBlob = storeAsBlob(buildSelectedContextBlob(rootPromptBlobIds, "pi"), blobStore);
 
   let conversationState;
   if (checkpoint) {
@@ -3141,7 +3236,7 @@ export function buildCursorRequest(
     }
 
     conversationState = create(ConversationStateStructureSchema, {
-      rootPromptMessagesJson: [systemBlobId],
+      rootPromptMessagesJson: rootPromptBlobIds,
       turns: turnBlobIds,
       todos: [],
       pendingToolCalls: [],

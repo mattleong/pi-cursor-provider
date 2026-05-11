@@ -151,7 +151,7 @@ The native provider runtime maintains conversation state per Pi session, enablin
 ### How it works
 
 - **Session tracking** — Pi passes the session ID through `streamSimple` options. The provider keys bridge state and stored conversation state from that real session ID.
-- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The provider stores that checkpoint and validates it with completed-turn metadata, but normal new turns default to rebuilding from Pi's message history so Pi remains the source of truth. Set `PI_CURSOR_REUSE_CHECKPOINTS=1` to opt back into checkpoint reuse for debugging/performance experiments.
+- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The provider stores that checkpoint and validates it with completed-turn metadata, but normal new turns default to rebuilding from Pi's message history with a context-derived Cursor conversation ID so Pi remains the source of truth. Rebuilt requests also include an inline Pi transcript in root prompt context as a safety net for Cursor backends that ignore structured reconstructed turns. Set `PI_CURSOR_REUSE_CHECKPOINTS=1` to opt back into checkpoint reuse for debugging/performance experiments.
 - **Session-scoped state** — real pi session state is kept in memory until explicit cleanup or process restart. Anonymous fallback state can still be TTL-evicted.
 - **Lifecycle cleanup** — session state is cleaned up on pi lifecycle events such as session switch, fork, `/tree`, and shutdown.
 
@@ -174,7 +174,7 @@ When you navigate back in Pi's session tree and branch from an earlier point, th
 - completed turn count mismatches, and
 - same-depth branch changes detected via completed-history fingerprint mismatch.
 
-When a checkpoint is stale or checkpoint reuse is disabled, the provider reconstructs proper protobuf conversation turns from the message history Pi sends, so Cursor sees the actual conversation structure at the fork point.
+When a checkpoint is stale or checkpoint reuse is disabled, the provider reconstructs proper protobuf conversation turns from the message history Pi sends and uses a conversation ID derived from that Pi context, so Cursor sees the actual conversation structure at the fork point instead of any cached Cursor-side state.
 
 ### Session resume
 

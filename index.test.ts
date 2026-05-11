@@ -2862,7 +2862,21 @@ describe("native streamSimple provider", () => {
       );
 
       expect(runRequests).toHaveLength(1);
+      expect(runRequests[0].conversationId).not.toBe("conv-rebuild");
       expect(runRequests[0].conversationState.turns).toHaveLength(1);
+      expect(runRequests[0].conversationState.rootPromptMessagesJson).toHaveLength(2);
+      const rootPromptMessages = runRequests[0].conversationState.rootPromptMessagesJson.map(
+        (blobId: Uint8Array) =>
+          JSON.parse(
+            new TextDecoder().decode(
+              __testInternals.conversationStates
+                .get(convKey)!
+                .blobStore.get(Buffer.from(blobId).toString("hex"))!,
+            ),
+          ),
+      );
+      expect(rootPromptMessages[1].content).toContain("remember pineapple");
+      expect(rootPromptMessages[1].content).toContain("I will remember");
       expect(runRequests[0].action.action.value.userMessage.text).toBe(
         "what did I ask you to remember?",
       );
@@ -4211,7 +4225,7 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(runRequests[0].conversationId).toBe("conv-interrupt-after-checkpoint");
+    expect(runRequests[0].conversationId).not.toBe("conv-interrupt-after-checkpoint");
     expect(runRequests[0].conversationState.turns).toHaveLength(1);
     expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
   });
@@ -4301,7 +4315,7 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(runRequests[0].conversationId).toBe("conv-partial-assistant");
+    expect(runRequests[0].conversationId).not.toBe("conv-partial-assistant");
     expect(runRequests[0].conversationState.turns).toHaveLength(1);
     expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
   });
@@ -4404,7 +4418,7 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(runRequests[0].conversationId).toBe("conv-old");
+    expect(runRequests[0].conversationId).not.toBe("conv-old");
     expect(
       toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
     ).not.toEqual(priorCheckpoint);
