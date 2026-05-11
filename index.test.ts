@@ -2748,6 +2748,50 @@ async function collectEvents(stream: AsyncIterable<any>): Promise<any[]> {
 }
 
 describe("native streamSimple provider", () => {
+  test("seeds in-flight context usage from prior assistant usage", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const priorUsage = { ...emptyUsage(), totalTokens: 40_000 };
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "previous prompt", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "previous response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: priorUsage,
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "new prompt", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId: "native-inflight-usage-session" },
+      ),
+    );
+
+    expect(events[0]).toMatchObject({ type: "start" });
+    expect(events[0].partial.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
+    expect(events.at(-1).message.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
+  });
+
   test("image-only user request forwards selected images without the local proxy", async () => {
     const runRequests: any[] = [];
     setBridgeFactoryForTests(

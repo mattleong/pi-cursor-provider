@@ -824,24 +824,84 @@ interface NativeStreamWriter {
   error(message: string, reason: "error" | "aborted", state?: StreamState): void;
 }
 
-function emptyCursorUsage(): AssistantMessage["usage"] {
+function emptyCursorUsage(totalTokens = 0): AssistantMessage["usage"] {
   return {
     input: 0,
     output: 0,
     cacheRead: 0,
     cacheWrite: 0,
-    totalTokens: 0,
+    totalTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
+}
+
+function usageContextTokens(usage: AssistantMessage["usage"]): number {
+  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function estimateTextTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+function estimateContentTokens(content: unknown): number {
+  if (typeof content === "string") return estimateTextTokens(content);
+  if (!Array.isArray(content)) return 0;
+  return content.reduce((total, block) => {
+    if (!block || typeof block !== "object") return total;
+    const typed = block as Record<string, unknown>;
+    if (typeof typed.text === "string") return total + estimateTextTokens(typed.text);
+    if (typeof typed.thinking === "string") return total + estimateTextTokens(typed.thinking);
+    if (typed.type === "toolCall") return total + estimateTextTokens(JSON.stringify(typed));
+    if (typed.type === "image") return total + 85;
+    return total;
+  }, 0);
+}
+
+function estimateMessageTokens(message: PiMessage): number {
+  const baseTokens = 4;
+  if (message.role === "toolResult") {
+    return (
+      baseTokens + estimateTextTokens(message.toolName) + estimateContentTokens(message.content)
+    );
+  }
+  return baseTokens + estimateContentTokens(message.content);
+}
+
+function assistantUsageForContext(message: PiMessage): AssistantMessage["usage"] | undefined {
+  if (message.role !== "assistant") return undefined;
+  if (message.stopReason === "aborted" || message.stopReason === "error") return undefined;
+  return message.usage;
+}
+
+function estimateInFlightContextTokens(context: Context): number {
+  const messages = context.messages ?? [];
+  const systemPromptTokens = context.systemPrompt ? estimateTextTokens(context.systemPrompt) : 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const usage = assistantUsageForContext(messages[i]!);
+    if (!usage) continue;
+    const trailingTokens = messages
+      .slice(i + 1)
+      .reduce((total, message) => total + estimateMessageTokens(message), 0);
+    return usageContextTokens(usage) + trailingTokens;
+  }
+  return (
+    systemPromptTokens +
+    messages.reduce((total, message) => total + estimateMessageTokens(message), 0)
+  );
 }
 
 function tokenCost(tokens: number, ratePerMillion = 0): number {
   return (tokens * ratePerMillion) / 1_000_000;
 }
 
-function applyCursorUsage(output: AssistantMessage, model: Model<Api>, state?: StreamState): void {
+function applyCursorUsage(
+  output: AssistantMessage,
+  model: Model<Api>,
+  state?: StreamState,
+  fallbackTotalTokens = 0,
+): void {
   if (!state) return;
-  const usage = computeUsage(state);
+  const usage = computeUsage(state, fallbackTotalTokens);
   const costInput = tokenCost(usage.prompt_tokens, model.cost?.input);
   const costOutput = tokenCost(usage.completion_tokens, model.cost?.output);
   output.usage = {
@@ -860,14 +920,17 @@ function applyCursorUsage(output: AssistantMessage, model: Model<Api>, state?: S
   };
 }
 
-function createCursorAssistantMessage(model: Model<Api>): AssistantMessage {
+function createCursorAssistantMessage(
+  model: Model<Api>,
+  initialContextTokens = 0,
+): AssistantMessage {
   return {
     role: "assistant",
     content: [],
     api: model.api,
     provider: model.provider,
     model: model.id,
-    usage: emptyCursorUsage(),
+    usage: emptyCursorUsage(initialContextTokens),
     stopReason: "stop",
     timestamp: Date.now(),
   };
@@ -876,8 +939,9 @@ function createCursorAssistantMessage(model: Model<Api>): AssistantMessage {
 function createNativeStreamWriter(
   stream: AssistantMessageEventStream,
   model: Model<Api>,
+  initialContextTokens = 0,
 ): NativeStreamWriter {
-  const output = createCursorAssistantMessage(model);
+  const output = createCursorAssistantMessage(model, initialContextTokens);
   let started = false;
   let closed = false;
   let active: { kind: NativeBlockKind; contentIndex: number; ended: boolean } | undefined;
@@ -985,7 +1049,7 @@ function createNativeStreamWriter(
       if (closed) return;
       ensureStarted();
       endActiveBlock();
-      applyCursorUsage(output, model, state);
+      applyCursorUsage(output, model, state, initialContextTokens);
       output.stopReason = reason;
       stream.push({ type: "done", reason, message: output });
       closed = true;
@@ -995,7 +1059,7 @@ function createNativeStreamWriter(
       if (closed) return;
       ensureStarted();
       endActiveBlock();
-      applyCursorUsage(output, model, state);
+      applyCursorUsage(output, model, state, initialContextTokens);
       output.stopReason = reason;
       output.errorMessage = message;
       stream.push({ type: "error", reason, error: output });
@@ -1203,7 +1267,8 @@ export function createCursorNativeStream(
 ) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
-    const writer = createNativeStreamWriter(stream, model);
+    const initialContextTokens = estimateInFlightContextTokens(context);
+    const writer = createNativeStreamWriter(stream, model, initialContextTokens);
     writer.start();
 
     (async () => {
@@ -3577,9 +3642,9 @@ function makeHeartbeatBytes(): Uint8Array {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, heartbeat));
 }
 
-function computeUsage(state: StreamState) {
+function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
   const completion_tokens = state.outputTokens;
-  const total_tokens = state.totalTokens || completion_tokens;
+  const total_tokens = state.totalTokens || Math.max(fallbackTotalTokens, completion_tokens);
   const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
   return { prompt_tokens, completion_tokens, total_tokens };
 }
