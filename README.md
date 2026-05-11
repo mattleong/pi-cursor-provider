@@ -151,7 +151,7 @@ The native provider runtime maintains conversation state per Pi session, enablin
 ### How it works
 
 - **Session tracking** — Pi passes the session ID through `streamSimple` options. The provider keys bridge state and stored conversation state from that real session ID.
-- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The provider stores that checkpoint and validates it with completed-turn metadata, but normal new turns default to rebuilding from Pi's message history with a context-derived Cursor conversation ID so Pi remains the source of truth. Rebuilt requests also include an inline Pi transcript in root prompt context as a safety net for Cursor backends that ignore structured reconstructed turns. Set `PI_CURSOR_REUSE_CHECKPOINTS=1` to opt back into checkpoint reuse for debugging/performance experiments.
+- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The provider stores that checkpoint and validates it with completed-turn metadata, but normal new turns default to rebuilding from Pi's message history with a context-derived Cursor conversation ID so Pi remains the source of truth. Rebuilt requests also include a bounded inline Pi transcript in the current root prompt context as a safety net for Cursor backends that ignore structured reconstructed turns. Set `PI_CURSOR_REUSE_CHECKPOINTS=1` to opt back into checkpoint reuse for debugging/performance experiments.
 - **Session-scoped state** — real pi session state is kept in memory until explicit cleanup or process restart. Anonymous fallback state can still be TTL-evicted.
 - **Lifecycle cleanup** — session state is cleaned up on pi lifecycle events such as session switch, fork, `/tree`, and shutdown.
 
@@ -179,6 +179,8 @@ When a checkpoint is stale or checkpoint reuse is disabled, the provider reconst
 ### Session resume
 
 Conversation state is stored in memory. If the provider process restarts, checkpoints are lost. On each normal request, Pi sends the full conversation history, and the provider reconstructs structured protobuf turns from that history instead of relying on an inline plaintext fallback.
+
+The inline transcript safety net is bounded to avoid runaway context growth. Defaults: `PI_CURSOR_INLINE_HISTORY_MAX_CHARS=32000` total transcript characters and `PI_CURSOR_INLINE_HISTORY_SEGMENT_MAX_CHARS=4000` per user/assistant/tool segment. Set the total max to `0` to disable the inline safety net.
 
 That reconstruction preserves:
 

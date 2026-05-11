@@ -314,10 +314,27 @@ const configuredActiveBridgeTtlMs = Number(
 const ACTIVE_BRIDGE_TTL_MS = Number.isFinite(configuredActiveBridgeTtlMs)
   ? Math.max(1_000, configuredActiveBridgeTtlMs)
   : DEFAULT_ACTIVE_BRIDGE_TTL_MS;
+const DEFAULT_INLINE_HISTORY_MAX_CHARS = 32_000;
+const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = 4_000;
+const INLINE_HISTORY_MAX_CHARS = readNonNegativeIntegerEnv(
+  "PI_CURSOR_INLINE_HISTORY_MAX_CHARS",
+  DEFAULT_INLINE_HISTORY_MAX_CHARS,
+);
+const INLINE_HISTORY_SEGMENT_MAX_CHARS = readNonNegativeIntegerEnv(
+  "PI_CURSOR_INLINE_HISTORY_SEGMENT_MAX_CHARS",
+  DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS,
+);
 const defaultBridgeFactory: BridgeFactory = (options) => spawnBridge(options, debugLog);
 let bridgeFactory: BridgeFactory = defaultBridgeFactory;
 let debugRequestCounter = 0;
 let debugLogFilePath: string | undefined;
+
+function readNonNegativeIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
 
 function isProxyDebugEnabled(): boolean {
   return isCursorProviderDebugEnabled();
@@ -850,7 +867,10 @@ function estimateContentTokens(content: unknown): number {
     if (!block || typeof block !== "object") return total;
     const typed = block as Record<string, unknown>;
     if (typeof typed.text === "string") return total + estimateTextTokens(typed.text);
-    if (typeof typed.thinking === "string") return total + estimateTextTokens(typed.thinking);
+    // Pi thinking blocks are not replayed into Cursor conversation history, so
+    // counting them here makes the footer context estimate grow faster than the
+    // actual prompt sent to Cursor.
+    if (typed.type === "thinking") return total;
     if (typed.type === "toolCall") return total + estimateTextTokens(JSON.stringify(typed));
     if (typed.type === "image") return total + 85;
     return total;
@@ -1467,7 +1487,7 @@ async function handleCursorNativeRequest(
     turns,
     requestConversationId,
     requestCheckpoint,
-    stored.blobStore,
+    requestCheckpoint ? stored.blobStore : undefined,
     maxMode,
     body.cursor_model_parameters,
     mcpTools,
@@ -2146,6 +2166,11 @@ function mergeBlobStore(stored: StoredConversation, blobStore: Map<string, Uint8
   stored.lastAccessMs = Date.now();
 }
 
+function replaceBlobStore(stored: StoredConversation, blobStore: Map<string, Uint8Array>): void {
+  stored.blobStore = new Map(blobStore);
+  stored.lastAccessMs = Date.now();
+}
+
 function commitStoredCheckpoint(
   stored: StoredConversation,
   checkpointBytes: Uint8Array,
@@ -2155,7 +2180,7 @@ function commitStoredCheckpoint(
   systemPromptFingerprint: string,
 ): void {
   const completedHistory = [...completedTurns, currentTurn];
-  mergeBlobStore(stored, blobStore);
+  replaceBlobStore(stored, blobStore);
   stored.checkpoint = checkpointBytes;
   stored.checkpointTurnCount = completedHistory.length;
   stored.checkpointHistoryFingerprint = fingerprintCompletedTurns(completedHistory);
@@ -2490,7 +2515,7 @@ async function handleChatCompletion(
     turns,
     requestConversationId,
     requestCheckpoint,
-    stored.blobStore,
+    requestCheckpoint ? stored.blobStore : undefined,
     maxMode,
     body.cursor_model_parameters,
     mcpTools,
@@ -3021,7 +3046,7 @@ function createSelectedImages(images: ParsedImageContent[]) {
 
 function createUserMessage(
   text: string,
-  selectedContextBlob: Uint8Array,
+  selectedContextBlob?: Uint8Array,
   images: ParsedImageContent[] = [],
 ): UserMessage {
   const messageId = crypto.randomUUID();
@@ -3032,7 +3057,7 @@ function createUserMessage(
       selectedImages: createSelectedImages(images),
     }),
     mode: 1,
-    selectedContextBlob,
+    ...(selectedContextBlob ? { selectedContextBlob } : {}),
     correlationId: messageId,
   });
 }
@@ -3091,27 +3116,56 @@ function transcriptImageSummary(images: ParsedImageContent[] | undefined): strin
   return `\n[images: ${images.map((image) => `${image.mimeType}, ${image.data.length} bytes`).join("; ")}]`;
 }
 
+function truncateInlineHistoryText(text: string): string {
+  if (INLINE_HISTORY_SEGMENT_MAX_CHARS === 0) return `[omitted ${text.length} chars]`;
+  if (text.length <= INLINE_HISTORY_SEGMENT_MAX_CHARS) return text;
+  return `${text.slice(0, INLINE_HISTORY_SEGMENT_MAX_CHARS)}\n[truncated ${text.length - INLINE_HISTORY_SEGMENT_MAX_CHARS} chars]`;
+}
+
 function transcriptStepText(step: ParsedTurnStep): string {
-  if (step.kind === "assistantText") return `Assistant: ${step.text}`;
-  const args = Object.keys(step.arguments).length ? ` ${JSON.stringify(step.arguments)}` : "";
+  if (step.kind === "assistantText") return `Assistant: ${truncateInlineHistoryText(step.text)}`;
+  const argsText = Object.keys(step.arguments).length ? JSON.stringify(step.arguments) : "";
+  const args = argsText ? ` ${truncateInlineHistoryText(argsText)}` : "";
   const result = step.result
-    ? `\nTool result${step.result.isError ? " (error)" : ""}: ${step.result.content}${transcriptImageSummary(step.result.images)}`
+    ? `\nTool result${step.result.isError ? " (error)" : ""}: ${truncateInlineHistoryText(step.result.content)}${transcriptImageSummary(step.result.images)}`
     : "";
   return `Tool call: ${step.toolName || "tool"}${args}${result}`;
 }
 
 function inlineHistoryPrompt(turns: ParsedTurn[]): string | undefined {
-  if (turns.length === 0) return undefined;
-  const body = turns
-    .map((turn, index) => {
-      const lines = [
-        `Turn ${index + 1}`,
-        `User: ${turn.userText}${transcriptImageSummary(turn.userImages)}`,
-        ...turn.steps.map(transcriptStepText),
-      ];
-      return lines.join("\n");
-    })
-    .join("\n\n");
+  if (turns.length === 0 || INLINE_HISTORY_MAX_CHARS === 0) return undefined;
+  const turnBlocks = turns.map((turn, index) => {
+    const lines = [
+      `Turn ${index + 1}`,
+      `User: ${truncateInlineHistoryText(turn.userText)}${transcriptImageSummary(turn.userImages)}`,
+      ...turn.steps.map(transcriptStepText),
+    ];
+    return lines.join("\n");
+  });
+
+  const selectedBlocks: string[] = [];
+  let selectedLength = 0;
+  for (let index = turnBlocks.length - 1; index >= 0; index -= 1) {
+    const block = turnBlocks[index]!;
+    const separatorLength = selectedBlocks.length > 0 ? 2 : 0;
+    if (selectedLength + separatorLength + block.length > INLINE_HISTORY_MAX_CHARS) break;
+    selectedBlocks.unshift(block);
+    selectedLength += separatorLength + block.length;
+  }
+
+  if (selectedBlocks.length === 0) {
+    const lastBlock = turnBlocks.at(-1)!;
+    selectedBlocks.push(
+      lastBlock.length > INLINE_HISTORY_MAX_CHARS
+        ? `${lastBlock.slice(0, INLINE_HISTORY_MAX_CHARS)}\n[truncated ${lastBlock.length - INLINE_HISTORY_MAX_CHARS} chars]`
+        : lastBlock,
+    );
+  }
+
+  const omittedTurnCount = turns.length - selectedBlocks.length;
+  const omittedNotice =
+    omittedTurnCount > 0 ? `[${omittedTurnCount} older turn(s) omitted]\n\n` : "";
+  const body = `${omittedNotice}${selectedBlocks.join("\n\n")}`;
   return `Prior Pi conversation context follows. Use this transcript to resolve references in the current user message; the current user message is separate and comes after this context.\n\n<pi_conversation_history>\n${body}\n</pi_conversation_history>`;
 }
 
@@ -3218,7 +3272,7 @@ export function buildCursorRequest(
   } else {
     const turnBlobIds: Uint8Array[] = [];
     for (const turn of turns) {
-      const userMsg = createUserMessage(turn.userText, selectedCtxBlob, turn.userImages ?? []);
+      const userMsg = createUserMessage(turn.userText, undefined, turn.userImages ?? []);
       const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
       const stepBlobIds = turn.steps.map((s) => storeAsBlob(buildTurnStepBytes(s), blobStore));
 

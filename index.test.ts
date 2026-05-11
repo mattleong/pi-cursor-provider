@@ -2124,6 +2124,28 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(blobData.content).toBe("You are helpful");
   });
 
+  test("inline history root prompt is not attached to every reconstructed turn", () => {
+    const turns = [turn("first", [assistantStep("done")]), turn("second", [assistantStep("ok")])];
+    const payload = buildCursorRequest("gpt-5", "system", "continue", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+
+    expect(req.conversationState.rootPromptMessagesJson).toHaveLength(2);
+    const historyBlobId = Buffer.from(req.conversationState.rootPromptMessagesJson[1]).toString(
+      "hex",
+    );
+    const historyBlob = JSON.parse(new TextDecoder().decode(payload.blobStore.get(historyBlobId)!));
+    expect(historyBlob.content).toContain("<pi_conversation_history>");
+    expect(historyBlob.content).toContain("first");
+    expect(historyBlob.content).toContain("second");
+
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
+    expect(decoded[0].userMsg.selectedContextBlob).toHaveLength(0);
+    expect(decoded[1].userMsg.selectedContextBlob).toHaveLength(0);
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.selectedContextBlob).toBeInstanceOf(Uint8Array);
+    expect(userAction.userMessage.selectedContextBlob.length).toBeGreaterThan(0);
+  });
+
   test("each reconstructed turn has a unique messageId", () => {
     const turns = [turn("a", [assistantStep("b")]), turn("a", [assistantStep("b")])];
     const payload = buildCursorRequest("gpt-5", "system", "c", turns, "conv-1", null);
