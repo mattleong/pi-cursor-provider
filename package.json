@@ -60,11 +60,11 @@
     "vitest": "^4.1.3"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.72.1",
-    "@mariozechner/pi-coding-agent": "^0.72.1"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.6.0"
   },
   "pi": {
     "extensions": [

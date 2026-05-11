@@ -20,7 +20,7 @@ import {
   type TextContent as PiTextContent,
   type Tool as PiTool,
   type ToolCall as PiToolCall,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";

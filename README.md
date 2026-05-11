@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-cursor-provider.svg)](https://www.npmjs.com/package/pi-cursor-provider)
 
-[Pi](https://github.com/badlogic/pi-mono) extension that provides access to [Cursor](https://cursor.com) models via OAuth authentication and a native Pi `streamSimple` provider.
+[Pi](https://github.com/earendil-works/pi-mono) extension that provides access to [Cursor](https://cursor.com) models via OAuth authentication and a native Pi `streamSimple` provider.
 
 ## How it works
 
@@ -64,7 +64,7 @@ Examples:
 | `gpt-5.1-codex-max-high`       | `gpt-5.1-codex-max` | `high`   | —           |
 | `composer-2`                   | `composer-2`        | —        | —           |
 
-Models sharing the same `(base, variant)` with **≥2 effort levels** and a sensible default (`medium` or no-suffix) are collapsed into a single entry with `supportsReasoningEffort: true`. Pi's thinking level maps to the effort suffix:
+Models sharing the same `(base, variant)` with **≥2 effort levels** and a sensible default (`medium` or no-suffix) are collapsed into a single entry with a Pi `thinkingLevelMap`. Pi's thinking level maps to the effort suffix:
 
 | Pi Level  | Cursor Suffix                   |
 | --------- | ------------------------------- |
@@ -107,7 +107,7 @@ When a group is **collapsed**, the provider registers one model with Pi thinking
 - **Multiple** effort suffixes for the same `(base, -fast, -thinking)` group, or
 - **A single** variant whose parsed effort suffix is **non-empty** (for example only `claude-4.5-opus-high` is listed). The suffix is removed from the displayed ID so Pi's reasoning-effort setting supplies it.
 
-**Left as-is** (raw Cursor ID on that row, `supportsReasoningEffort: false`) when the group has **one** variant and the parsed effort suffix is **empty**—typically IDs with no effort segment, such as `composer-2`, `gemini-3.1-pro`, or `kimi-k2.5`.
+**Left as-is** (raw Cursor ID on that row, with no effort `thinkingLevelMap`) when the group has **one** variant and the parsed effort suffix is **empty**—typically IDs with no effort segment, such as `composer-2`, `gemini-3.1-pro`, or `kimi-k2.5`.
 
 ### Disabling the mapping
 
@@ -190,8 +190,8 @@ That reconstruction preserves:
 
 ## Requirements
 
-- [Pi](https://github.com/badlogic/pi-mono)
-- [Node.js](https://nodejs.org) >= 18
+- [Pi](https://github.com/earendil-works/pi-mono)
+- [Node.js](https://nodejs.org) >= 20.6.0
 - Active [Cursor](https://cursor.com) subscription
 
 ## Development

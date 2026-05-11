@@ -13,8 +13,8 @@
  */
 
 import rawFallbackModels from "./cursor-models-raw.json";
-import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
+import { AuthStorage, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -564,7 +564,7 @@ export function buildEffortMap(efforts: Set<string>): Record<string, string> {
   };
 }
 
-/** Dedup raw models: collapse effort variants into one entry with supportsReasoningEffort. */
+/** Dedup raw models: collapse effort variants into one entry with a Pi thinkingLevelMap. */
 export function processModels(raw: CursorModel[]): ProcessedModel[] {
   // Group by (base, fast, thinking)
   const groups = new Map<
@@ -659,15 +659,6 @@ function modelConfig(m: ProcessedModel) {
     cost: estimateModelCost(m.id),
     contextWindow: m.contextWindow,
     maxTokens: m.maxTokens,
-    compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: m.supportsEffort,
-      ...(m.supportsEffort &&
-        m.effortMap && {
-          reasoningEffortMap: m.effortMap,
-        }),
-      maxTokensField: "max_tokens" as const,
-    },
   };
 }
 
@@ -1380,6 +1371,7 @@ export default async function (pi: ExtensionAPI) {
     rawModelByEffortByModelId = buildRawModelLookup(processed);
 
     pi.registerProvider("cursor", {
+      name: "Cursor",
       baseUrl: "https://api2.cursor.sh",
       api: "cursor-native",
       streamSimple: createCursorNativeStream({
