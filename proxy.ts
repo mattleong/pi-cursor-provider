@@ -1439,7 +1439,13 @@ async function handleCursorNativeRequest(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
-  discardStaleCheckpointIfNeeded(stored, turns, systemPromptFingerprint, requestId, convKey);
+  const requestCheckpoint = checkpointForRequest(
+    stored,
+    turns,
+    systemPromptFingerprint,
+    requestId,
+    convKey,
+  );
 
   const mcpTools = buildMcpToolDefinitions(toolResolution.tools);
   const effectiveUserText = userText;
@@ -1450,7 +1456,7 @@ async function handleCursorNativeRequest(
     effectiveUserText,
     turns,
     stored.conversationId,
-    stored.checkpoint,
+    requestCheckpoint,
     stored.blobStore,
     maxMode,
     body.cursor_model_parameters,
@@ -1471,7 +1477,8 @@ async function handleCursorNativeRequest(
     bridgeKey,
     convKey,
     conversationId: stored.conversationId,
-    hasCheckpoint: !!stored.checkpoint,
+    hasStoredCheckpoint: !!stored.checkpoint,
+    hasRequestCheckpoint: !!requestCheckpoint,
     payload,
   });
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
@@ -2004,20 +2011,25 @@ function clearStoredCheckpoint(stored: StoredConversation, clearBlobStore = fals
   if (clearBlobStore) stored.blobStore.clear();
 }
 
+function isCursorCheckpointReuseEnabled(): boolean {
+  const raw = process.env.PI_CURSOR_REUSE_CHECKPOINTS?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 function discardStaleCheckpointIfNeeded(
   stored: StoredConversation,
   turns: ParsedTurn[],
   systemPromptFingerprint: string,
   requestId: string,
   convKey: string,
-): void {
+): boolean {
   if (!stored.checkpoint) {
     debugLog("checkpoint.decision", {
       requestId,
       convKey,
       checkpointDecision: "none",
     });
-    return;
+    return false;
   }
 
   const currentTurnCount = turns.length;
@@ -2047,7 +2059,7 @@ function discardStaleCheckpointIfNeeded(
       currentHistoryFingerprint,
       systemPromptFingerprint,
     });
-    return;
+    return true;
   }
 
   debugLog("chat.discard_checkpoint", {
@@ -2063,6 +2075,34 @@ function discardStaleCheckpointIfNeeded(
     systemPromptFingerprint,
   });
   clearStoredCheckpoint(stored, true);
+  return false;
+}
+
+function checkpointForRequest(
+  stored: StoredConversation,
+  turns: ParsedTurn[],
+  systemPromptFingerprint: string,
+  requestId: string,
+  convKey: string,
+): Uint8Array | null {
+  const validCheckpoint = discardStaleCheckpointIfNeeded(
+    stored,
+    turns,
+    systemPromptFingerprint,
+    requestId,
+    convKey,
+  );
+  if (!validCheckpoint || !stored.checkpoint) return null;
+  if (isCursorCheckpointReuseEnabled()) return stored.checkpoint;
+
+  debugLog("checkpoint.decision", {
+    requestId,
+    convKey,
+    checkpointDecision: "rebuild_from_pi_context",
+    reason: "checkpoint_reuse_disabled",
+    currentTurnCount: turns.length,
+  });
+  return null;
 }
 
 function mergeBlobStore(stored: StoredConversation, blobStore: Map<string, Uint8Array>): void {
@@ -2377,14 +2417,25 @@ async function handleChatCompletion(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
-  discardStaleCheckpointIfNeeded(stored, turns, systemPromptFingerprint, requestId, convKey);
+  const requestCheckpoint = checkpointForRequest(
+    stored,
+    turns,
+    systemPromptFingerprint,
+    requestId,
+    convKey,
+  );
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText =
     userText || (toolResults.length > 0 ? toolResults.map((r) => r.content).join("\n") : "");
   const effectiveUserImages = userText || userImages.length > 0 ? userImages : [];
-  if (!stored.checkpoint) {
-    debugLog("chat.no_checkpoint", { requestId, convKey, conversationId: stored.conversationId });
+  if (!requestCheckpoint) {
+    debugLog("chat.no_request_checkpoint", {
+      requestId,
+      convKey,
+      conversationId: stored.conversationId,
+      hasStoredCheckpoint: !!stored.checkpoint,
+    });
   }
   const payload = buildCursorRequest(
     modelId,
@@ -2392,7 +2443,7 @@ async function handleChatCompletion(
     effectiveUserText,
     turns,
     stored.conversationId,
-    stored.checkpoint,
+    requestCheckpoint,
     stored.blobStore,
     maxMode,
     body.cursor_model_parameters,
@@ -2405,7 +2456,8 @@ async function handleChatCompletion(
     conversationId: stored.conversationId,
     effectiveUserText,
     turnCount: turns.length,
-    hasCheckpoint: !!stored.checkpoint,
+    hasStoredCheckpoint: !!stored.checkpoint,
+    hasRequestCheckpoint: !!requestCheckpoint,
     payload,
   });
   payload.mcpTools = mcpTools;

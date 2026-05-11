@@ -2792,6 +2792,86 @@ describe("native streamSimple provider", () => {
     expect(events.at(-1).message.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
   });
 
+  test("rebuilds normal turns from Pi context instead of cached Cursor checkpoints", async () => {
+    const previousCheckpointSetting = process.env.PI_CURSOR_REUSE_CHECKPOINTS;
+    delete process.env.PI_CURSOR_REUSE_CHECKPOINTS;
+    try {
+      const runRequests: any[] = [];
+      setBridgeFactoryForTests(
+        (options) =>
+          new FakeBridge(options, (clientMessage, fake) => {
+            if (clientMessage.message.case === "runRequest") {
+              runRequests.push(clientMessage.message.value);
+              setTimeout(() => {
+                fake.emitServerMessage(makeTextDeltaMessage("pineapple"));
+                fake.emitServerMessage(makeCheckpointMessage());
+                fake.close(0);
+              }, 0);
+            }
+          }),
+      );
+
+      const sessionId = "native-rebuild-from-pi-context";
+      const convKey = deriveConversationKeyFromSessionId(sessionId);
+      const completedTurns = [turn("remember pineapple", [assistantStep("I will remember")])];
+      const emptyCheckpointPayload = buildCursorRequest(
+        "gpt-5",
+        "system",
+        "next",
+        [],
+        "conv-rebuild",
+        null,
+      );
+      __testInternals.conversationStates.set(convKey, {
+        conversationId: "conv-rebuild",
+        checkpoint: toBinary(
+          ConversationStateStructureSchema,
+          decodeRunRequest(emptyCheckpointPayload).conversationState,
+        ),
+        checkpointTurnCount: completedTurns.length,
+        checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(completedTurns),
+        checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
+        sessionScoped: true,
+        blobStore: new Map(emptyCheckpointPayload.blobStore),
+        lastAccessMs: Date.now(),
+      });
+
+      const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+      await collectEvents(
+        streamSimple(
+          nativeModel(),
+          {
+            systemPrompt: "system",
+            messages: [
+              { role: "user", content: "remember pineapple", timestamp: Date.now() },
+              {
+                role: "assistant",
+                content: [{ type: "text", text: "I will remember" }],
+                api: "cursor-native",
+                provider: "cursor",
+                model: "gpt-5",
+                usage: emptyUsage(),
+                stopReason: "stop",
+                timestamp: Date.now(),
+              },
+              { role: "user", content: "what did I ask you to remember?", timestamp: Date.now() },
+            ],
+          } as any,
+          { sessionId },
+        ),
+      );
+
+      expect(runRequests).toHaveLength(1);
+      expect(runRequests[0].conversationState.turns).toHaveLength(1);
+      expect(runRequests[0].action.action.value.userMessage.text).toBe(
+        "what did I ask you to remember?",
+      );
+    } finally {
+      if (previousCheckpointSetting === undefined) delete process.env.PI_CURSOR_REUSE_CHECKPOINTS;
+      else process.env.PI_CURSOR_REUSE_CHECKPOINTS = previousCheckpointSetting;
+    }
+  });
+
   test("image-only user request forwards selected images without the local proxy", async () => {
     const runRequests: any[] = [];
     setBridgeFactoryForTests(
