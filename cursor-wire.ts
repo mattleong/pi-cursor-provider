@@ -187,26 +187,3 @@ export function decodeAvailableModelsResponse(bytes: Uint8Array): CursorParamete
   }
   return models;
 }
-
-// No generated schema for selectedContextBlob; emit raw wire format for the two
-// fields Cursor actually reads: field 1 (repeated bytes) rootPromptMessagesJson
-// refs, field 22 (string) clientName. blobId.length < 128 (SHA256 = 32 bytes).
-export function buildSelectedContextBlob(
-  rootPromptBlobIds: Uint8Array[],
-  clientName: string,
-): Uint8Array {
-  const parts: Uint8Array[] = [];
-  for (const blobId of rootPromptBlobIds) {
-    parts.push(new Uint8Array([0x0a, blobId.length, ...blobId]));
-  }
-  const clientBytes = new TextEncoder().encode(clientName);
-  parts.push(new Uint8Array([0xb2, 0x01, clientBytes.length, ...clientBytes]));
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const p of parts) {
-    result.set(p, offset);
-    offset += p.length;
-  }
-  return result;
-}

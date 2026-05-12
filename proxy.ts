@@ -29,16 +29,11 @@ import { isAbsolute, join as pathJoin, resolve as pathResolve } from "node:path"
 import { pathToFileURL } from "node:url";
 import {
   AgentClientMessageSchema,
-  AgentRunRequestSchema,
   AgentServerMessageSchema,
   CancelActionSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
-  ConversationStepSchema,
-  AgentConversationTurnStructureSchema,
-  ConversationTurnStructureSchema,
-  AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
   ComputerUseErrorSchema,
   ComputerUseResultSchema,
@@ -56,12 +51,10 @@ import {
   ListMcpResourcesRejectedSchema,
   LsRejectedSchema,
   LsResultSchema,
-  McpArgsSchema,
   McpImageContentSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
-  McpToolCallSchema,
   McpToolDefinitionSchema,
   McpToolErrorSchema,
   McpToolResultSchema,
@@ -85,8 +78,6 @@ import {
   ShellRejectedSchema,
   ShellResultSchema,
   ShellStreamSchema,
-  ToolCallSchema,
-  UserMessageActionSchema,
   UserMessageSchema,
   WriteRejectedSchema,
   WriteResultSchema,
@@ -99,6 +90,8 @@ import {
   type ExecServerMessage,
   type KvServerMessage,
   type McpToolDefinition,
+  type McpTools,
+  type RequestedModel,
   type UserMessage,
 } from "./proto/agent_pb.js";
 import {
@@ -110,7 +103,6 @@ import {
   type BridgeHandle,
 } from "./bridge.js";
 import {
-  buildSelectedContextBlob,
   decodeAvailableModelsResponse,
   encodeAvailableModelsRequest,
   type CursorModelParameter,
@@ -1289,6 +1281,17 @@ function lostToolContinuationMessage(): string {
 function estimateInlineHistoryPromptTokens(body: ChatCompletionRequest): number {
   try {
     const parsed = parseMessages(body.messages, body.cursor_tool_result_images, false);
+    const sessionId = derivePiSessionId(body);
+    const convKey = deriveConversationKey(body.messages, sessionId);
+    const stored = conversationStates.get(convKey);
+    if (
+      stored?.checkpoint &&
+      stored.checkpointTurnCount === parsed.turns.length &&
+      stored.checkpointHistoryFingerprint === fingerprintCompletedTurns(parsed.turns) &&
+      stored.checkpointSystemPromptFingerprint === fingerprintSystemPrompt(parsed.systemPrompt)
+    ) {
+      return 0;
+    }
     const historyPrompt = inlineHistoryPrompt(parsed.turns, parsed.userText);
     return historyPrompt ? estimateTextTokens(historyPrompt) : 0;
   } catch {
@@ -2059,11 +2062,6 @@ function clearStoredCheckpoint(stored: StoredConversation, clearBlobStore = fals
   if (clearBlobStore) stored.blobStore.clear();
 }
 
-function isCursorCheckpointReuseEnabled(): boolean {
-  const raw = process.env.PI_CURSOR_REUSE_CHECKPOINTS?.trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
-}
-
 function discardStaleCheckpointIfNeeded(
   stored: StoredConversation,
   turns: ParsedTurn[],
@@ -2141,16 +2139,15 @@ function checkpointForRequest(
     convKey,
   );
   if (!validCheckpoint || !stored.checkpoint) return null;
-  if (isCursorCheckpointReuseEnabled()) return stored.checkpoint;
 
   debugLog("checkpoint.decision", {
     requestId,
     convKey,
-    checkpointDecision: "rebuild_from_pi_context",
-    reason: "checkpoint_reuse_disabled",
+    checkpointDecision: "reuse_valid_checkpoint",
+    reason: "valid_checkpoint_preserves_cursor_context",
     currentTurnCount: turns.length,
   });
-  return null;
+  return stored.checkpoint;
 }
 
 function conversationIdForRequest(
@@ -3039,26 +3036,6 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 
 // ── Build Cursor protobuf request ──
 
-function encodeMcpArgValue(value: unknown): Uint8Array {
-  try {
-    return toBinary(ValueSchema, fromJson(ValueSchema, value as JsonValue));
-  } catch {
-    return new TextEncoder().encode(String(value));
-  }
-}
-
-function encodeMcpArgsMap(args: Record<string, unknown>): Record<string, Uint8Array> {
-  const encoded: Record<string, Uint8Array> = {};
-  for (const [key, value] of Object.entries(args)) encoded[key] = encodeMcpArgValue(value);
-  return encoded;
-}
-
-function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint8Array {
-  const id = new Uint8Array(createHash("sha256").update(data).digest());
-  blobStore.set(Buffer.from(id).toString("hex"), data);
-  return id;
-}
-
 function createSelectedImages(images: ParsedImageContent[]) {
   // Matches Cursor CLI's ACP image path for inline image data:
   // new SelectedImage({ dataOrBlobId: { case: "data", value }, uuid, mimeType })
@@ -3071,12 +3048,11 @@ function createSelectedImages(images: ParsedImageContent[]) {
   );
 }
 
-function createUserMessage(
-  text: string,
-  selectedContextBlob?: Uint8Array,
-  images: ParsedImageContent[] = [],
-): UserMessage {
+function createUserMessage(text: string, images: ParsedImageContent[] = []): UserMessage {
   const messageId = crypto.randomUUID();
+  // The committed generated schema is older than Cursor CLI 2026.05.09 here:
+  // field 10 is conversation_state_blob_id, and field 17 is thread_id.
+  // Leave both unset instead of using stale selectedContextBlob/correlationId names.
   return create(UserMessageSchema, {
     text,
     messageId,
@@ -3084,8 +3060,6 @@ function createUserMessage(
       selectedImages: createSelectedImages(images),
     }),
     mode: 1,
-    ...(selectedContextBlob ? { selectedContextBlob } : {}),
-    correlationId: messageId,
   });
 }
 
@@ -3136,6 +3110,12 @@ function mcpResultFromParsedToolResult(result: ParsedToolResult) {
           }),
         },
   });
+}
+
+function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint8Array {
+  const id = new Uint8Array(createHash("sha256").update(data).digest());
+  blobStore.set(Buffer.from(id).toString("hex"), data);
+  return id;
 }
 
 function transcriptImageSummary(images: ParsedImageContent[] | undefined): string {
@@ -3313,17 +3293,7 @@ function inlineHistoryPrompt(turns: ParsedTurn[], currentUserText: string): stri
   });
 
   const body = selectedInlineHistoryBlocks(turnBlocks, currentUserText).join("\n\n");
-  return `Prior Pi conversation context follows. Use this transcript to resolve references in the current user message; the current user message is separate and comes after this context.\n\n<pi_conversation_history>\n${body}\n</pi_conversation_history>`;
-}
-
-function rootPromptBlobIdsForRequest(
-  systemPrompt: string,
-  blobStore: Map<string, Uint8Array>,
-): Uint8Array[] {
-  const systemBytes = new TextEncoder().encode(
-    JSON.stringify({ role: "system", content: systemPrompt }),
-  );
-  return [storeAsBlob(systemBytes, blobStore)];
+  return `Prior Pi conversation context follows. This is a redundant safety copy of the full prior Pi transcript. Use it to preserve session continuity and resolve references in the current user message; the current user message is separate and comes after this context.\n\n<pi_conversation_history>\n${body}\n</pi_conversation_history>`;
 }
 
 function userTextWithInlineHistory(userText: string, historyPrompt: string | undefined): string {
@@ -3334,45 +3304,287 @@ function userTextWithInlineHistory(userText: string, historyPrompt: string | und
   return `${historyPrompt}\n\nCurrent user message:\n<current_user_message>\n${currentUserText}\n</current_user_message>`;
 }
 
-function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
-  if (step.kind === "assistantText") {
-    return toBinary(
-      ConversationStepSchema,
-      create(ConversationStepSchema, {
-        message: {
-          case: "assistantMessage",
-          value: create(AssistantMessageSchema, { text: step.text }),
-        },
-      }),
+function rootPromptBlobIds(systemPrompt: string, blobStore: Map<string, Uint8Array>): Uint8Array[] {
+  if (!systemPrompt.trim()) return [];
+  return [
+    storeAsBlob(
+      new TextEncoder().encode(JSON.stringify({ role: "system", content: systemPrompt })),
+      blobStore,
+    ),
+  ];
+}
+
+function encodeWireVarint(value: number): Uint8Array {
+  const out: number[] = [];
+  let current = value >>> 0;
+  while (current >= 0x80) {
+    out.push((current & 0x7f) | 0x80);
+    current >>>= 7;
+  }
+  out.push(current);
+  return new Uint8Array(out);
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.length;
+  }
+  return result;
+}
+
+function encodeLengthDelimitedField(fieldNo: number, value: Uint8Array): Uint8Array {
+  return concatBytes([encodeWireVarint((fieldNo << 3) | 2), encodeWireVarint(value.length), value]);
+}
+
+function encodePreFetchedBlob(id: Uint8Array, value: Uint8Array): Uint8Array {
+  return concatBytes([encodeLengthDelimitedField(1, id), encodeLengthDelimitedField(2, value)]);
+}
+
+function appendPreFetchedBlobsToRunRequest(
+  runRequestBytes: Uint8Array,
+  blobStore: Map<string, Uint8Array>,
+): Uint8Array {
+  if (blobStore.size === 0) return runRequestBytes;
+  const fields = [...blobStore.entries()].map(([hexId, value]) =>
+    encodeLengthDelimitedField(17, encodePreFetchedBlob(Buffer.from(hexId, "hex"), value)),
+  );
+  return concatBytes([runRequestBytes, ...fields]);
+}
+
+function encodeAgentClientRunRequest(runRequestBytes: Uint8Array): Uint8Array {
+  return encodeLengthDelimitedField(1, runRequestBytes);
+}
+
+function summarizeBlobStore(blobStore: Map<string, Uint8Array>) {
+  const entries = [...blobStore.entries()].map(([id, bytes]) => ({ id, bytes: bytes.length }));
+  entries.sort((a, b) => b.bytes - a.bytes);
+  return {
+    count: blobStore.size,
+    bytes: entries.reduce((sum, entry) => sum + entry.bytes, 0),
+    largest: entries.slice(0, 5),
+  };
+}
+
+function turnStats(turns: ParsedTurn[]) {
+  return {
+    count: turns.length,
+    stepCount: turns.reduce((sum, turn) => sum + turn.steps.length, 0),
+    toolStepCount: turns.reduce(
+      (sum, turn) => sum + turn.steps.filter((step) => step.kind === "toolCall").length,
+      0,
+    ),
+  };
+}
+
+interface EncodedConversationHistory {
+  bytes?: Uint8Array;
+  messageCount: number;
+  userMessageCount: number;
+  assistantMessageCount: number;
+  toolMessageCount: number;
+}
+
+function encodeStringField(fieldNo: number, value: string): Uint8Array {
+  return encodeLengthDelimitedField(fieldNo, new TextEncoder().encode(value));
+}
+
+function encodeBoolField(fieldNo: number, value: boolean): Uint8Array {
+  return concatBytes([encodeWireVarint((fieldNo << 3) | 0), new Uint8Array([value ? 1 : 0])]);
+}
+
+function encodeConversationHistoryText(text: string): Uint8Array {
+  return encodeStringField(1, text);
+}
+
+function encodeConversationHistoryImage(image: ParsedImageContent): Uint8Array {
+  const fields = [encodeStringField(1, Buffer.from(image.data).toString("base64"))];
+  if (image.mimeType) fields.push(encodeStringField(2, image.mimeType));
+  return concatBytes(fields);
+}
+
+function encodeConversationHistoryUserContentText(text: string): Uint8Array {
+  return encodeLengthDelimitedField(1, encodeConversationHistoryText(text));
+}
+
+function encodeConversationHistoryUserContentImage(image: ParsedImageContent): Uint8Array {
+  return encodeLengthDelimitedField(2, encodeConversationHistoryImage(image));
+}
+
+function encodeConversationHistoryAssistantContentText(text: string): Uint8Array {
+  return encodeLengthDelimitedField(1, encodeConversationHistoryText(text));
+}
+
+function encodeConversationHistoryToolCall(step: ParsedToolCallStep): Uint8Array {
+  const fields = [
+    encodeStringField(1, step.toolCallId),
+    encodeStringField(2, step.toolName || "tool"),
+    encodeStringField(3, JSON.stringify(step.arguments ?? {})),
+  ];
+  return concatBytes(fields);
+}
+
+function encodeConversationHistoryAssistantContentToolCall(step: ParsedToolCallStep): Uint8Array {
+  return encodeLengthDelimitedField(4, encodeConversationHistoryToolCall(step));
+}
+
+function encodeConversationHistoryToolResultContentText(text: string): Uint8Array {
+  return encodeLengthDelimitedField(1, encodeConversationHistoryText(text));
+}
+
+function encodeConversationHistoryToolResultContentImage(image: ParsedImageContent): Uint8Array {
+  return encodeLengthDelimitedField(2, encodeConversationHistoryImage(image));
+}
+
+function encodeConversationHistoryUserMessage(turn: ParsedTurn): Uint8Array | undefined {
+  const contents: Uint8Array[] = [];
+  if (turn.userText.trim()) {
+    contents.push(
+      encodeLengthDelimitedField(1, encodeConversationHistoryUserContentText(turn.userText)),
     );
   }
+  for (const image of turn.userImages ?? []) {
+    contents.push(encodeLengthDelimitedField(1, encodeConversationHistoryUserContentImage(image)));
+  }
+  if (contents.length === 0) return undefined;
+  return concatBytes(contents);
+}
 
-  const toolName = step.toolName || "tool";
-  const mcpToolCall = create(McpToolCallSchema, {
-    args: create(McpArgsSchema, {
-      name: toolName,
-      args: encodeMcpArgsMap(step.arguments),
-      toolCallId: step.toolCallId,
-      providerIdentifier: "pi",
-      toolName,
-    }),
-    ...(step.result && { result: mcpResultFromParsedToolResult(step.result) }),
-  });
+function encodeConversationHistoryAssistantTextMessage(text: string): Uint8Array | undefined {
+  if (!text.trim()) return undefined;
+  return encodeLengthDelimitedField(1, encodeConversationHistoryAssistantContentText(text));
+}
 
-  return toBinary(
-    ConversationStepSchema,
-    create(ConversationStepSchema, {
-      message: {
-        case: "toolCall",
-        value: create(ToolCallSchema, {
-          tool: {
-            case: "mcpToolCall",
-            value: mcpToolCall,
-          },
-        }),
-      },
-    }),
-  );
+function encodeConversationHistoryAssistantToolCallMessage(
+  step: ParsedToolCallStep,
+): Uint8Array | undefined {
+  if (!step.toolCallId && !step.toolName) return undefined;
+  return encodeLengthDelimitedField(1, encodeConversationHistoryAssistantContentToolCall(step));
+}
+
+function encodeConversationHistoryToolMessage(step: ParsedToolCallStep): Uint8Array | undefined {
+  if (!step.result) return undefined;
+  const fields = [
+    encodeStringField(1, step.toolCallId),
+    encodeStringField(2, step.toolName || "tool"),
+  ];
+  if (step.result.content.length > 0 || (step.result.images ?? []).length === 0) {
+    fields.push(
+      encodeLengthDelimitedField(
+        3,
+        encodeConversationHistoryToolResultContentText(step.result.content),
+      ),
+    );
+  }
+  for (const image of step.result.images ?? []) {
+    fields.push(
+      encodeLengthDelimitedField(3, encodeConversationHistoryToolResultContentImage(image)),
+    );
+  }
+  if (step.result.isError) fields.push(encodeBoolField(4, true));
+  return concatBytes(fields);
+}
+
+function encodeConversationHistoryMessage(fieldNo: 1 | 2 | 3, value: Uint8Array): Uint8Array {
+  return encodeLengthDelimitedField(fieldNo, value);
+}
+
+function encodeConversationHistoryForTurns(turns: ParsedTurn[]): EncodedConversationHistory {
+  const messages: Uint8Array[] = [];
+  let userMessageCount = 0;
+  let assistantMessageCount = 0;
+  let toolMessageCount = 0;
+
+  for (const turn of turns) {
+    const userMessage = encodeConversationHistoryUserMessage(turn);
+    if (userMessage) {
+      messages.push(
+        encodeLengthDelimitedField(1, encodeConversationHistoryMessage(1, userMessage)),
+      );
+      userMessageCount += 1;
+    }
+
+    for (const step of turn.steps) {
+      if (step.kind === "assistantText") {
+        const assistantMessage = encodeConversationHistoryAssistantTextMessage(step.text);
+        if (assistantMessage) {
+          messages.push(
+            encodeLengthDelimitedField(1, encodeConversationHistoryMessage(2, assistantMessage)),
+          );
+          assistantMessageCount += 1;
+        }
+        continue;
+      }
+
+      const assistantToolCall = encodeConversationHistoryAssistantToolCallMessage(step);
+      if (assistantToolCall) {
+        messages.push(
+          encodeLengthDelimitedField(1, encodeConversationHistoryMessage(2, assistantToolCall)),
+        );
+        assistantMessageCount += 1;
+      }
+
+      const toolMessage = encodeConversationHistoryToolMessage(step);
+      if (toolMessage) {
+        messages.push(
+          encodeLengthDelimitedField(1, encodeConversationHistoryMessage(3, toolMessage)),
+        );
+        toolMessageCount += 1;
+      }
+    }
+  }
+
+  return {
+    bytes: messages.length > 0 ? concatBytes(messages) : undefined,
+    messageCount: messages.length,
+    userMessageCount,
+    assistantMessageCount,
+    toolMessageCount,
+  };
+}
+
+function encodeUserMessageAction(
+  userMessage: UserMessage,
+  conversationHistory: EncodedConversationHistory,
+): Uint8Array {
+  const fields = [encodeLengthDelimitedField(1, toBinary(UserMessageSchema, userMessage))];
+  if (conversationHistory.bytes)
+    fields.push(encodeLengthDelimitedField(7, conversationHistory.bytes));
+  return concatBytes(fields);
+}
+
+function encodeUserMessageConversationAction(
+  userMessage: UserMessage,
+  conversationHistory: EncodedConversationHistory,
+): Uint8Array {
+  return encodeLengthDelimitedField(1, encodeUserMessageAction(userMessage, conversationHistory));
+}
+
+function encodeAgentRunRequest(params: {
+  conversationState: ConversationStateStructure;
+  userMessage: UserMessage;
+  conversationHistory: EncodedConversationHistory;
+  requestedModel: RequestedModel;
+  mcpTools: McpTools;
+  conversationId: string;
+}): Uint8Array {
+  const fields = [
+    encodeLengthDelimitedField(
+      1,
+      toBinary(ConversationStateStructureSchema, params.conversationState),
+    ),
+    encodeLengthDelimitedField(
+      2,
+      encodeUserMessageConversationAction(params.userMessage, params.conversationHistory),
+    ),
+    encodeLengthDelimitedField(9, toBinary(RequestedModelSchema, params.requestedModel)),
+    encodeLengthDelimitedField(4, toBinary(McpToolsSchema, params.mcpTools)),
+  ];
+  if (params.conversationId) fields.push(encodeStringField(5, params.conversationId));
+  return concatBytes(fields);
 }
 
 export function buildCursorRequest(
@@ -3391,12 +3603,12 @@ export function buildCursorRequest(
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
-    systemPrompt,
-    userText,
-    turns,
+    systemPromptChars: systemPrompt.length,
+    userTextChars: userText.length,
+    turns: turnStats(turns),
     conversationId,
-    checkpoint,
-    existingBlobStore,
+    checkpointBytes: checkpoint?.length ?? 0,
+    existingBlobStore: existingBlobStore ? summarizeBlobStore(existingBlobStore) : undefined,
     maxMode,
     cursorModelParameters,
     mcpToolCount: mcpTools.length,
@@ -3404,59 +3616,40 @@ export function buildCursorRequest(
     workspaceContext,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
-  const historyPrompt = inlineHistoryPrompt(turns, userText);
-  const rootPromptBlobIds = rootPromptBlobIdsForRequest(systemPrompt, blobStore);
-  const selectedCtxBlob = storeAsBlob(buildSelectedContextBlob(rootPromptBlobIds, "pi"), blobStore);
+  const historyPrompt = checkpoint ? undefined : inlineHistoryPrompt(turns, userText);
+  const rootPromptMessagesJson = checkpoint ? [] : rootPromptBlobIds(systemPrompt, blobStore);
+  const conversationHistory = checkpoint
+    ? {
+        messageCount: 0,
+        userMessageCount: 0,
+        assistantMessageCount: 0,
+        toolMessageCount: 0,
+      }
+    : encodeConversationHistoryForTurns(turns);
 
-  let conversationState;
-  if (checkpoint) {
-    conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
-  } else {
-    const turnBlobIds: Uint8Array[] = [];
-    for (const turn of turns) {
-      const userMsg = createUserMessage(turn.userText, undefined, turn.userImages ?? []);
-      const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
-      const stepBlobIds = turn.steps.map((s) => storeAsBlob(buildTurnStepBytes(s), blobStore));
-
-      const agentTurn = create(AgentConversationTurnStructureSchema, {
-        userMessage: userMsgBlobId,
-        steps: stepBlobIds,
-        requestId: crypto.randomUUID(),
+  const conversationState = checkpoint
+    ? fromBinary(ConversationStateStructureSchema, checkpoint)
+    : create(ConversationStateStructureSchema, {
+        rootPromptMessagesJson,
+        turns: [],
+        todos: [],
+        pendingToolCalls: [],
+        previousWorkspaceUris: [workspaceContext.workspaceUri],
+        mode: 1,
+        fileStates: {},
+        fileStatesV2: {},
+        summaryArchives: [],
+        turnTimings: [],
+        subagentStates: {},
+        selfSummaryCount: 0,
+        readPaths: [],
+        clientName: "pi",
       });
-      const turnStructure = create(ConversationTurnStructureSchema, {
-        turn: { case: "agentConversationTurn", value: agentTurn },
-      });
-      turnBlobIds.push(
-        storeAsBlob(toBinary(ConversationTurnStructureSchema, turnStructure), blobStore),
-      );
-    }
-
-    conversationState = create(ConversationStateStructureSchema, {
-      rootPromptMessagesJson: rootPromptBlobIds,
-      turns: turnBlobIds,
-      todos: [],
-      pendingToolCalls: [],
-      previousWorkspaceUris: [workspaceContext.workspaceUri],
-      mode: 1,
-      fileStates: {},
-      fileStatesV2: {},
-      summaryArchives: [],
-      turnTimings: [],
-      subagentStates: {},
-      selfSummaryCount: 0,
-      readPaths: [],
-      clientName: "pi",
-    });
-  }
 
   const userMessage = createUserMessage(
     userTextWithInlineHistory(userText, historyPrompt),
-    selectedCtxBlob,
     userImages,
   );
-  const action = create(ConversationActionSchema, {
-    action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) },
-  });
   // Cursor's newer request path uses requestedModel instead of legacy modelDetails.
   // Some Cursor models (for example GPT-5.5) use requestedModel.parameters
   // for context/reasoning/fast instead of encoding everything in the model ID.
@@ -3470,23 +3663,38 @@ export function buildCursorRequest(
     create(RequestedModel_ModelParameterbytesSchema, parameter),
   );
   const requestedModel = create(RequestedModelSchema, { modelId, maxMode, parameters });
-  const runRequest = create(AgentRunRequestSchema, {
+  const mcpToolsMessage = create(McpToolsSchema, { mcpTools });
+  const runRequestBytesWithoutPrefetch = encodeAgentRunRequest({
     conversationState,
-    action,
+    userMessage,
+    conversationHistory,
     requestedModel,
+    mcpTools: mcpToolsMessage,
     conversationId,
-    mcpTools: create(McpToolsSchema, { mcpTools }),
   });
-  const clientMessage = create(AgentClientMessageSchema, {
-    message: { case: "runRequest", value: runRequest },
-  });
+  const runRequestBytes = appendPreFetchedBlobsToRunRequest(
+    runRequestBytesWithoutPrefetch,
+    blobStore,
+  );
 
   const payload = {
-    requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
+    requestBytes: encodeAgentClientRunRequest(runRequestBytes),
     blobStore,
     mcpTools,
   };
-  debugLog("cursor_request.build.end", payload);
+  debugLog("cursor_request.build.end", {
+    conversationId,
+    checkpointUsed: Boolean(checkpoint),
+    conversationTurns: (conversationState as any).turns?.length ?? 0,
+    rootPromptMessages: (conversationState as any).rootPromptMessagesJson?.length ?? 0,
+    conversationHistory,
+    inlineHistoryChars: historyPrompt?.length ?? 0,
+    requestBytes: payload.requestBytes.length,
+    runRequestBytes: runRequestBytes.length,
+    prefetchBytes: runRequestBytes.length - runRequestBytesWithoutPrefetch.length,
+    blobs: summarizeBlobStore(blobStore),
+    mcpToolCount: mcpTools.length,
+  });
   return payload;
 }
 

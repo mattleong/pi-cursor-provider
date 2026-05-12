@@ -23,7 +23,7 @@ The repository currently commits the generated TypeScript only; the upstream `.p
 
 ## Manual wire helpers
 
-`cursor-wire.ts` contains the remaining reverse-engineered wire helpers that do not yet have generated schemas in this repo:
+`cursor-wire.ts` and `proxy.ts` contain the remaining reverse-engineered wire helpers that do not yet have generated schemas in this repo:
 
 - `AvailableModelsRequest` encoder:
   - field 5: `use_model_parameters = true`
@@ -49,8 +49,22 @@ The repository currently commits the generated TypeScript only; the upstream `.p
 - MCP schema compatibility:
   - Cursor CLI's current `agent.v1.McpToolDefinition.input_schema` and `McpArgs.args` map values are `google.protobuf.Value` messages.
   - The committed generated `proto/agent_pb.ts` still exposes those length-delimited fields as `bytes`, so the provider writes and reads serialized `Value` bytes at those positions.
-- `selectedContextBlob` encoder:
-  - field 1: repeated root prompt blob ids
-  - field 22: client name
+- `AgentRunRequest.pre_fetched_blobs` encoder in `proxy.ts`:
+  - request field 17: repeated pre-fetched blob
+  - pre-fetched blob field 1: blob id bytes
+  - pre-fetched blob field 2: blob value bytes
+- System prompts are sent as JSON root prompt blobs referenced by `ConversationStateStructure.root_prompt_messages_json`. The provider deliberately does **not** send `AgentRunRequest.custom_system_prompt` because live Cursor backends can reject it as the internal `--system-prompt` option.
+- `UserMessageAction.conversation_history` encoder in `proxy.ts`:
+  - user-message action field 7: `ConversationHistory`
+  - conversation history field 1: repeated messages
+  - message field 1/2/3: user/assistant/tool oneof
+  - user and assistant content field 1: repeated content
+  - text content field 1: text
+  - image content fields 1/2: base64 data string / MIME type
+  - assistant content field 4: tool call
+  - tool call fields 1/2/3: tool call id / tool name / JSON args
+  - tool message fields 1/2/3/4: tool call id / tool name / repeated result content / is error
+
+Cursor CLI `2026.05.09-0afadcc` no longer treats `UserMessage` field 10 as `selectedContextBlob`; that field is `conversation_state_blob_id` in the installed agent bundle, and field 17 is `thread_id`. The provider therefore does not send the stale field-10 selected-context or field-17 correlation workaround. Normal Pi-history rebuilds use `UserMessageAction.conversation_history` with no duplicated turn history in `ConversationStateStructure.turns`; the state only carries root prompt blob references and other non-history scaffolding. Rebuild requests intentionally include a redundant inline Pi transcript safety copy in the current `UserMessage.text` by default so prior context remains visible if Cursor ignores the reverse-engineered native history field. Valid checkpoints may be reused when their Pi-history/system-prompt fingerprints still match; checkpoint-backed requests do not add the inline transcript, avoiding repeated checkpoint+transcript duplication.
 
 Prefer replacing these helpers with generated schemas once the corresponding `.proto` definitions are available.

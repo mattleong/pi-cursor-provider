@@ -150,8 +150,9 @@ The native provider runtime maintains conversation state per Pi session, enablin
 
 ### How it works
 
-- **Session tracking** — Pi passes the session ID through `streamSimple` options. The provider keys bridge state and stored conversation state from that real session ID.
-- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The provider stores that checkpoint and validates it with completed-turn metadata, but normal new turns default to rebuilding from Pi's message history with a context-derived Cursor conversation ID so Pi remains the source of truth. Rebuilt requests also include a bounded inline Pi transcript directly in the current user message as a safety net for Cursor backends that ignore structured reconstructed turns. Set `PI_CURSOR_REUSE_CHECKPOINTS=1` to opt back into checkpoint reuse for debugging/performance experiments.
+- **Session tracking** — Pi passes the session ID through `streamSimple` options; the provider hook also fills it from Pi's session manager if a caller omits it. Bridge state and stored conversation state are keyed from that real session ID.
+- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The provider reuses a checkpoint only when its completed-turn fingerprint and system-prompt fingerprint still match Pi's current branch. Stale checkpoints are discarded; missing checkpoints rebuild from Pi's message history with a context-derived Cursor conversation ID.
+- **Redundant history** — Rebuild requests carry Pi's completed history through Cursor's native `UserMessageAction.conversation_history` field and also paste a full inline transcript safety copy into the current user message by default. Valid checkpoint requests do not duplicate that transcript, which avoids runaway context growth during normal sessions.
 - **Session-scoped state** — real pi session state is kept in memory until explicit cleanup or process restart. Anonymous fallback state can still be TTL-evicted.
 - **Lifecycle cleanup** — session state is cleaned up on pi lifecycle events such as session switch, fork, `/tree`, and shutdown.
 
@@ -174,13 +175,13 @@ When you navigate back in Pi's session tree and branch from an earlier point, th
 - completed turn count mismatches, and
 - same-depth branch changes detected via completed-history fingerprint mismatch.
 
-When a checkpoint is stale or checkpoint reuse is disabled, the provider reconstructs proper protobuf conversation turns from the message history Pi sends and uses a conversation ID derived from that Pi context, so Cursor sees the actual conversation structure at the fork point instead of any cached Cursor-side state.
+When a checkpoint is stale or missing, the provider imports Pi's completed message history through Cursor's native `UserMessageAction.conversation_history` field and uses a conversation ID derived from that Pi context, so Cursor sees the actual conversation structure at the fork point instead of any cached Cursor-side state. The inline safety transcript is also derived from Pi's current branch, so forked requests do not rely on stale Cursor-side state.
 
 ### Session resume
 
-Conversation state is stored in memory. If the provider process restarts, checkpoints are lost. On each normal request, Pi sends the full conversation history, and the provider reconstructs structured protobuf turns from that history instead of relying on an inline plaintext fallback.
+Conversation state is stored in memory. If the provider process restarts, checkpoints are lost. On each normal request, Pi sends the full conversation history, and the provider imports structured history via Cursor's native conversation-history field plus the inline transcript safety copy.
 
-The inline transcript safety net is placed directly in the current user message for maximum Cursor visibility and is still backed by structured reconstructed turns. By default it is unbounded so it mirrors all Pi-provided prior turns instead of saying older turns were omitted. Optional caps are available for performance/debugging: set `PI_CURSOR_INLINE_HISTORY_MAX_CHARS`, `PI_CURSOR_INLINE_HISTORY_HEAD_MAX_CHARS`, and `PI_CURSOR_INLINE_HISTORY_SEGMENT_MAX_CHARS` to non-negative numbers, or set the total max to `0` to disable the inline safety net.
+Requests use Cursor's current native shape: prior Pi history in `UserMessageAction.conversation_history` when rebuilding, the system prompt as a root prompt blob referenced by `ConversationStateStructure.root_prompt_messages_json`, request blobs preloaded via `AgentRunRequest.pre_fetched_blobs`, and no stale `selectedContextBlob`/`correlationId` workaround fields. When no valid checkpoint is available, the current `UserMessage.text` includes the redundant inline transcript safety net by default; set `PI_CURSOR_INLINE_HISTORY_MAX_CHARS=0` to disable it, or cap it with `PI_CURSOR_INLINE_HISTORY_MAX_CHARS`, `PI_CURSOR_INLINE_HISTORY_HEAD_MAX_CHARS`, and `PI_CURSOR_INLINE_HISTORY_SEGMENT_MAX_CHARS`.
 
 That reconstruction preserves:
 

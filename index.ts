@@ -387,6 +387,15 @@ function registerCursorPayloadContextHook(pi: ExtensionAPI) {
     if (!Array.isArray(typedPayload.messages)) return;
 
     const nextPayload: Record<string, unknown> = { ...typedPayload };
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    if (typeof sessionId === "string" && sessionId.trim()) {
+      if (typeof nextPayload.pi_session_id !== "string" || !nextPayload.pi_session_id.trim()) {
+        nextPayload.pi_session_id = sessionId;
+      }
+      if (typeof nextPayload.user !== "string" || !nextPayload.user.trim()) {
+        nextPayload.user = sessionId;
+      }
+    }
     if (typeof ctx.cwd === "string" && ctx.cwd.trim()) {
       nextPayload.cursor_workspace_path = ctx.cwd;
     }

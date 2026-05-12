@@ -50,8 +50,6 @@ import {
   AgentClientMessageSchema,
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
-  ConversationTurnStructureSchema,
-  ConversationStepSchema,
   ExecServerMessageSchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
@@ -60,7 +58,6 @@ import {
   RequestContextArgsSchema,
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
-  UserMessageSchema,
 } from "./proto/agent_pb.ts";
 
 afterEach(() => {
@@ -1677,6 +1674,265 @@ function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>): any {
   return clientMsg.message.value as any;
 }
 
+function readRawVarint(bytes: Uint8Array, offsetRef: { offset: number }): number {
+  let result = 0;
+  let shift = 0;
+  while (offsetRef.offset < bytes.length) {
+    const byte = bytes[offsetRef.offset++]!;
+    result += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) return result;
+    shift += 7;
+  }
+  throw new Error("unexpected EOF reading varint");
+}
+
+function readRawLengthDelimited(bytes: Uint8Array, offsetRef: { offset: number }): Uint8Array {
+  const length = readRawVarint(bytes, offsetRef);
+  const end = offsetRef.offset + length;
+  if (end > bytes.length) throw new Error("length-delimited field exceeds buffer");
+  const value = bytes.subarray(offsetRef.offset, end);
+  offsetRef.offset = end;
+  return value;
+}
+
+function skipRawField(bytes: Uint8Array, offsetRef: { offset: number }, wireType: number): void {
+  if (wireType === 0) {
+    readRawVarint(bytes, offsetRef);
+    return;
+  }
+  if (wireType === 1) {
+    offsetRef.offset += 8;
+    return;
+  }
+  if (wireType === 2) {
+    readRawLengthDelimited(bytes, offsetRef);
+    return;
+  }
+  if (wireType === 5) {
+    offsetRef.offset += 4;
+    return;
+  }
+  throw new Error(`unsupported test wire type ${wireType}`);
+}
+
+function decodeRawString(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes);
+}
+
+function findRawLengthDelimitedFields(bytes: Uint8Array, targetFieldNo: number): Uint8Array[] {
+  const offsetRef = { offset: 0 };
+  const values: Uint8Array[] = [];
+  while (offsetRef.offset < bytes.length) {
+    const tag = readRawVarint(bytes, offsetRef);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === targetFieldNo && wireType === 2) {
+      values.push(readRawLengthDelimited(bytes, offsetRef));
+    } else {
+      skipRawField(bytes, offsetRef, wireType);
+    }
+  }
+  return values;
+}
+
+function getRunRequestBytesFromAgentClientMessageFrame(frame: Uint8Array): Uint8Array | undefined {
+  return findRawLengthDelimitedFields(frame, 1)[0];
+}
+
+function getConversationHistoryBytesFromRunRequestBytes(
+  runRequestBytes: Uint8Array,
+): Uint8Array | undefined {
+  const actionBytes = findRawLengthDelimitedFields(runRequestBytes, 2)[0];
+  if (!actionBytes) return undefined;
+  const userMessageActionBytes = findRawLengthDelimitedFields(actionBytes, 1)[0];
+  if (!userMessageActionBytes) return undefined;
+  return findRawLengthDelimitedFields(userMessageActionBytes, 7)[0];
+}
+
+type DecodedConversationHistoryMessage =
+  | {
+      role: "user";
+      content: Array<
+        { type: "text"; text: string } | { type: "image"; data: string; mimeType?: string }
+      >;
+    }
+  | {
+      role: "assistant";
+      content: Array<
+        | { type: "text"; text: string }
+        | { type: "toolCall"; toolCallId: string; toolName: string; argsJson: string }
+      >;
+    }
+  | {
+      role: "tool";
+      toolCallId: string;
+      toolName: string;
+      isError?: boolean;
+      content: Array<
+        { type: "text"; text: string } | { type: "image"; data: string; mimeType?: string }
+      >;
+    };
+
+function decodeHistoryTextContent(bytes: Uint8Array): string {
+  const value = findRawLengthDelimitedFields(bytes, 1)[0];
+  return value ? decodeRawString(value) : "";
+}
+
+function decodeHistoryImageContent(bytes: Uint8Array) {
+  const data = findRawLengthDelimitedFields(bytes, 1)[0];
+  const mimeType = findRawLengthDelimitedFields(bytes, 2)[0];
+  return {
+    type: "image" as const,
+    data: data ? decodeRawString(data) : "",
+    ...(mimeType ? { mimeType: decodeRawString(mimeType) } : {}),
+  };
+}
+
+function decodeHistoryUserMessage(bytes: Uint8Array): DecodedConversationHistoryMessage {
+  const content = findRawLengthDelimitedFields(bytes, 1).map((contentBytes) => {
+    const text = findRawLengthDelimitedFields(contentBytes, 1)[0];
+    if (text) return { type: "text" as const, text: decodeHistoryTextContent(text) };
+    const image = findRawLengthDelimitedFields(contentBytes, 2)[0];
+    if (image) return decodeHistoryImageContent(image);
+    return { type: "text" as const, text: "" };
+  });
+  return { role: "user", content };
+}
+
+function decodeHistoryToolCall(bytes: Uint8Array) {
+  const toolCallId = findRawLengthDelimitedFields(bytes, 1)[0];
+  const toolName = findRawLengthDelimitedFields(bytes, 2)[0];
+  const argsJson = findRawLengthDelimitedFields(bytes, 3)[0];
+  return {
+    type: "toolCall" as const,
+    toolCallId: toolCallId ? decodeRawString(toolCallId) : "",
+    toolName: toolName ? decodeRawString(toolName) : "",
+    argsJson: argsJson ? decodeRawString(argsJson) : "",
+  };
+}
+
+function decodeHistoryAssistantMessage(bytes: Uint8Array): DecodedConversationHistoryMessage {
+  const content = findRawLengthDelimitedFields(bytes, 1).map((contentBytes) => {
+    const text = findRawLengthDelimitedFields(contentBytes, 1)[0];
+    if (text) return { type: "text" as const, text: decodeHistoryTextContent(text) };
+    const toolCall = findRawLengthDelimitedFields(contentBytes, 4)[0];
+    if (toolCall) return decodeHistoryToolCall(toolCall);
+    return { type: "text" as const, text: "" };
+  });
+  return { role: "assistant", content };
+}
+
+function decodeHistoryToolMessage(bytes: Uint8Array): DecodedConversationHistoryMessage {
+  const toolCallId = findRawLengthDelimitedFields(bytes, 1)[0];
+  const toolName = findRawLengthDelimitedFields(bytes, 2)[0];
+  const offsetRef = { offset: 0 };
+  let isError: boolean | undefined;
+  const content: Array<
+    { type: "text"; text: string } | { type: "image"; data: string; mimeType?: string }
+  > = [];
+  while (offsetRef.offset < bytes.length) {
+    const tag = readRawVarint(bytes, offsetRef);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === 3 && wireType === 2) {
+      const contentBytes = readRawLengthDelimited(bytes, offsetRef);
+      const text = findRawLengthDelimitedFields(contentBytes, 1)[0];
+      if (text) content.push({ type: "text", text: decodeHistoryTextContent(text) });
+      else {
+        const image = findRawLengthDelimitedFields(contentBytes, 2)[0];
+        if (image) content.push(decodeHistoryImageContent(image));
+      }
+    } else if (fieldNo === 4 && wireType === 0) {
+      isError = readRawVarint(bytes, offsetRef) !== 0;
+    } else {
+      skipRawField(bytes, offsetRef, wireType);
+    }
+  }
+  return {
+    role: "tool",
+    toolCallId: toolCallId ? decodeRawString(toolCallId) : "",
+    toolName: toolName ? decodeRawString(toolName) : "",
+    ...(isError === undefined ? {} : { isError }),
+    content,
+  };
+}
+
+function decodeConversationHistoryBytes(bytes: Uint8Array): DecodedConversationHistoryMessage[] {
+  return findRawLengthDelimitedFields(bytes, 1).map((messageBytes) => {
+    const user = findRawLengthDelimitedFields(messageBytes, 1)[0];
+    if (user) return decodeHistoryUserMessage(user);
+    const assistant = findRawLengthDelimitedFields(messageBytes, 2)[0];
+    if (assistant) return decodeHistoryAssistantMessage(assistant);
+    const tool = findRawLengthDelimitedFields(messageBytes, 3)[0];
+    if (tool) return decodeHistoryToolMessage(tool);
+    throw new Error("unknown conversation history message");
+  });
+}
+
+function decodeConversationHistoryFromAgentClientMessageFrame(
+  frame: Uint8Array,
+): DecodedConversationHistoryMessage[] {
+  const runRequestBytes = getRunRequestBytesFromAgentClientMessageFrame(frame);
+  if (!runRequestBytes) return [];
+  const historyBytes = getConversationHistoryBytesFromRunRequestBytes(runRequestBytes);
+  return historyBytes ? decodeConversationHistoryBytes(historyBytes) : [];
+}
+
+function decodeConversationHistory(
+  payload: ReturnType<typeof buildCursorRequest>,
+): DecodedConversationHistoryMessage[] {
+  return decodeConversationHistoryFromAgentClientMessageFrame(payload.requestBytes);
+}
+
+function decodePreFetchedBlob(bytes: Uint8Array): { id: Uint8Array; value: Uint8Array } {
+  const offsetRef = { offset: 0 };
+  let id: Uint8Array = new Uint8Array();
+  let value: Uint8Array = new Uint8Array();
+  while (offsetRef.offset < bytes.length) {
+    const tag = readRawVarint(bytes, offsetRef);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === 1 && wireType === 2) id = readRawLengthDelimited(bytes, offsetRef);
+    else if (fieldNo === 2 && wireType === 2) value = readRawLengthDelimited(bytes, offsetRef);
+    else skipRawField(bytes, offsetRef, wireType);
+  }
+  return { id, value };
+}
+
+function decodePreFetchedBlobStoreFromRunRequestBytes(
+  runRequestBytes: Uint8Array,
+): Map<string, Uint8Array> {
+  const offsetRef = { offset: 0 };
+  const blobStore = new Map<string, Uint8Array>();
+  while (offsetRef.offset < runRequestBytes.length) {
+    const tag = readRawVarint(runRequestBytes, offsetRef);
+    const fieldNo = tag >>> 3;
+    const wireType = tag & 0x7;
+    if (fieldNo === 17 && wireType === 2) {
+      const blob = decodePreFetchedBlob(readRawLengthDelimited(runRequestBytes, offsetRef));
+      blobStore.set(Buffer.from(blob.id).toString("hex"), blob.value);
+    } else {
+      skipRawField(runRequestBytes, offsetRef, wireType);
+    }
+  }
+  return blobStore;
+}
+
+function decodePreFetchedBlobStoreFromAgentClientMessageFrame(
+  frame: Uint8Array,
+): Map<string, Uint8Array> {
+  const runRequestBytes = getRunRequestBytesFromAgentClientMessageFrame(frame);
+  return runRequestBytes
+    ? decodePreFetchedBlobStoreFromRunRequestBytes(runRequestBytes)
+    : new Map();
+}
+
+function decodePreFetchedBlobStore(
+  payload: ReturnType<typeof buildCursorRequest>,
+): Map<string, Uint8Array> {
+  return decodePreFetchedBlobStoreFromAgentClientMessageFrame(payload.requestBytes);
+}
+
 function requestedModelSummary(req: any) {
   return {
     modelId: req.requestedModel.modelId,
@@ -1719,31 +1975,6 @@ function routedRequestSummary(rawModels: CursorModel[], model: string, reasoning
       ),
     ),
   );
-}
-
-function resolveBlob(data: Uint8Array, blobStore?: Map<string, Uint8Array>): Uint8Array {
-  if (blobStore && data.length === 32) {
-    const resolved = blobStore.get(Buffer.from(data).toString("hex"));
-    if (resolved) return resolved;
-  }
-  return data;
-}
-
-function decodeTurns(
-  state: any,
-  blobStore?: Map<string, Uint8Array>,
-): Array<{ userMsg: any; steps: any[] }> {
-  return (state.turns as Uint8Array[]).map((turnRef: Uint8Array) => {
-    const turnBytes = resolveBlob(turnRef, blobStore);
-    const turnStruct = fromBinary(ConversationTurnStructureSchema, turnBytes);
-    expect(turnStruct.turn.case).toBe("agentConversationTurn");
-    const agentTurn = turnStruct.turn.value as any;
-    const userMsg = fromBinary(UserMessageSchema, resolveBlob(agentTurn.userMessage, blobStore));
-    const steps = (agentTurn.steps as Uint8Array[]).map((s: Uint8Array) =>
-      fromBinary(ConversationStepSchema, resolveBlob(s, blobStore)),
-    );
-    return { userMsg, steps };
-  });
 }
 
 describe("buildCursorRequest — turn reconstruction", () => {
@@ -1982,47 +2213,51 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(selectedImage.uuid).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
-  test("preserves images when reconstructing prior user turns", () => {
+  test("preserves images when encoding prior user turns as native conversation_history", () => {
     const image = { data: jpegBytes(), mimeType: "image/jpeg" };
     const turns = [{ ...turn("what is this?", [assistantStep("a photo")]), userImages: [image] }];
     const payload = buildCursorRequest("gpt-5", "system", "thanks", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded[0].userMsg.selectedContext.selectedImages).toHaveLength(1);
-    const selectedImage = decoded[0].userMsg.selectedContext.selectedImages[0];
-    expect(selectedImage.mimeType).toBe("image/jpeg");
-    expect(selectedImage.dataOrBlobId.case).toBe("data");
-    expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(jpegBytes()));
+    const history = decodeConversationHistory(payload);
+
+    expect(req.conversationState.turns).toHaveLength(0);
+    expect(history[0]).toMatchObject({ role: "user" });
+    expect((history[0] as any).content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image", data: Buffer.from(jpegBytes()).toString("base64"), mimeType: "image/jpeg" },
+    ]);
   });
 
-  test("no checkpoint, with assistant-text turns — reconstructs protobuf turns without inline fallback", () => {
+  test("no checkpoint, with assistant-text turns — encodes native conversation_history plus inline safety transcript", () => {
     const turns = [
       turn("first question", [assistantStep("first answer")]),
       turn("second question", [assistantStep("second answer")]),
     ];
     const payload = buildCursorRequest("gpt-5", "system", "third question", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
+    const history = decodeConversationHistory(payload);
 
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded).toHaveLength(2);
-
-    expect(decoded[0].userMsg.text).toBe("first question");
-    expect(decoded[0].steps).toHaveLength(1);
-    expect(decoded[0].steps[0].message.case).toBe("assistantMessage");
-    expect((decoded[0].steps[0].message.value as any).text).toBe("first answer");
-
-    expect(decoded[1].userMsg.text).toBe("second question");
-    expect(decoded[1].steps[0].message.case).toBe("assistantMessage");
-    expect((decoded[1].steps[0].message.value as any).text).toBe("second answer");
+    expect(req.conversationState.turns).toHaveLength(0);
+    expect(history).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "first question" }] },
+      { role: "assistant", content: [{ type: "text", text: "first answer" }] },
+      { role: "user", content: [{ type: "text", text: "second question" }] },
+      { role: "assistant", content: [{ type: "text", text: "second answer" }] },
+    ]);
 
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
     expect(userAction.userMessage.text).toContain("first question");
+    expect(userAction.userMessage.text).toContain("first answer");
+    expect(userAction.userMessage.text).toContain("second question");
     expect(userAction.userMessage.text).toContain("second answer");
-    expect(userAction.userMessage.text).toContain("<current_user_message>\nthird question");
+    expect(userAction.userMessage.text).toContain(
+      "<current_user_message>\nthird question\n</current_user_message>",
+    );
+    expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
-  test("no checkpoint, reconstructs tool-call steps and final assistant text", () => {
+  test("no checkpoint, encodes tool-call history and final assistant text", () => {
     const turns = [
       turn("inspect file", [
         toolStep(
@@ -2036,37 +2271,42 @@ describe("buildCursorRequest — turn reconstruction", () => {
     ];
     const payload = buildCursorRequest("gpt-5", "system", "fix it", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
+    const history = decodeConversationHistory(payload);
 
-    expect(decoded).toHaveLength(1);
-    expect(decoded[0].userMsg.text).toBe("inspect file");
-    expect(decoded[0].steps).toHaveLength(2);
-
-    const toolCallStep = decoded[0].steps[0]!;
-    expect(toolCallStep.message.case).toBe("toolCall");
-    expect(toolCallStep.message.value.tool.case).toBe("mcpToolCall");
-    expect(toolCallStep.message.value.tool.value.args?.toolCallId).toBe("tc1");
-    expect(toolCallStep.message.value.tool.value.args?.toolName).toBe("read");
-    expect(toolCallStep.message.value.tool.value.result?.result.case).toBe("success");
-    expect(
-      toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.case,
-    ).toBe("text");
-    expect(
-      toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.value.text,
-    ).toBe("file contents");
-
-    const finalAssistantStep = decoded[0].steps[1]!;
-    expect(finalAssistantStep.message.case).toBe("assistantMessage");
-    expect((finalAssistantStep.message.value as any).text).toBe("I found the issue.");
+    expect(req.conversationState.turns).toHaveLength(0);
+    expect(history).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "inspect file" }] },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            toolCallId: "tc1",
+            toolName: "read",
+            argsJson: JSON.stringify({ path: "src/index.ts" }),
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "tc1",
+        toolName: "read",
+        content: [{ type: "text", text: "file contents" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "I found the issue." }] },
+    ]);
 
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
     expect(userAction.userMessage.text).toContain("inspect file");
     expect(userAction.userMessage.text).toContain("file contents");
-    expect(userAction.userMessage.text).toContain("<current_user_message>\nfix it");
+    expect(userAction.userMessage.text).toContain(
+      "<current_user_message>\nfix it\n</current_user_message>",
+    );
+    expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
-  test("no checkpoint, reconstructs tool-call image result content", () => {
+  test("no checkpoint, encodes tool-call image result content", () => {
     const turns = [
       turn("capture screenshot", [
         toolStep(
@@ -2085,25 +2325,24 @@ describe("buildCursorRequest — turn reconstruction", () => {
       "conv-1",
       null,
     );
-    const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    const toolCallStep = decoded[0].steps[0]!;
-    expect(toolCallStep.message.case).toBe("toolCall");
-    const success = toolCallStep.message.value.tool.value.result.result.value;
-    expect(success.content).toHaveLength(1);
-    expect(success.content[0].content.case).toBe("image");
-    expect(success.content[0].content.value.mimeType).toBe("image/png");
-    expect(Array.from(success.content[0].content.value.data)).toEqual(Array.from(pngBytes()));
+    const history = decodeConversationHistory(payload);
+    expect(history[2]).toMatchObject({
+      role: "tool",
+      toolCallId: "tc1",
+      toolName: "screenshot",
+      content: [
+        { type: "image", data: Buffer.from(pngBytes()).toString("base64"), mimeType: "image/png" },
+      ],
+    });
   });
 
-  test("no checkpoint, turn with no steps — no reconstructed steps", () => {
+  test("no checkpoint, turn with no steps — encodes only the user history message", () => {
     const turns = [turn("hello")];
     const payload = buildCursorRequest("gpt-5", "system", "follow up", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded).toHaveLength(1);
-    expect(decoded[0].userMsg.text).toBe("hello");
-    expect(decoded[0].steps).toHaveLength(0);
+    const history = decodeConversationHistory(payload);
+    expect(req.conversationState.turns).toHaveLength(0);
+    expect(history).toEqual([{ role: "user", content: [{ type: "text", text: "hello" }] }]);
   });
 
   test("with checkpoint — uses checkpoint, ignores turns", () => {
@@ -2118,9 +2357,10 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(req.conversationState.turns).toHaveLength(0);
   });
 
-  test("system prompt stored in blobStore", () => {
+  test("system prompt is stored as a root prompt blob", () => {
     const payload = buildCursorRequest("gpt-5", "You are helpful", "hi", [], "conv-1", null);
     const req = decodeRunRequest(payload);
+    expect(req.customSystemPrompt).toBeUndefined();
     expect(req.conversationState.rootPromptMessagesJson).toHaveLength(1);
     const blobId = Buffer.from(req.conversationState.rootPromptMessagesJson[0]).toString("hex");
     expect(payload.blobStore.has(blobId)).toBe(true);
@@ -2129,25 +2369,51 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(blobData.content).toBe("You are helpful");
   });
 
-  test("inline history is placed in current user message, not every reconstructed turn", () => {
+  test("prefetches every request blob using Cursor's current pre_fetched_blobs field", () => {
+    const checkpointPayload = buildCursorRequest("gpt-5", "system", "old", [], "conv-1", null);
+    const checkpoint = toBinary(
+      ConversationStateStructureSchema,
+      decodeRunRequest(checkpointPayload).conversationState,
+    );
+    const payload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "continue",
+      [],
+      "conv-1",
+      checkpoint,
+      new Map([["00".repeat(32), new Uint8Array([1, 2, 3])]]),
+    );
+    const prefetched = decodePreFetchedBlobStore(payload);
+
+    expect(prefetched.size).toBe(payload.blobStore.size);
+    for (const [blobId, bytes] of payload.blobStore) {
+      expect(Array.from(prefetched.get(blobId) ?? [])).toEqual(Array.from(bytes));
+    }
+  });
+
+  test("adds redundant inline Pi history without sending stale selectedContextBlob fields", () => {
     const turns = [turn("first", [assistantStep("done")]), turn("second", [assistantStep("ok")])];
     const payload = buildCursorRequest("gpt-5", "system", "continue", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
+    const history = decodeConversationHistory(payload);
 
     expect(req.conversationState.rootPromptMessagesJson).toHaveLength(1);
-
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded[0].userMsg.selectedContextBlob).toHaveLength(0);
-    expect(decoded[1].userMsg.selectedContextBlob).toHaveLength(0);
+    expect(req.conversationState.turns).toHaveLength(0);
+    expect(history).toHaveLength(4);
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
     expect(userAction.userMessage.text).toContain("first");
+    expect(userAction.userMessage.text).toContain("done");
     expect(userAction.userMessage.text).toContain("second");
-    expect(userAction.userMessage.selectedContextBlob).toBeInstanceOf(Uint8Array);
-    expect(userAction.userMessage.selectedContextBlob.length).toBeGreaterThan(0);
+    expect(userAction.userMessage.text).toContain("ok");
+    expect(userAction.userMessage.text).toContain(
+      "<current_user_message>\ncontinue\n</current_user_message>",
+    );
+    expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
-  test("inline history remains visible when using a checkpoint conversation state", () => {
+  test("checkpoint request path avoids duplicating prior Pi history inline", () => {
     const checkpointPayload = buildCursorRequest("gpt-5", "system", "old", [], "conv-1", null);
     const checkpoint = toBinary(
       ConversationStateStructureSchema,
@@ -2158,14 +2424,14 @@ describe("buildCursorRequest — turn reconstruction", () => {
     const req = decodeRunRequest(payload);
 
     expect(req.conversationState.turns).toHaveLength(0);
+    expect(decodeConversationHistory(payload)).toHaveLength(0);
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
-    expect(userAction.userMessage.text).toContain("remember pineapple");
-    expect(userAction.userMessage.text).toContain("I will remember");
-    expect(userAction.userMessage.text).toContain("<current_user_message>\ncontinue");
+    expect(userAction.userMessage.text).toBe("continue");
+    expect(userAction.userMessage.text).not.toContain("<pi_conversation_history>");
+    expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
-  test("inline history includes all Pi turns by default", () => {
+  test("native conversation_history includes all Pi turns by default", () => {
     const turns = [
       turn("SESSION PIN: remember pineapple", [assistantStep("acknowledged head context")]),
       ...Array.from({ length: 12 }, (_, index) =>
@@ -2177,42 +2443,55 @@ describe("buildCursorRequest — turn reconstruction", () => {
     ];
     const payload = buildCursorRequest("gpt-5", "system", "continue", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
-    const userAction = req.action.action.value as any;
+    const history = decodeConversationHistory(payload);
 
-    expect(userAction.userMessage.text).toContain("SESSION PIN: remember pineapple");
-    expect(userAction.userMessage.text).toContain("middle-5");
-    expect(userAction.userMessage.text).toContain("recent issue context");
-    expect(userAction.userMessage.text).not.toContain("turn(s) compressed to previews");
-    expect(userAction.userMessage.text).not.toContain("turn(s) omitted");
+    expect(history).toHaveLength(turns.length * 2);
+    expect((history[0] as any).content[0].text).toContain("SESSION PIN: remember pineapple");
+    expect((history[12] as any).content[0].text).toContain("middle-5");
+    expect((history.at(-2) as any).content[0].text).toContain("recent issue context");
+    expect((history[13] as any).content[0].text).toContain("middle reply 5");
+    const text = (req.action.action.value as any).userMessage.text;
+    expect(text).toContain("<pi_conversation_history>");
+    expect(text).toContain("SESSION PIN: remember pineapple");
+    expect(text).toContain("middle-5");
+    expect(text).toContain("middle reply 5");
+    expect(text).toContain("recent issue context");
+    expect(text).toContain("<current_user_message>\ncontinue\n</current_user_message>");
   });
 
-  test("each reconstructed turn has a unique messageId", () => {
-    const turns = [turn("a", [assistantStep("b")]), turn("a", [assistantStep("b")])];
-    const payload = buildCursorRequest("gpt-5", "system", "c", turns, "conv-1", null);
-    const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded[0].userMsg.messageId).not.toBe(decoded[1].userMsg.messageId);
+  test("current user action has a generated messageId", () => {
+    const first = decodeRunRequest(buildCursorRequest("gpt-5", "system", "c", [], "conv-1", null));
+    const second = decodeRunRequest(buildCursorRequest("gpt-5", "system", "c", [], "conv-1", null));
+    expect(first.action.action.value.userMessage.messageId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(first.action.action.value.userMessage.messageId).not.toBe(
+      second.action.action.value.userMessage.messageId,
+    );
   });
 });
 
 // ── Fork via checkpoint discard + reconstruction ──
 
 describe("fork discards checkpoint, reconstruction takes over", () => {
-  test("fork scenario — checkpoint discarded, turns reconstructed from messages", () => {
+  test("fork scenario — checkpoint discarded, history reconstructed from messages", () => {
     const turns = [turn("first", [assistantStep("response1")])];
     const payload = buildCursorRequest("gpt-5", "system", "forked question", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
+    const history = decodeConversationHistory(payload);
 
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded).toHaveLength(1);
-    expect(decoded[0].userMsg.text).toBe("first");
-    expect((decoded[0].steps[0].message.value as any).text).toBe("response1");
+    expect(req.conversationState.turns).toHaveLength(0);
+    expect(history).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      { role: "assistant", content: [{ type: "text", text: "response1" }] },
+    ]);
 
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
     expect(userAction.userMessage.text).toContain("first");
     expect(userAction.userMessage.text).toContain("response1");
-    expect(userAction.userMessage.text).toContain("<current_user_message>\nforked question");
+    expect(userAction.userMessage.text).toContain(
+      "<current_user_message>\nforked question\n</current_user_message>",
+    );
+    expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
   test("fork to beginning — no turns, no reconstruction", () => {
@@ -2642,7 +2921,16 @@ class FakeBridge {
 
   write(data: Uint8Array) {
     for (const frame of decodeConnectFramesForTest(data)) {
-      const clientMessage = fromBinary(AgentClientMessageSchema, frame);
+      const clientMessage = fromBinary(AgentClientMessageSchema, frame) as any;
+      clientMessage.__rawFrame = frame;
+      clientMessage.__prefetchedBlobStore =
+        decodePreFetchedBlobStoreFromAgentClientMessageFrame(frame);
+      clientMessage.__conversationHistory =
+        decodeConversationHistoryFromAgentClientMessageFrame(frame);
+      if (clientMessage.message.case === "runRequest") {
+        clientMessage.message.value.__blobStore = clientMessage.__prefetchedBlobStore;
+        clientMessage.message.value.__conversationHistory = clientMessage.__conversationHistory;
+      }
       this.clientMessages.push(clientMessage);
       this.onClientMessage?.(clientMessage, this);
     }
@@ -2873,88 +3161,81 @@ describe("native streamSimple provider", () => {
     expect(events.at(-1).message.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
   });
 
-  test("rebuilds normal turns from Pi context instead of cached Cursor checkpoints", async () => {
-    const previousCheckpointSetting = process.env.PI_CURSOR_REUSE_CHECKPOINTS;
-    delete process.env.PI_CURSOR_REUSE_CHECKPOINTS;
-    try {
-      const runRequests: any[] = [];
-      setBridgeFactoryForTests(
-        (options) =>
-          new FakeBridge(options, (clientMessage, fake) => {
-            if (clientMessage.message.case === "runRequest") {
-              runRequests.push(clientMessage.message.value);
-              setTimeout(() => {
-                fake.emitServerMessage(makeTextDeltaMessage("pineapple"));
-                fake.emitServerMessage(makeCheckpointMessage());
-                fake.close(0);
-              }, 0);
-            }
-          }),
-      );
+  test("reuses valid checkpoints while carrying inline Pi context as a safety net", async () => {
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("pineapple"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
 
-      const sessionId = "native-rebuild-from-pi-context";
-      const convKey = deriveConversationKeyFromSessionId(sessionId);
-      const completedTurns = [turn("remember pineapple", [assistantStep("I will remember")])];
-      const emptyCheckpointPayload = buildCursorRequest(
-        "gpt-5",
-        "system",
-        "next",
-        [],
-        "conv-rebuild",
-        null,
-      );
-      __testInternals.conversationStates.set(convKey, {
-        conversationId: "conv-rebuild",
-        checkpoint: toBinary(
-          ConversationStateStructureSchema,
-          decodeRunRequest(emptyCheckpointPayload).conversationState,
-        ),
-        checkpointTurnCount: completedTurns.length,
-        checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(completedTurns),
-        checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
-        sessionScoped: true,
-        blobStore: new Map(emptyCheckpointPayload.blobStore),
-        lastAccessMs: Date.now(),
-      });
+    const sessionId = "native-rebuild-from-pi-context";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const completedTurns = [turn("remember pineapple", [assistantStep("I will remember")])];
+    const emptyCheckpointPayload = buildCursorRequest(
+      "gpt-5",
+      "system",
+      "next",
+      [],
+      "conv-rebuild",
+      null,
+    );
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-rebuild",
+      checkpoint: toBinary(
+        ConversationStateStructureSchema,
+        decodeRunRequest(emptyCheckpointPayload).conversationState,
+      ),
+      checkpointTurnCount: completedTurns.length,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns(completedTurns),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
+      sessionScoped: true,
+      blobStore: new Map(emptyCheckpointPayload.blobStore),
+      lastAccessMs: Date.now(),
+    });
 
-      const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
-      await collectEvents(
-        streamSimple(
-          nativeModel(),
-          {
-            systemPrompt: "system",
-            messages: [
-              { role: "user", content: "remember pineapple", timestamp: Date.now() },
-              {
-                role: "assistant",
-                content: [{ type: "text", text: "I will remember" }],
-                api: "cursor-native",
-                provider: "cursor",
-                model: "gpt-5",
-                usage: emptyUsage(),
-                stopReason: "stop",
-                timestamp: Date.now(),
-              },
-              { role: "user", content: "what did I ask you to remember?", timestamp: Date.now() },
-            ],
-          } as any,
-          { sessionId },
-        ),
-      );
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          systemPrompt: "system",
+          messages: [
+            { role: "user", content: "remember pineapple", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "I will remember" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: emptyUsage(),
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "what did I ask you to remember?", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
 
-      expect(runRequests).toHaveLength(1);
-      expect(runRequests[0].conversationId).not.toBe("conv-rebuild");
-      expect(runRequests[0].conversationState.turns).toHaveLength(1);
-      expect(runRequests[0].conversationState.rootPromptMessagesJson).toHaveLength(1);
-      expect(runRequests[0].action.action.value.userMessage.text).toContain("remember pineapple");
-      expect(runRequests[0].action.action.value.userMessage.text).toContain("I will remember");
-      expect(runRequests[0].action.action.value.userMessage.text).toContain(
-        "<current_user_message>\nwhat did I ask you to remember?",
-      );
-    } finally {
-      if (previousCheckpointSetting === undefined) delete process.env.PI_CURSOR_REUSE_CHECKPOINTS;
-      else process.env.PI_CURSOR_REUSE_CHECKPOINTS = previousCheckpointSetting;
-    }
+    expect(runRequests).toHaveLength(1);
+    expect(runRequests[0].conversationId).toBe("conv-rebuild");
+    expect(runRequests[0].conversationState.turns).toHaveLength(0);
+    expect(runRequests[0].conversationState.rootPromptMessagesJson).toHaveLength(1);
+    expect(runRequests[0].customSystemPrompt).toBeUndefined();
+    expect(runRequests[0].__conversationHistory).toHaveLength(0);
+    const text = runRequests[0].action.action.value.userMessage.text;
+    expect(text).toBe("what did I ask you to remember?");
+    expect(text).not.toContain("<pi_conversation_history>");
   });
 
   test("image-only user request forwards selected images without the local proxy", async () => {
@@ -3285,11 +3566,10 @@ describe("native streamSimple provider", () => {
     expect(runRequests).toHaveLength(1);
     const blobStore = __testInternals.conversationStates.get(convKey)?.blobStore;
     expect(blobStore).toBeTruthy();
-    const decoded = decodeTurns(runRequests[0].conversationState, blobStore);
-    const step = decoded[0].steps[0];
-    expect(step.message.case).toBe("assistantMessage");
-    expect(step.message.value.text).toContain("I found the template");
-    expect(step.message.value.text).toContain("Interrupted: the user aborted");
+    const assistantHistory = runRequests[0].__conversationHistory[1];
+    expect(assistantHistory).toMatchObject({ role: "assistant" });
+    expect(assistantHistory.content[0].text).toContain("I found the template");
+    expect(assistantHistory.content[0].text).toContain("Interrupted: the user aborted");
   });
 
   test("native routing applies reasoning/model parameter maps without before_provider_request", async () => {
@@ -4388,10 +4668,16 @@ describe("proxy integration — session handling", () => {
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
     expect(runRequests[0].conversationId).not.toBe("conv-partial-assistant");
-    expect(runRequests[0].conversationState.turns).toHaveLength(1);
+    expect(runRequests[0].conversationState.turns).toHaveLength(0);
+    expect(runRequests[0].__conversationHistory).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "ask something" }] },
+      { role: "assistant", content: [{ type: "text", text: "partial response text" }] },
+    ]);
     expect(runRequests[0].action.action.value.userMessage.text).toContain(
-      "<current_user_message>\ncontinue",
+      "<current_user_message>\ncontinue\n</current_user_message>",
     );
+    expect(runRequests[0].action.action.value.userMessage.text).toContain("ask something");
+    expect(runRequests[0].action.action.value.userMessage.text).toContain("partial response text");
   });
 
   test("interrupt before any new checkpoint discards prior checkpoint when resumed history includes the interrupted turn", async () => {
@@ -4492,11 +4778,14 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(runRequests[0].conversationId).not.toBe("conv-old");
-    expect(
-      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
-    ).not.toEqual(priorCheckpoint);
-    expect(runRequests[0].conversationState.turns).toHaveLength(1);
+    expect(runRequests[0].conversationId).toBe("conv-old");
+    expect(runRequests[0].conversationState.turns).toHaveLength(0);
+    expect(runRequests[0].__conversationHistory).toHaveLength(0);
+    expect(runRequests[0].action.action.value.userMessage.text).not.toContain(
+      "<pi_conversation_history>",
+    );
+    expect(runRequests[0].action.action.value.userMessage.text).not.toContain("earlier");
+    expect(runRequests[0].action.action.value.userMessage.text).not.toContain("done");
     expect(runRequests[0].action.action.value.userMessage.text).toContain("interrupt me");
     expect(runRequests[0].action.action.value.userMessage.text).toContain("continue");
   });
@@ -4557,12 +4846,19 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(
-      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
-    ).not.toEqual(priorCheckpoint);
-    expect(runRequests[0].conversationState.turns).toHaveLength(2);
+    expect(runRequests[0].conversationState.turns).toHaveLength(0);
+    expect(runRequests[0].__conversationHistory).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: "Hi from Cursor" }] },
+      { role: "user", content: [{ type: "text", text: "second turn on another provider" }] },
+      { role: "assistant", content: [{ type: "text", text: "Reply from another provider" }] },
+    ]);
     expect(runRequests[0].action.action.value.userMessage.text).toContain(
-      "<current_user_message>\nnow continue on cursor",
+      "<current_user_message>\nnow continue on cursor\n</current_user_message>",
+    );
+    expect(runRequests[0].action.action.value.userMessage.text).toContain("Hi from Cursor");
+    expect(runRequests[0].action.action.value.userMessage.text).toContain(
+      "Reply from another provider",
     );
   });
 
@@ -4619,10 +4915,14 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(
-      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
-    ).not.toEqual(priorCheckpoint);
-    expect(runRequests[0].conversationState.turns).toHaveLength(1);
+    expect(runRequests[0].conversationId).not.toBe("conv-system-prompt-change");
+    expect(runRequests[0].customSystemPrompt).toBeUndefined();
+    expect(runRequests[0].conversationState.rootPromptMessagesJson).toHaveLength(1);
+    expect(runRequests[0].conversationState.turns).toHaveLength(0);
+    expect(runRequests[0].__conversationHistory).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      { role: "assistant", content: [{ type: "text", text: "done" }] },
+    ]);
   });
 
   test("same-depth branch with different assistant text discards stale checkpoint", async () => {
@@ -4664,8 +4964,6 @@ describe("proxy integration — session handling", () => {
       lastAccessMs: Date.now(),
     });
 
-    const storedCheckpoint = __testInternals.conversationStates.get(convKey)?.checkpoint;
-
     const port = await startProxy(async () => "test-token");
     const response = await postChatCompletion(port, {
       model: "gpt-5",
@@ -4680,10 +4978,12 @@ describe("proxy integration — session handling", () => {
 
     expect(response.statusCode).toBe(200);
     expect(runRequests).toHaveLength(1);
-    expect(
-      toBinary(ConversationStateStructureSchema, runRequests[0].conversationState),
-    ).not.toEqual(storedCheckpoint);
-    expect(runRequests[0].conversationState.turns).toHaveLength(1);
+    expect(runRequests[0].conversationId).not.toBe("conv-branch");
+    expect(runRequests[0].conversationState.turns).toHaveLength(0);
+    expect(runRequests[0].__conversationHistory).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      { role: "assistant", content: [{ type: "text", text: "branch-b" }] },
+    ]);
   });
 });
 
