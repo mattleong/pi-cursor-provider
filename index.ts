@@ -49,6 +49,7 @@ export {
   buildRawModelLookup,
   FALLBACK_MODELS,
   modelsFromParameterizedMetadata,
+  modelConfig,
   parseModelId,
   processModels,
   supportsReasoningModelId,

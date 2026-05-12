@@ -14,6 +14,7 @@ import {
   extractToolResultImagePayloads,
   FALLBACK_MODELS,
   modelsFromParameterizedMetadata,
+  modelConfig,
   parseModelId,
   processModels,
   registerCursorModelSwitchCleanup,
@@ -396,6 +397,35 @@ describe("reasoning support", () => {
 });
 
 describe("processModels", () => {
+  test("applies Cursor pricing sheet costs", () => {
+    const costFor = (id: string) => modelConfig(processModels([m(id)])[0]!).cost;
+
+    expect(costFor("gpt-5.5-medium")).toEqual({
+      input: 5,
+      output: 30,
+      cacheRead: 0.5,
+      cacheWrite: 0,
+    });
+    expect(costFor("claude-4-sonnet-1m-thinking")).toEqual({
+      input: 6,
+      output: 22.5,
+      cacheRead: 0.6,
+      cacheWrite: 7.5,
+    });
+    expect(costFor("gpt-5.4-nano-high")).toEqual({
+      input: 0.2,
+      output: 1.25,
+      cacheRead: 0.02,
+      cacheWrite: 0,
+    });
+    expect(costFor("grok-4-20-thinking")).toEqual({
+      input: 2,
+      output: 6,
+      cacheRead: 0.2,
+      cacheWrite: 0,
+    });
+  });
+
   test("composer-2 — no effort variants, kept as-is", () => {
     const result = processModels([m("composer-2"), m("composer-2-fast")]);
     const c2 = result.find((r) => r.id === "composer-2");
