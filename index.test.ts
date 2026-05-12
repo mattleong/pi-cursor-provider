@@ -1,6 +1,6 @@
 import rawModels from "./cursor-models-raw.json";
 import gpt55ParameterizedFixture from "./fixtures/cursor-gpt55-parameterized.json";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
 import { spawnBridge } from "./bridge.ts";
@@ -58,12 +58,14 @@ import {
   RequestContextArgsSchema,
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
+  TokenDeltaUpdateSchema,
 } from "./proto/agent_pb.ts";
 
 afterEach(() => {
   stopProxy();
   setBridgeFactoryForTests();
   cleanupAllSessionState();
+  vi.useRealTimers();
 });
 
 // ── Helper ──
@@ -2995,6 +2997,17 @@ function makeTextDeltaMessage(text: string) {
   });
 }
 
+function makeTokenDeltaMessage(tokens: number) {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens }) },
+      }),
+    },
+  });
+}
+
 function makeCheckpointMessage() {
   return create(AgentServerMessageSchema, {
     message: {
@@ -4419,6 +4432,122 @@ describe("proxy integration — session handling", () => {
 
     expect(cancelCount).toBe(0);
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+  });
+
+  test("stream watchdog cancels when Cursor stops sending server messages", async () => {
+    if (__testInternals.UPSTREAM_IDLE_TIMEOUT_MS <= 0) return;
+    vi.useFakeTimers();
+    let cancelCount = 0;
+    const sessionId = "session-upstream-idle";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const bridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "conversationAction") {
+          cancelCount += 1;
+          fake.close(0);
+        }
+      },
+    );
+    const writes: string[] = [];
+    let ended = 0;
+    const req = new EventEmitter() as any;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = (chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    };
+    res.end = () => {
+      ended += 1;
+      res.headersSent = true;
+      return res;
+    };
+
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "gpt-5",
+      bridgeKey,
+      convKey,
+      completedTurns: [],
+      currentTurn: turn("hang"),
+      req,
+      res,
+    });
+
+    await vi.advanceTimersByTimeAsync(__testInternals.UPSTREAM_IDLE_TIMEOUT_MS + 1);
+
+    expect(cancelCount).toBe(1);
+    expect(ended).toBe(1);
+    expect(writes.join("")).toContain("no non-heartbeat server messages");
+  });
+
+  test("stream visible watchdog ignores token-only deltas", async () => {
+    if (__testInternals.VISIBLE_IDLE_TIMEOUT_MS <= 0) return;
+    vi.useFakeTimers();
+    let cancelCount = 0;
+    const sessionId = "session-visible-idle";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const bridge = new FakeBridge(
+      { accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" },
+      (clientMessage, fake) => {
+        if (clientMessage.message.case === "conversationAction") {
+          cancelCount += 1;
+          fake.close(0);
+        }
+      },
+    );
+    const writes: string[] = [];
+    const req = new EventEmitter() as any;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = (chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    };
+    res.end = () => {
+      res.headersSent = true;
+      return res;
+    };
+
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "gpt-5",
+      bridgeKey,
+      convKey,
+      completedTurns: [],
+      currentTurn: turn("token-only hang"),
+      req,
+      res,
+    });
+
+    const upstream = __testInternals.UPSTREAM_IDLE_TIMEOUT_MS;
+    const visible = __testInternals.VISIBLE_IDLE_TIMEOUT_MS;
+    const tick = upstream > 0 ? Math.max(1, Math.min(upstream - 1, Math.floor(visible / 2))) : 1;
+    let elapsed = 0;
+    bridge.emitServerMessage(makeTokenDeltaMessage(100));
+    while (elapsed + tick < visible) {
+      await vi.advanceTimersByTimeAsync(tick);
+      elapsed += tick;
+      bridge.emitServerMessage(makeTokenDeltaMessage(100));
+    }
+    await vi.advanceTimersByTimeAsync(visible - elapsed + 1);
+
+    expect(cancelCount).toBe(1);
+    expect(writes.join("")).toContain("no visible text, thinking, or tool call");
+    expect(writes.join("")).not.toContain("no non-heartbeat server messages");
   });
 
   test("stream cancellation sends cancelAction without committing pending checkpoint or blob store", async () => {

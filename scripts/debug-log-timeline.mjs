@@ -19,6 +19,14 @@ const NOTABLE_EVENTS = [
   "tool_resume.sent_result",
   "stream.client_close",
   "nonstream.client_close",
+  "stream.upstream_idle_timeout",
+  "stream.visible_idle_timeout",
+  "native.stream.upstream_idle_timeout",
+  "native.stream.visible_idle_timeout",
+  "nonstream.upstream_idle_timeout",
+  "nonstream.visible_idle_timeout",
+  "server_message.unhandled",
+  "server_message.unhandled_interaction_update",
   "stream.checkpoint_committed",
   "nonstream.checkpoint_committed",
   "stream.bridge_close",
@@ -176,6 +184,7 @@ function summarize(events, filePath) {
         bridgeClose: undefined,
         error: undefined,
         noUserMessage: false,
+        timeout: undefined,
       };
       requests.set(requestId, request);
       requestOrder.push(requestId);
@@ -306,6 +315,22 @@ function summarize(events, filePath) {
         if (!req) break;
         req.error = shorten(event.message ?? "unknown error", 120);
         break;
+      case "stream.upstream_idle_timeout":
+      case "stream.visible_idle_timeout":
+      case "native.stream.upstream_idle_timeout":
+      case "native.stream.visible_idle_timeout":
+      case "nonstream.upstream_idle_timeout":
+      case "nonstream.visible_idle_timeout":
+        if (!req) break;
+        req.timeout = {
+          kind: eventName.endsWith("visible_idle_timeout") ? "visible" : "upstream",
+          timeoutMs: event.timeoutMs,
+          idleMs: event.idleMs,
+          lastUpstreamReason: event.lastUpstreamReason,
+          lastVisibleReason: event.lastVisibleReason,
+        };
+        req.error = shorten(event.message ?? "stream timeout", 120);
+        break;
       case "stream.writer_start":
       case "nonstream.start":
       case "native.stream.start":
@@ -411,6 +436,11 @@ function renderRequestLine(request, baseTsMs) {
   if (request.discardCheckpoint) pieces.push(`discardCheckpoint=${request.discardCheckpoint}`);
   if (request.noUserMessage) pieces.push("NO_USER_MESSAGE");
   if (request.error) pieces.push(`error=${JSON.stringify(request.error)}`);
+  if (request.timeout) {
+    pieces.push(
+      `timeout(${request.timeout.kind}, timeout=${formatDuration(request.timeout.timeoutMs ?? 0)}, idle=${formatDuration(request.timeout.idleMs ?? 0)}, upstream=${request.timeout.lastUpstreamReason ?? "?"}, visible=${request.timeout.lastVisibleReason ?? "?"})`,
+    );
+  }
 
   if (request.resumeToolResults.length > 0 || typeof request.pendingBeforeResume === "number") {
     const ids = request.resumeToolResults

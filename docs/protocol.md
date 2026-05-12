@@ -8,6 +8,10 @@ This provider talks to Cursor's upstream HTTP/2 Connect/protobuf APIs. The gener
 - `POST /agent.v1.AgentService/GetUsableModels` — unary model discovery using generated protobuf schemas.
 - `POST /aiserver.v1.AiService/AvailableModels` — unary parameterized model discovery.
 
+## Runtime liveness
+
+The HTTP/2 bridge still sends Cursor `clientHeartbeat` frames so Cursor keeps long agent runs alive, but provider-level liveness is based on decoded Cursor server messages rather than those client heartbeat writes. Active runs have two watchdogs: an upstream-idle timer reset by non-heartbeat server messages, and a visible-idle timer reset only by text/thinking/tool-call output. The visible timer intentionally does not reset on `tokenDelta`, so token-only hidden generation cannot spin forever without surfacing progress to Pi. Both watchdogs are stopped while a Cursor tool call is paused for Pi to execute; paused tool bridges are governed by `PI_CURSOR_ACTIVE_BRIDGE_TTL_MS` instead.
+
 `h2-bridge.mjs` is a small Node HTTP/2 child process. It exists because the extension can be loaded by runtimes whose `node:http2` compatibility is unreliable. The parent process speaks length-prefixed frames to the child; the child speaks HTTP/2 to Cursor.
 
 ## Generated protobuf

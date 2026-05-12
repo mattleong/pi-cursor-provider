@@ -300,12 +300,22 @@ const conversationStates = new Map<string, StoredConversation>();
 const sessionLocks = new Map<string, Promise<void>>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_ACTIVE_BRIDGE_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120 * 1000;
+const DEFAULT_VISIBLE_IDLE_TIMEOUT_MS = 180 * 1000;
 const configuredActiveBridgeTtlMs = Number(
   process.env.PI_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? DEFAULT_ACTIVE_BRIDGE_TTL_MS,
 );
 const ACTIVE_BRIDGE_TTL_MS = Number.isFinite(configuredActiveBridgeTtlMs)
   ? Math.max(1_000, configuredActiveBridgeTtlMs)
   : DEFAULT_ACTIVE_BRIDGE_TTL_MS;
+const UPSTREAM_IDLE_TIMEOUT_MS = readTimeoutMsEnv(
+  "PI_CURSOR_UPSTREAM_IDLE_TIMEOUT_MS",
+  DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
+);
+const VISIBLE_IDLE_TIMEOUT_MS = readTimeoutMsEnv(
+  "PI_CURSOR_VISIBLE_IDLE_TIMEOUT_MS",
+  DEFAULT_VISIBLE_IDLE_TIMEOUT_MS,
+);
 const DEFAULT_INLINE_HISTORY_MAX_CHARS = Number.POSITIVE_INFINITY;
 const DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS = Number.POSITIVE_INFINITY;
 const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = Number.POSITIVE_INFINITY;
@@ -334,6 +344,12 @@ function readNonNegativeIntegerEnv(name: string, fallback: number): number {
   }
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
+function readTimeoutMsEnv(name: string, fallback: number): number {
+  const value = readNonNegativeIntegerEnv(name, fallback);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.max(1_000, value);
 }
 
 function isProxyDebugEnabled(): boolean {
@@ -452,6 +468,8 @@ export const __testInternals = {
   conversationStates,
   fingerprintCompletedTurns,
   fingerprintSystemPrompt,
+  UPSTREAM_IDLE_TIMEOUT_MS,
+  VISIBLE_IDLE_TIMEOUT_MS,
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
@@ -769,6 +787,137 @@ export function touchActiveBridgeForSession(
     reason,
   });
   return true;
+}
+
+type CursorStreamTimeoutKind = "upstream_idle" | "visible_idle";
+
+interface CursorStreamWatchdog {
+  touchUpstream(reason: string): void;
+  touchVisible(reason: string): void;
+  stop(): void;
+}
+
+function describeTimeoutMs(timeoutMs: number): string {
+  if (timeoutMs % 60_000 === 0) return `${timeoutMs / 60_000}m`;
+  if (timeoutMs % 1000 === 0) return `${timeoutMs / 1000}s`;
+  return `${timeoutMs}ms`;
+}
+
+function cursorStreamTimeoutMessage(kind: CursorStreamTimeoutKind, timeoutMs: number): string {
+  const duration = describeTimeoutMs(timeoutMs);
+  if (kind === "upstream_idle") {
+    return `Cursor upstream stalled: no non-heartbeat server messages for ${duration}.`;
+  }
+  return `Cursor upstream stalled: no visible text, thinking, or tool call for ${duration}.`;
+}
+
+function createCursorStreamWatchdog(options: {
+  eventPrefix: string;
+  requestId?: string;
+  bridgeKey: string;
+  convKey: string;
+  bridge: BridgeHandle;
+  heartbeatTimer: ReturnType<typeof setInterval>;
+  onTimeout(kind: CursorStreamTimeoutKind, message: string): void;
+}): CursorStreamWatchdog {
+  let stopped = false;
+  let upstreamTimer: ReturnType<typeof setTimeout> | undefined;
+  let visibleTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastUpstreamMs = Date.now();
+  let lastVisibleMs = Date.now();
+  let lastUpstreamReason = "stream_start";
+  let lastVisibleReason = "stream_start";
+
+  const clearTimers = () => {
+    if (upstreamTimer) clearTimeout(upstreamTimer);
+    if (visibleTimer) clearTimeout(visibleTimer);
+    upstreamTimer = undefined;
+    visibleTimer = undefined;
+  };
+
+  const fire = (kind: CursorStreamTimeoutKind, timeoutMs: number, lastMs: number) => {
+    if (stopped) return;
+    stopped = true;
+    clearTimers();
+    const message = cursorStreamTimeoutMessage(kind, timeoutMs);
+    debugLog(`${options.eventPrefix}.${kind}_timeout`, {
+      requestId: options.requestId,
+      bridgeKey: options.bridgeKey,
+      convKey: options.convKey,
+      timeoutMs,
+      idleMs: Math.max(0, Date.now() - lastMs),
+      lastUpstreamReason,
+      lastVisibleReason,
+      visibleTimeoutMs: VISIBLE_IDLE_TIMEOUT_MS,
+      upstreamTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+      message,
+    });
+    options.onTimeout(kind, message);
+    cleanupBridge(options.bridge, options.heartbeatTimer, options.bridgeKey);
+  };
+
+  const armUpstream = () => {
+    if (upstreamTimer) clearTimeout(upstreamTimer);
+    if (stopped || UPSTREAM_IDLE_TIMEOUT_MS <= 0) return;
+    upstreamTimer = setTimeout(
+      () => fire("upstream_idle", UPSTREAM_IDLE_TIMEOUT_MS, lastUpstreamMs),
+      UPSTREAM_IDLE_TIMEOUT_MS,
+    );
+    upstreamTimer.unref?.();
+  };
+
+  const armVisible = () => {
+    if (visibleTimer) clearTimeout(visibleTimer);
+    if (stopped || VISIBLE_IDLE_TIMEOUT_MS <= 0) return;
+    visibleTimer = setTimeout(
+      () => fire("visible_idle", VISIBLE_IDLE_TIMEOUT_MS, lastVisibleMs),
+      VISIBLE_IDLE_TIMEOUT_MS,
+    );
+    visibleTimer.unref?.();
+  };
+
+  armUpstream();
+  armVisible();
+
+  return {
+    touchUpstream(reason: string) {
+      if (stopped) return;
+      lastUpstreamMs = Date.now();
+      lastUpstreamReason = reason;
+      armUpstream();
+    },
+    touchVisible(reason: string) {
+      if (stopped) return;
+      lastVisibleMs = Date.now();
+      lastVisibleReason = reason;
+      armVisible();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearTimers();
+    },
+  };
+}
+
+function cursorServerMessageLabel(msg: AgentServerMessage): string {
+  const msgCase = msg.message.case ?? "unknown";
+  if (msgCase === "interactionUpdate") {
+    const updateCase = (msg.message.value as any).message?.case ?? "unknown";
+    return `${msgCase}.${updateCase}`;
+  }
+  if (msgCase === "execServerMessage") {
+    const execCase = (msg.message.value as any).message?.case ?? "unknown";
+    return `${msgCase}.${execCase}`;
+  }
+  return msgCase;
+}
+
+function isCursorServerHeartbeat(msg: AgentServerMessage): boolean {
+  return (
+    msg.message.case === "interactionUpdate" &&
+    (msg.message.value as any).message?.case === "heartbeat"
+  );
 }
 
 export function cleanupAllSessionState(): void {
@@ -1673,10 +1822,23 @@ function writeNativeStream(
   let cancelled = false;
   let streamError: Error | null = null;
   let latestCheckpoint: Uint8Array | null = null;
+  const watchdog = createCursorStreamWatchdog({
+    eventPrefix: "native.stream",
+    requestId,
+    bridgeKey,
+    convKey,
+    bridge,
+    heartbeatTimer,
+    onTimeout: (_kind, message) => {
+      streamError = new Error(message);
+      if (!writer.closed) writer.error(message, "error", state);
+    },
+  });
 
   const abort = () => {
     if (cancelled) return;
     cancelled = true;
+    watchdog.stop();
     debugLog("native.stream.abort", { requestId, bridgeKey, convKey, writerClosed: writer.closed });
     cleanupBridge(bridge, heartbeatTimer, bridgeKey);
     if (!writer.closed) writer.error("Aborted", "aborted", state);
@@ -1694,8 +1856,14 @@ function writeNativeStream(
       currentTurn,
       text,
       isThinking,
-      (reasoning) => writer.thinking(reasoning),
-      (content) => writer.text(content),
+      (reasoning) => {
+        watchdog.touchVisible("thinking_delta");
+        writer.thinking(reasoning);
+      },
+      (content) => {
+        watchdog.touchVisible("text_delta");
+        writer.text(content);
+      },
     );
   };
 
@@ -1703,8 +1871,14 @@ function writeNativeStream(
     flushFilteredStreamText(
       tagFilter,
       currentTurn,
-      (reasoning) => writer.thinking(reasoning),
-      (content) => writer.text(content),
+      (reasoning) => {
+        watchdog.touchVisible("thinking_delta");
+        writer.thinking(reasoning);
+      },
+      (content) => {
+        watchdog.touchVisible("text_delta");
+        writer.text(content);
+      },
     );
   };
 
@@ -1712,6 +1886,8 @@ function writeNativeStream(
     (messageBytes) => {
       try {
         const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+        if (!isCursorServerHeartbeat(serverMessage))
+          watchdog.touchUpstream(cursorServerMessageLabel(serverMessage));
         processServerMessage(
           serverMessage,
           blobStore,
@@ -1722,6 +1898,8 @@ function writeNativeStream(
           emitText,
           (exec) => {
             mcpExecReceived = true;
+            watchdog.touchVisible("tool_call");
+            watchdog.stop();
             emitFlushed();
             rememberToolCallPause(
               bridgeKey,
@@ -1757,6 +1935,7 @@ function writeNativeStream(
         streamError = err instanceof Error ? err : new Error(String(err));
         const message = streamError.message;
         debugLog("native.stream.process_error", { requestId, bridgeKey, convKey, message });
+        watchdog.stop();
         if (!writer.closed) writer.error(message, "error", state);
         cleanupBridge(bridge, heartbeatTimer, bridgeKey);
       }
@@ -1765,6 +1944,7 @@ function writeNativeStream(
       const endError = parseConnectEndStream(endStreamBytes);
       if (endError) {
         streamError = endError;
+        watchdog.stop();
         debugLog("native.stream.cursor_error", { requestId, modelId, message: endError.message });
         writer.error(endError.message, "error", state);
       }
@@ -1784,6 +1964,7 @@ function writeNativeStream(
       currentTurn,
       latestCheckpoint,
     });
+    watchdog.stop();
     clearInterval(heartbeatTimer);
     options?.signal?.removeEventListener("abort", abort);
 
@@ -2560,6 +2741,7 @@ async function handleChatCompletion(
       payload,
       accessToken,
       modelId,
+      bridgeKey,
       convKey,
       turns,
       currentTurn,
@@ -3725,6 +3907,21 @@ function processServerMessage(
       if (delta) onText(delta, true);
     } else if (updateCase === "tokenDelta") {
       state.outputTokens += update.message.value.tokens ?? 0;
+    } else if (
+      updateCase &&
+      ![
+        "heartbeat",
+        "thinkingCompleted",
+        "summary",
+        "summaryStarted",
+        "summaryCompleted",
+        "turnEnded",
+        "userMessageAppended",
+        "stepStarted",
+        "stepCompleted",
+      ].includes(updateCase)
+    ) {
+      debugLog("server_message.unhandled_interaction_update", { updateCase, update });
     }
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
@@ -3744,6 +3941,8 @@ function processServerMessage(
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
+  } else if (msgCase) {
+    debugLog("server_message.unhandled", { msgCase, msg });
   }
 }
 
@@ -4429,12 +4628,28 @@ function writeSSEStream(
   let cancelled = false;
   let streamError: Error | null = null;
   let latestCheckpoint: Uint8Array | null = null;
+  const watchdog = createCursorStreamWatchdog({
+    eventPrefix: "stream",
+    requestId,
+    bridgeKey,
+    convKey,
+    bridge,
+    heartbeatTimer,
+    onTimeout: (_kind, message) => {
+      streamError = new Error(message);
+      sendSSE(makeChunk({ content: message }, "error"));
+      sendSSE(makeUsageChunk());
+      sendDone();
+      closeResponse();
+    },
+  });
 
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
     if (cancelled || closed) return;
     debugLog("stream.client_close", { requestId, bridgeKey, convKey });
     cancelled = true;
+    watchdog.stop();
     cleanupBridge(bridge, heartbeatTimer, bridgeKey);
     closeResponse();
   };
@@ -4445,6 +4660,8 @@ function writeSSEStream(
     (messageBytes) => {
       try {
         const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+        if (!isCursorServerHeartbeat(serverMessage))
+          watchdog.touchUpstream(cursorServerMessageLabel(serverMessage));
         processServerMessage(
           serverMessage,
           blobStore,
@@ -4458,12 +4675,20 @@ function writeSSEStream(
               currentTurn,
               text,
               isThinking,
-              (reasoning) => sendSSE(makeChunk({ reasoning_content: reasoning })),
-              (content) => sendSSE(makeChunk({ content })),
+              (reasoning) => {
+                watchdog.touchVisible("thinking_delta");
+                sendSSE(makeChunk({ reasoning_content: reasoning }));
+              },
+              (content) => {
+                watchdog.touchVisible("text_delta");
+                sendSSE(makeChunk({ content }));
+              },
             );
           },
           (exec) => {
             mcpExecReceived = true;
+            watchdog.touchVisible("tool_call");
+            watchdog.stop();
 
             flushFilteredStreamText(
               tagFilter,
@@ -4528,6 +4753,7 @@ function writeSSEStream(
         sendSSE(makeUsageChunk());
         sendDone();
         closeResponse();
+        watchdog.stop();
         cleanupBridge(bridge, heartbeatTimer, bridgeKey);
       }
     },
@@ -4535,6 +4761,7 @@ function writeSSEStream(
       const endError = parseConnectEndStream(endStreamBytes);
       if (endError) {
         streamError = endError;
+        watchdog.stop();
         console.error(`[cursor-provider] Cursor stream error (${modelId}):`, endError.message);
         sendSSE(makeChunk({ content: endError.message }, "error"));
         sendSSE(makeUsageChunk());
@@ -4557,6 +4784,7 @@ function writeSSEStream(
       currentTurn,
       latestCheckpoint,
     });
+    watchdog.stop();
     clearInterval(heartbeatTimer);
     req.removeListener("close", onClientClose);
     res.removeListener("close", onClientClose);
@@ -4719,6 +4947,7 @@ async function handleNonStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
+  bridgeKey: string,
   convKey: string,
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
@@ -4741,11 +4970,28 @@ async function handleNonStreamingResponse(
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   let cancelled = false;
+  const state = createStreamState();
+  const tagFilter = createThinkingTagFilter();
+  let fullText = "";
+  let nonStreamError: Error | null = null;
+  let latestCheckpoint: Uint8Array | null = null;
+  const watchdog = createCursorStreamWatchdog({
+    eventPrefix: "nonstream",
+    requestId,
+    bridgeKey,
+    convKey,
+    bridge,
+    heartbeatTimer,
+    onTimeout: (_kind, message) => {
+      nonStreamError = new Error(message);
+    },
+  });
 
   const onClientClose = () => {
     if (cancelled) return;
     debugLog("nonstream.client_close", { requestId, convKey });
     cancelled = true;
+    watchdog.stop();
     clearInterval(heartbeatTimer);
     if (bridge.alive) {
       sendCancelAction(bridge);
@@ -4754,16 +5000,6 @@ async function handleNonStreamingResponse(
   };
   req.on("close", onClientClose);
   res.on("close", onClientClose);
-  const state: StreamState = {
-    toolCallIndex: 0,
-    pendingExecs: [],
-    outputTokens: 0,
-    totalTokens: 0,
-  };
-  const tagFilter = createThinkingTagFilter();
-  let fullText = "";
-  let nonStreamError: Error | null = null;
-  let latestCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
     bridge.onData(
@@ -4771,6 +5007,8 @@ async function handleNonStreamingResponse(
         (messageBytes) => {
           try {
             const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+            if (!isCursorServerHeartbeat(serverMessage))
+              watchdog.touchUpstream(cursorServerMessageLabel(serverMessage));
             processServerMessage(
               serverMessage,
               payload.blobStore,
@@ -4781,6 +5019,7 @@ async function handleNonStreamingResponse(
               (text, isThinking) => {
                 if (isThinking) return;
                 const { content } = tagFilter.process(text);
+                if (content) watchdog.touchVisible("text_delta");
                 fullText += content;
                 appendAssistantTextToTurn(currentTurn, content);
               },
@@ -4801,6 +5040,7 @@ async function handleNonStreamingResponse(
               convKey,
               message: nonStreamError.message,
             });
+            watchdog.stop();
             clearInterval(heartbeatTimer);
             if (bridge.alive) {
               sendCancelAction(bridge);
@@ -4811,6 +5051,7 @@ async function handleNonStreamingResponse(
         (endStreamBytes) => {
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
+            watchdog.stop();
             console.error(
               `[cursor-provider] Cursor non-stream error (${modelId}):`,
               endError.message,
@@ -4831,6 +5072,7 @@ async function handleNonStreamingResponse(
         currentTurn,
         latestCheckpoint,
       });
+      watchdog.stop();
       clearInterval(heartbeatTimer);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);

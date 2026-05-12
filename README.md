@@ -155,12 +155,13 @@ The native provider runtime maintains conversation state per Pi session, enablin
 - **Redundant history** — Rebuild requests carry Pi's completed history through Cursor's native `UserMessageAction.conversation_history` field and also paste a full inline transcript safety copy into the current user message by default. Valid checkpoint requests do not duplicate that transcript, which avoids runaway context growth during normal sessions.
 - **Session-scoped state** — real pi session state is kept in memory until explicit cleanup or process restart. Anonymous fallback state can still be TTL-evicted.
 - **Lifecycle cleanup** — session state is cleaned up on pi lifecycle events such as session switch, fork, `/tree`, and shutdown.
+- **Stall guards** — active Cursor runs are cancelled if upstream stops sending non-heartbeat server messages (default 2 minutes; `PI_CURSOR_UPSTREAM_IDLE_TIMEOUT_MS`) or if it keeps spending tokens without visible text, thinking, or a tool call (default 3 minutes; `PI_CURSOR_VISIBLE_IDLE_TIMEOUT_MS`). Set either value to `0` to disable that guard.
 
 ### Tool continuations
 
 When Cursor pauses for a tool call, the provider keeps the live upstream bridge open and waits for Pi to send the tool result on the next stream request. That tool result is sent back into the same in-flight Cursor run, so the tool continuation stays part of the original user turn instead of inflating completed history.
 
-If that live bridge is gone before the tool result arrives (for example because the provider process restarted or the upstream stream died), the provider returns an explicit `tool_continuation_lost` error instead of silently starting a new Cursor turn with the tool result as user text. Retry from before the tool call or start a new turn. Paused tool-call bridges are cancelled after a TTL (default 15 minutes; override with `PI_CURSOR_ACTIVE_BRIDGE_TTL_MS`).
+If that live bridge is gone before the tool result arrives (for example because the provider process restarted or the upstream stream died), the provider returns an explicit `tool_continuation_lost` error instead of silently starting a new Cursor turn with the tool result as user text. Retry from before the tool call or start a new turn. Paused tool-call bridges are cancelled after a TTL (default 15 minutes; override with `PI_CURSOR_ACTIVE_BRIDGE_TTL_MS`). The active-run stall guards are stopped while Pi is executing a Cursor-requested tool, so long local tool calls are governed by this tool-continuation TTL rather than the upstream/visible idle timers.
 
 `tool_choice: "none"` is honored by withholding MCP tools from Cursor when supplied through provider options/hooks. Other forced tool choices are rejected because Cursor's agent protocol does not expose an equivalent control. Cursor controls output budgeting server-side; unsupported sampling parameters such as `temperature` are rejected instead of silently ignored.
 
@@ -219,7 +220,7 @@ npm run debug:timeline -- --latest
 npm run debug:timeline -- /path/to/pi-cursor-provider-debug-2026-04-08T14-06-07-565Z-41184.log
 ```
 
-Add `--json` if you want the parsed summary as JSON instead of formatted text.
+Add `--json` if you want the parsed summary as JSON instead of formatted text. Timeout events appear as `*.upstream_idle_timeout` or `*.visible_idle_timeout` entries, with the last upstream/visible progress reason included to distinguish true upstream silence from token-only hidden generation.
 
 ## Credits
 
