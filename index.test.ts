@@ -50,6 +50,7 @@ import {
   AgentClientMessageSchema,
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
+  ConversationTokenDetailsSchema,
   ExecServerMessageSchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
@@ -59,6 +60,7 @@ import {
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   TokenDeltaUpdateSchema,
+  TurnEndedUpdateSchema,
 } from "./proto/agent_pb.ts";
 
 afterEach(() => {
@@ -3008,11 +3010,49 @@ function makeTokenDeltaMessage(tokens: number) {
   });
 }
 
-function makeCheckpointMessage() {
+function makeCheckpointMessage(usedTokens?: number) {
   return create(AgentServerMessageSchema, {
     message: {
       case: "conversationCheckpointUpdate",
-      value: create(ConversationStateStructureSchema, {}),
+      value: create(
+        ConversationStateStructureSchema,
+        usedTokens === undefined
+          ? {}
+          : { tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }) },
+      ),
+    },
+  });
+}
+
+function encodeVarint(value: number | bigint): Uint8Array {
+  let remaining = BigInt(value);
+  const bytes: number[] = [];
+  do {
+    let byte = Number(remaining & 0x7fn);
+    remaining >>= 7n;
+    if (remaining > 0n) byte |= 0x80;
+    bytes.push(byte);
+  } while (remaining > 0n);
+  return new Uint8Array(bytes);
+}
+
+function makeTurnEndedMessage(usage: {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens?: number;
+}) {
+  const value = create(TurnEndedUpdateSchema, {}) as any;
+  value.$unknown = [
+    { no: 1, wireType: 0, data: encodeVarint(usage.inputTokens) },
+    { no: 2, wireType: 0, data: encodeVarint(usage.outputTokens) },
+    { no: 3, wireType: 0, data: encodeVarint(usage.cacheReadTokens) },
+    { no: 4, wireType: 0, data: encodeVarint(usage.cacheWriteTokens ?? 0) },
+  ];
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, { message: { case: "turnEnded", value } }),
     },
   });
 }
@@ -3130,7 +3170,7 @@ async function collectEvents(stream: AsyncIterable<any>): Promise<any[]> {
 }
 
 describe("native streamSimple provider", () => {
-  test("seeds in-flight context usage from prior assistant usage", async () => {
+  test("does not carry prior assistant context usage into billable input", async () => {
     setBridgeFactoryForTests(
       (options) =>
         new FakeBridge(options, (clientMessage, fake) => {
@@ -3170,8 +3210,145 @@ describe("native streamSimple provider", () => {
     );
 
     expect(events[0]).toMatchObject({ type: "start" });
-    expect(events[0].partial.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
+    expect(events.at(-1).message.usage.input).toBe(0);
     expect(events.at(-1).message.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
+  });
+
+  test("reports Cursor cumulative tokenDetails as per-segment deltas", async () => {
+    const sessionId = "native-cursor-usage-delta-session";
+    let runCount = 0;
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runCount += 1;
+            setTimeout(() => {
+              if (runCount === 1) {
+                fake.emitServerMessage(makeTokenDeltaMessage(50));
+                fake.emitServerMessage(makeTextDeltaMessage("ok"));
+                fake.emitServerMessage(makeCheckpointMessage(1_250));
+                fake.emitServerMessage(
+                  makeTurnEndedMessage({
+                    inputTokens: 1_200,
+                    outputTokens: 50,
+                    cacheReadTokens: 1_000,
+                  }),
+                );
+              } else {
+                fake.emitServerMessage(makeTokenDeltaMessage(60));
+                fake.emitServerMessage(makeTextDeltaMessage("done"));
+                fake.emitServerMessage(makeCheckpointMessage(1_600));
+                fake.emitServerMessage(
+                  makeTurnEndedMessage({
+                    inputTokens: 1_540,
+                    outputTokens: 60,
+                    cacheReadTokens: 1_250,
+                  }),
+                );
+              }
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-usage-delta",
+      checkpoint: toBinary(
+        ConversationStateStructureSchema,
+        decodeRunRequest(buildCursorRequest("gpt-5", "system", "old", [], "conv-usage-delta", null))
+          .conversationState,
+      ),
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns([
+        turn("old", [assistantStep("old response")]),
+      ]),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
+      cursorUsageCumulativeTokens: 1_000,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          systemPrompt: "system",
+          messages: [
+            { role: "user", content: "old", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "old response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: emptyUsage(),
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "new prompt", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.input).toBe(200);
+    expect(usage.output).toBe(50);
+    expect(usage.cacheRead).toBe(1_000);
+    expect(usage.totalTokens).toBe(1_250);
+    expect(__testInternals.conversationStates.get(convKey)?.cursorUsageCumulativeTokens).toBe(
+      1_250,
+    );
+
+    const nextEvents = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          systemPrompt: "system",
+          messages: [
+            { role: "user", content: "old", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "old response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: emptyUsage(),
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "new prompt", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "ok" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage,
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "next prompt", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    const nextUsage = nextEvents.at(-1).message.usage;
+    expect(nextUsage.input).toBe(290);
+    expect(nextUsage.output).toBe(60);
+    expect(nextUsage.cacheRead).toBe(1_250);
+    expect(nextUsage.totalTokens).toBe(1_600);
+    expect(usage.input + usage.output + nextUsage.input + nextUsage.output).toBe(600);
+    expect(__testInternals.conversationStates.get(convKey)?.cursorUsageCumulativeTokens).toBe(
+      1_600,
+    );
   });
 
   test("reuses valid checkpoints while carrying inline Pi context as a safety net", async () => {

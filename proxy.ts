@@ -234,16 +234,37 @@ export interface StoredConversation {
   checkpointTurnCount?: number;
   checkpointHistoryFingerprint?: string;
   checkpointSystemPromptFingerprint?: string;
+  /** Last Cursor-reported cumulative used_tokens value for this conversation checkpoint. */
+  cursorUsageCumulativeTokens?: number;
   sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
 }
 
+interface CursorTurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
 interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
-  outputTokens: number;
-  totalTokens: number;
+  /** Authoritative per-turn billing usage emitted by Cursor's turnEnded update. */
+  turnEndedUsage?: CursorTurnUsage;
+  /** Visible text/thinking chars emitted by Cursor for fallback output estimation. */
+  generatedOutputChars: number;
+  /** Estimated output tokens for Cursor-generated tool calls in fallback usage accounting. */
+  generatedToolCallTokens: number;
+  /** Raw Cursor tokenDelta total. Kept for diagnostics; it is not billing output usage. */
+  cursorTokenDeltaTokens: number;
+  /** Baseline Cursor cumulative used_tokens value at the start of this response segment. */
+  usageBaselineTokens: number;
+  /** Estimated cached-prefix tokens read for fallback usage accounting. */
+  cacheReadBaselineTokens: number;
+  /** Latest Cursor-reported cumulative used_tokens value observed in this response segment. */
+  cursorUsageCumulativeTokens: number;
 }
 
 interface ToolResultInfo {
@@ -316,9 +337,11 @@ const VISIBLE_IDLE_TIMEOUT_MS = readTimeoutMsEnv(
   "PI_CURSOR_VISIBLE_IDLE_TIMEOUT_MS",
   DEFAULT_VISIBLE_IDLE_TIMEOUT_MS,
 );
-const DEFAULT_INLINE_HISTORY_MAX_CHARS = Number.POSITIVE_INFINITY;
-const DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS = Number.POSITIVE_INFINITY;
-const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = Number.POSITIVE_INFINITY;
+const DEFAULT_INLINE_HISTORY_MAX_CHARS = 200_000;
+const DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS = 20_000;
+const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = 20_000;
+const CURSOR_GENERATED_CHARS_PER_OUTPUT_TOKEN = 2.7;
+const CURSOR_TOOL_ONLY_CACHE_READ_SCALE = 0.58;
 const INLINE_HISTORY_MAX_CHARS = readNonNegativeIntegerEnv(
   "PI_CURSOR_INLINE_HISTORY_MAX_CHARS",
   DEFAULT_INLINE_HISTORY_MAX_CHARS,
@@ -982,6 +1005,7 @@ type NativeBlockKind = "text" | "thinking";
 interface NativeStreamWriter {
   output: AssistantMessage;
   closed: boolean;
+  initialContextTokens: number;
   start(): void;
   text(delta: string): void;
   thinking(delta: string): void;
@@ -1007,6 +1031,82 @@ function usageContextTokens(usage: AssistantMessage["usage"]): number {
 
 function estimateTextTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+function estimateGeneratedOutputTokens(text: string): number {
+  return estimateGeneratedOutputCharTokens(text.length);
+}
+
+function estimateGeneratedOutputCharTokens(chars: number): number {
+  return Math.ceil(chars / CURSOR_GENERATED_CHARS_PER_OUTPUT_TOKEN);
+}
+
+function estimateGeneratedToolCallTokens(exec: PendingExec): number {
+  return estimateGeneratedOutputTokens(`${exec.toolName} ${exec.decodedArgs}`) + 8;
+}
+
+function decodeProtoVarint(data: Uint8Array): bigint | undefined {
+  let result = 0n;
+  let shift = 0n;
+  for (const byte of data) {
+    result |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return result;
+    shift += 7n;
+    if (shift > 63n) return undefined;
+  }
+  return undefined;
+}
+
+function protoIntToNumber(value: unknown): number | undefined {
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function unknownVarintField(message: { $unknown?: unknown }, fieldNo: number): number | undefined {
+  const unknownFields = (message as any).$unknown;
+  if (!Array.isArray(unknownFields)) return undefined;
+  for (const field of unknownFields) {
+    if (field?.no !== fieldNo || field?.wireType !== 0 || !(field.data instanceof Uint8Array)) {
+      continue;
+    }
+    const decoded = decodeProtoVarint(field.data);
+    if (decoded !== undefined) return Number(decoded);
+  }
+  return undefined;
+}
+
+function turnEndedUsage(value: unknown): CursorTurnUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const message = value as any;
+  const rawInputTokens = protoIntToNumber(message.inputTokens) ?? unknownVarintField(message, 1);
+  const outputTokens = protoIntToNumber(message.outputTokens) ?? unknownVarintField(message, 2);
+  const cacheReadTokens =
+    protoIntToNumber(message.cacheReadTokens) ?? unknownVarintField(message, 3);
+  const cacheWriteTokens =
+    protoIntToNumber(message.cacheWriteTokens) ?? unknownVarintField(message, 4);
+  if (
+    rawInputTokens === undefined &&
+    outputTokens === undefined &&
+    cacheReadTokens === undefined &&
+    cacheWriteTokens === undefined
+  ) {
+    return undefined;
+  }
+  const cacheRead = Math.max(0, Math.floor(cacheReadTokens ?? 0));
+  const cacheWrite = Math.max(0, Math.floor(cacheWriteTokens ?? 0));
+  // Cursor's own headless event path reports input as input - cacheRead - cacheWrite.
+  const input = Math.max(0, Math.floor(rawInputTokens ?? 0) - cacheRead - cacheWrite);
+  return {
+    inputTokens: input,
+    outputTokens: Math.max(0, Math.floor(outputTokens ?? 0)),
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+  };
 }
 
 function estimateContentTokens(content: unknown): number {
@@ -1073,18 +1173,22 @@ function applyCursorUsage(
   const usage = computeUsage(state, fallbackTotalTokens);
   const costInput = tokenCost(usage.prompt_tokens, model.cost?.input);
   const costOutput = tokenCost(usage.completion_tokens, model.cost?.output);
+  const costCacheRead = tokenCost(usage.cache_read_tokens, model.cost?.cacheRead);
+  const costCacheWrite = tokenCost(usage.cache_write_tokens, model.cost?.cacheWrite);
   output.usage = {
     input: usage.prompt_tokens,
     output: usage.completion_tokens,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: usage.total_tokens,
+    cacheRead: usage.cache_read_tokens,
+    cacheWrite: usage.cache_write_tokens,
+    // Pi uses totalTokens for current context-window usage, while input/output/cacheRead remain
+    // per-response billing deltas. Cursor tokenDetails.usedTokens is cumulative context.
+    totalTokens: usage.context_tokens,
     cost: {
       input: costInput,
       output: costOutput,
-      cacheRead: 0,
-      cacheWrite: 0,
-      total: costInput + costOutput,
+      cacheRead: costCacheRead,
+      cacheWrite: costCacheWrite,
+      total: costInput + costOutput + costCacheRead + costCacheWrite,
     },
   };
 }
@@ -1164,6 +1268,7 @@ function createNativeStreamWriter(
     get closed() {
       return closed;
     },
+    initialContextTokens,
     start: ensureStarted,
     text(delta: string) {
       if (closed || !delta) return;
@@ -1681,6 +1786,10 @@ async function handleCursorNativeRequest(
     hasRequestCheckpoint: !!requestCheckpoint,
     payload,
   });
+  const usageBaselineTokens = requestCheckpoint ? (stored.cursorUsageCumulativeTokens ?? 0) : 0;
+  const cacheReadBaselineTokens = requestCheckpoint
+    ? Math.max(usageBaselineTokens, writer.initialContextTokens)
+    : 0;
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   writeNativeStream(
     bridge,
@@ -1698,16 +1807,33 @@ async function handleCursorNativeRequest(
     writer,
     options,
     requestId,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
   );
 }
 
-function createStreamState(): StreamState {
+function createStreamState(
+  usageBaselineTokens = 0,
+  cacheReadBaselineTokens = usageBaselineTokens,
+): StreamState {
   return {
     toolCallIndex: 0,
     pendingExecs: [],
-    outputTokens: 0,
-    totalTokens: 0,
+    generatedOutputChars: 0,
+    generatedToolCallTokens: 0,
+    cursorTokenDeltaTokens: 0,
+    usageBaselineTokens: Math.max(0, usageBaselineTokens),
+    cacheReadBaselineTokens: Math.max(0, cacheReadBaselineTokens),
+    cursorUsageCumulativeTokens: 0,
   };
+}
+
+function recordCursorUsageProgress(convKey: string, state: StreamState): void {
+  if (state.cursorUsageCumulativeTokens <= 0) return;
+  const stored = conversationStates.get(convKey);
+  if (!stored) return;
+  stored.cursorUsageCumulativeTokens = state.cursorUsageCumulativeTokens;
+  stored.lastAccessMs = Date.now();
 }
 
 function emitFilteredStreamText(
@@ -1814,9 +1940,19 @@ function writeNativeStream(
   writer: NativeStreamWriter,
   options?: CursorNativeStreamOptions,
   requestId?: string,
+  usageBaselineTokens = 0,
+  cacheReadBaselineTokens = usageBaselineTokens,
 ): void {
-  debugLog("native.stream.start", { requestId, bridgeKey, convKey, modelId, workspaceContext });
-  const state = createStreamState();
+  debugLog("native.stream.start", {
+    requestId,
+    bridgeKey,
+    convKey,
+    modelId,
+    workspaceContext,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
+  });
+  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens);
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
@@ -1924,6 +2060,7 @@ function writeNativeStream(
             if (!writer.closed) {
               writer.toolCall(exec);
               writer.done("toolUse", state);
+              recordCursorUsageProgress(convKey, state);
             }
           },
           (checkpointBytes) => {
@@ -1994,6 +2131,7 @@ function writeNativeStream(
       if (stored && latestCheckpoint)
         debugLog("native.stream.checkpoint_committed", { requestId, convKey, stored });
       writer.done("stop", state);
+      recordCursorUsageProgress(convKey, state);
     } else {
       removeActiveBridge(bridgeKey);
     }
@@ -2112,6 +2250,8 @@ function handleNativeToolResultResume(
     requestId,
   );
 
+  const usageBaselineTokens = conversationStates.get(convKey)?.cursorUsageCumulativeTokens ?? 0;
+  const cacheReadBaselineTokens = Math.max(usageBaselineTokens, writer.initialContextTokens);
   writeNativeStream(
     bridge,
     heartbeatTimer,
@@ -2128,6 +2268,8 @@ function handleNativeToolResultResume(
     writer,
     options,
     requestId,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
   );
 }
 
@@ -2240,6 +2382,7 @@ function clearStoredCheckpoint(stored: StoredConversation, clearBlobStore = fals
   delete stored.checkpointTurnCount;
   delete stored.checkpointHistoryFingerprint;
   delete stored.checkpointSystemPromptFingerprint;
+  delete stored.cursorUsageCumulativeTokens;
   if (clearBlobStore) stored.blobStore.clear();
 }
 
@@ -2734,6 +2877,8 @@ async function handleChatCompletion(
     steps: [],
     ...(effectiveUserImages.length > 0 ? { userImages: effectiveUserImages } : {}),
   };
+  const usageBaselineTokens = requestCheckpoint ? (stored.cursorUsageCumulativeTokens ?? 0) : 0;
+  const cacheReadBaselineTokens = usageBaselineTokens;
 
   if (body.stream === false) {
     debugLog("chat.dispatch_nonstream", { requestId, convKey });
@@ -2750,6 +2895,8 @@ async function handleChatCompletion(
       req,
       res,
       requestId,
+      usageBaselineTokens,
+      cacheReadBaselineTokens,
     );
   } else {
     debugLog("chat.dispatch_stream", { requestId, bridgeKey, convKey });
@@ -2766,6 +2913,8 @@ async function handleChatCompletion(
       req,
       res,
       requestId,
+      usageBaselineTokens,
+      cacheReadBaselineTokens,
     );
   }
 }
@@ -3901,12 +4050,24 @@ function processServerMessage(
     const updateCase = update.message?.case;
     if (updateCase === "textDelta") {
       const delta = update.message.value.text || "";
-      if (delta) onText(delta, false);
+      if (delta) {
+        state.generatedOutputChars += delta.length;
+        onText(delta, false);
+      }
     } else if (updateCase === "thinkingDelta") {
       const delta = update.message.value.text || "";
-      if (delta) onText(delta, true);
+      if (delta) {
+        state.generatedOutputChars += delta.length;
+        onText(delta, true);
+      }
     } else if (updateCase === "tokenDelta") {
-      state.outputTokens += update.message.value.tokens ?? 0;
+      state.cursorTokenDeltaTokens += update.message.value.tokens ?? 0;
+    } else if (updateCase === "turnEnded") {
+      const usage = turnEndedUsage(update.message.value);
+      if (usage) {
+        state.turnEndedUsage = usage;
+        debugLog("usage.cursor_turn_ended", { usage });
+      }
     } else if (
       updateCase &&
       ![
@@ -3931,12 +4092,22 @@ function processServerMessage(
       mcpTools,
       workspaceContext,
       sendFrame,
-      onMcpExec,
+      (exec) => {
+        state.generatedToolCallTokens += estimateGeneratedToolCallTokens(exec);
+        onMcpExec(exec);
+      },
     );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
-    if ((stateStructure as any).tokenDetails) {
-      state.totalTokens = (stateStructure as any).tokenDetails.usedTokens;
+    const tokenDetails = (stateStructure as any).tokenDetails;
+    if (tokenDetails) {
+      state.cursorUsageCumulativeTokens = tokenDetails.usedTokens ?? 0;
+      debugLog("usage.cursor_token_details", {
+        usedTokens: state.cursorUsageCumulativeTokens,
+        maxTokens: tokenDetails.maxTokens,
+        baselineTokens: state.usageBaselineTokens,
+        cursorTokenDeltaTokens: state.cursorTokenDeltaTokens,
+      });
     }
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
@@ -4397,10 +4568,47 @@ function makeHeartbeatBytes(): Uint8Array {
 }
 
 function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
-  const completion_tokens = state.outputTokens;
-  const total_tokens = state.totalTokens || Math.max(fallbackTotalTokens, completion_tokens);
-  const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
-  return { prompt_tokens, completion_tokens, total_tokens };
+  let completion_tokens =
+    estimateGeneratedOutputCharTokens(state.generatedOutputChars) + state.generatedToolCallTokens;
+  let cache_read_tokens = 0;
+  let cache_write_tokens = 0;
+  let total_tokens = completion_tokens;
+  let context_tokens = Math.max(fallbackTotalTokens, completion_tokens);
+
+  if (state.turnEndedUsage) {
+    completion_tokens = state.turnEndedUsage.outputTokens;
+    cache_read_tokens = state.turnEndedUsage.cacheReadTokens;
+    cache_write_tokens = state.turnEndedUsage.cacheWriteTokens;
+    total_tokens =
+      state.turnEndedUsage.inputTokens + completion_tokens + cache_read_tokens + cache_write_tokens;
+  } else {
+    const cacheReadScale = state.generatedOutputChars > 0 ? 1 : CURSOR_TOOL_ONLY_CACHE_READ_SCALE;
+    cache_read_tokens =
+      completion_tokens > 0 ? Math.round(state.cacheReadBaselineTokens * cacheReadScale) : 0;
+  }
+
+  if (state.cursorUsageCumulativeTokens > 0) {
+    context_tokens = state.cursorUsageCumulativeTokens;
+    if (!state.turnEndedUsage) {
+      const deltaTokens = state.cursorUsageCumulativeTokens - state.usageBaselineTokens;
+      total_tokens = Math.max(
+        completion_tokens,
+        deltaTokens >= 0 ? deltaTokens : state.cursorUsageCumulativeTokens,
+      );
+    }
+  }
+
+  const prompt_tokens = state.turnEndedUsage
+    ? state.turnEndedUsage.inputTokens
+    : Math.max(0, total_tokens - completion_tokens);
+  return {
+    prompt_tokens,
+    completion_tokens,
+    cache_read_tokens,
+    cache_write_tokens,
+    total_tokens,
+    context_tokens,
+  };
 }
 
 function respondWithPendingToolCalls(
@@ -4500,8 +4708,18 @@ function handleStreamingResponse(
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
+  usageBaselineTokens = 0,
+  cacheReadBaselineTokens = usageBaselineTokens,
 ): void {
-  debugLog("stream.start", { requestId, bridgeKey, convKey, modelId, workspaceContext });
+  debugLog("stream.start", {
+    requestId,
+    bridgeKey,
+    convKey,
+    modelId,
+    workspaceContext,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
+  });
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   writeSSEStream(
     bridge,
@@ -4518,6 +4736,8 @@ function handleStreamingResponse(
     req,
     res,
     requestId,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
   );
 }
 
@@ -4568,6 +4788,8 @@ function writeSSEStream(
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
+  usageBaselineTokens = 0,
+  cacheReadBaselineTokens = usageBaselineTokens,
 ): void {
   debugLog("stream.writer_start", {
     requestId,
@@ -4577,6 +4799,8 @@ function writeSSEStream(
     workspaceContext,
     completedTurnCount: completedTurns.length,
     currentTurn,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
   });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -4622,7 +4846,7 @@ function writeSSEStream(
     };
   };
 
-  const state = createStreamState();
+  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens);
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
@@ -4734,6 +4958,7 @@ function writeSSEStream(
             sendSSE(makeChunk({}, "tool_calls"));
             sendDone();
             closeResponse();
+            recordCursorUsageProgress(convKey, state);
           },
           (checkpointBytes) => {
             latestCheckpoint = checkpointBytes;
@@ -4826,6 +5051,7 @@ function writeSSEStream(
       sendSSE(makeUsageChunk());
       sendDone();
       closeResponse();
+      recordCursorUsageProgress(convKey, state);
     } else {
       removeActiveBridge(bridgeKey);
     }
@@ -4923,6 +5149,8 @@ function handleToolResultResume(
   // Tool results belong to the same user turn that initiated the tool calls.
   // parseMessages keeps tool continuations out of completed history, so completedTurns
   // already reflects the correct history covered before this in-flight turn.
+  const usageBaselineTokens = conversationStates.get(convKey)?.cursorUsageCumulativeTokens ?? 0;
+  const cacheReadBaselineTokens = usageBaselineTokens;
   writeSSEStream(
     bridge,
     heartbeatTimer,
@@ -4938,6 +5166,8 @@ function handleToolResultResume(
     req,
     res,
     requestId,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
   );
 }
 
@@ -4956,6 +5186,8 @@ async function handleNonStreamingResponse(
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
+  usageBaselineTokens = 0,
+  cacheReadBaselineTokens = usageBaselineTokens,
 ): Promise<void> {
   debugLog("nonstream.start", {
     requestId,
@@ -4964,13 +5196,15 @@ async function handleNonStreamingResponse(
     workspaceContext,
     currentTurn,
     completedTurnCount: completedTurns.length,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
   });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   let cancelled = false;
-  const state = createStreamState();
+  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens);
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
   let nonStreamError: Error | null = null;
@@ -5129,6 +5363,7 @@ async function handleNonStreamingResponse(
           mergeBlobStore(stored, payload.blobStore);
         }
       }
+      recordCursorUsageProgress(convKey, state);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(

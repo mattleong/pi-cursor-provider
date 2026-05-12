@@ -40,7 +40,7 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gpt-5.3-codex": { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
   "gpt-5.4": { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
   "gpt-5.4-mini": { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-  "gpt-5.5": { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+  "gpt-5.5": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 0 },
   "grok-4.20": { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
   "kimi-k2.5": { input: 0.6, output: 3, cacheRead: 0.1, cacheWrite: 0 },
 };
