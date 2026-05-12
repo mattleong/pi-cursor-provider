@@ -3244,6 +3244,57 @@ describe("native streamSimple provider", () => {
     expect(events.at(-1).message.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
   });
 
+  test("estimates in-flight context from input/output only when totalTokens is unavailable", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const priorUsage = {
+      input: 1_000,
+      output: 50,
+      cacheRead: 500_000,
+      cacheWrite: 25_000,
+      totalTokens: undefined,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    } as any;
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "previous prompt", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "previous response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: priorUsage,
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "new prompt", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId: "native-inflight-no-total-usage-session" },
+      ),
+    );
+
+    expect(events[0]).toMatchObject({ type: "start" });
+    expect(events[0].partial.usage.totalTokens).toBeGreaterThanOrEqual(1_050);
+    expect(events[0].partial.usage.totalTokens).toBeLessThan(2_000);
+  });
+
   test("reports Cursor cumulative tokenDetails as per-segment deltas", async () => {
     const sessionId = "native-cursor-usage-delta-session";
     let runCount = 0;
@@ -3379,6 +3430,51 @@ describe("native streamSimple provider", () => {
     expect(__testInternals.conversationStates.get(convKey)?.cursorUsageCumulativeTokens).toBe(
       1_600,
     );
+  });
+
+  test("keeps raw cache-read usage while totalTokens reports active context", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("review complete"));
+              fake.emitServerMessage(makeCheckpointMessage(78_119));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 1_006_293,
+                  outputTokens: 4_327,
+                  cacheReadTokens: 939_008,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        { ...nativeModel("gpt-5.5"), contextWindow: 272_000 },
+        {
+          systemPrompt: "system",
+          messages: [{ role: "user", content: "review the branch", timestamp: Date.now() }],
+        } as any,
+        { sessionId: "native-large-cache-read-session" },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.totalTokens).toBe(78_119);
+    expect(usage.input).toBe(67_285);
+    expect(usage.output).toBe(4_327);
+    expect(usage.cacheRead).toBe(939_008);
+    expect(usage.cacheWrite).toBe(0);
+    expect(usage.input + usage.output + usage.cacheRead + usage.cacheWrite).toBeGreaterThan(
+      usage.totalTokens,
+    );
+    expect(usage.totalTokens).toBeLessThan(272_000 - 16_384);
   });
 
   test("reuses valid checkpoints while carrying inline Pi context as a safety net", async () => {

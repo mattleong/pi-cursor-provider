@@ -1026,7 +1026,10 @@ function emptyCursorUsage(totalTokens = 0): AssistantMessage["usage"] {
 }
 
 function usageContextTokens(usage: AssistantMessage["usage"]): number {
-  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  // totalTokens is the active context-window size. If it is unavailable,
+  // fall back only to non-cache input/output; Cursor cache read/write values
+  // are billing/cache telemetry and can exceed the live context by a lot.
+  return usage.totalTokens ?? usage.input + usage.output;
 }
 
 function estimateTextTokens(text: string): number {
