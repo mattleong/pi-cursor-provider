@@ -2337,7 +2337,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     ]);
   });
 
-  test("no checkpoint, with assistant-text turns — encodes native conversation_history plus inline safety transcript", () => {
+  test("no checkpoint, with assistant-text turns — encodes native conversation_history only", () => {
     const turns = [
       turn("first question", [assistantStep("first answer")]),
       turn("second question", [assistantStep("second answer")]),
@@ -2355,14 +2355,8 @@ describe("buildCursorRequest — turn reconstruction", () => {
     ]);
 
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
-    expect(userAction.userMessage.text).toContain("first question");
-    expect(userAction.userMessage.text).toContain("first answer");
-    expect(userAction.userMessage.text).toContain("second question");
-    expect(userAction.userMessage.text).toContain("second answer");
-    expect(userAction.userMessage.text).toContain(
-      "<current_user_message>\nthird question\n</current_user_message>",
-    );
+    expect(userAction.userMessage.text).toBe("third question");
+    expect(userAction.userMessage.text).not.toContain("<pi_conversation_history>");
     expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
@@ -2406,12 +2400,8 @@ describe("buildCursorRequest — turn reconstruction", () => {
     ]);
 
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
-    expect(userAction.userMessage.text).toContain("inspect file");
-    expect(userAction.userMessage.text).toContain("file contents");
-    expect(userAction.userMessage.text).toContain(
-      "<current_user_message>\nfix it\n</current_user_message>",
-    );
+    expect(userAction.userMessage.text).toBe("fix it");
+    expect(userAction.userMessage.text).not.toContain("<pi_conversation_history>");
     expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
@@ -2501,7 +2491,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     }
   });
 
-  test("adds redundant inline Pi history without sending stale selectedContextBlob fields", () => {
+  test("sends native Pi history without stale selectedContextBlob fields", () => {
     const turns = [turn("first", [assistantStep("done")]), turn("second", [assistantStep("ok")])];
     const payload = buildCursorRequest("gpt-5", "system", "continue", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
@@ -2511,14 +2501,8 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(req.conversationState.turns).toHaveLength(0);
     expect(history).toHaveLength(4);
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
-    expect(userAction.userMessage.text).toContain("first");
-    expect(userAction.userMessage.text).toContain("done");
-    expect(userAction.userMessage.text).toContain("second");
-    expect(userAction.userMessage.text).toContain("ok");
-    expect(userAction.userMessage.text).toContain(
-      "<current_user_message>\ncontinue\n</current_user_message>",
-    );
+    expect(userAction.userMessage.text).toBe("continue");
+    expect(userAction.userMessage.text).not.toContain("<pi_conversation_history>");
     expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
@@ -2560,12 +2544,8 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect((history.at(-2) as any).content[0].text).toContain("recent issue context");
     expect((history[13] as any).content[0].text).toContain("middle reply 5");
     const text = (req.action.action.value as any).userMessage.text;
-    expect(text).toContain("<pi_conversation_history>");
-    expect(text).toContain("SESSION PIN: remember pineapple");
-    expect(text).toContain("middle-5");
-    expect(text).toContain("middle reply 5");
-    expect(text).toContain("recent issue context");
-    expect(text).toContain("<current_user_message>\ncontinue\n</current_user_message>");
+    expect(text).toBe("continue");
+    expect(text).not.toContain("<pi_conversation_history>");
   });
 
   test("current user action has a generated messageId", () => {
@@ -2594,12 +2574,8 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     ]);
 
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toContain("<pi_conversation_history>");
-    expect(userAction.userMessage.text).toContain("first");
-    expect(userAction.userMessage.text).toContain("response1");
-    expect(userAction.userMessage.text).toContain(
-      "<current_user_message>\nforked question\n</current_user_message>",
-    );
+    expect(userAction.userMessage.text).toBe("forked question");
+    expect(userAction.userMessage.text).not.toContain("<pi_conversation_history>");
     expect(userAction.userMessage.selectedContextBlob).toHaveLength(0);
   });
 
@@ -2662,6 +2638,25 @@ describe("parseMessages — structured tool turns", () => {
     expect(parsed.userText).toBe("what is in this screenshot?");
     expect(parsed.userImages).toHaveLength(1);
     expect(parsed.userImages[0].mimeType).toBe("image/png");
+  });
+
+  test("concatenates assistant text blocks without synthetic separators", () => {
+    const parsed = parseMessages([
+      { role: "user", content: "inspect" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "first sentence." },
+          { type: "thinking", thinking: "" },
+          { type: "text", text: "second sentence." },
+        ] as any,
+      },
+    ]);
+
+    expect(parsed.turns).toHaveLength(1);
+    expect(parsed.turns[0].steps).toEqual([
+      { kind: "assistantText", text: "first sentence.second sentence." },
+    ]);
   });
 
   test("rejects remote OpenAI image_url values with an explicit error", () => {
@@ -3653,7 +3648,7 @@ describe("native streamSimple provider", () => {
     expect(usage.totalTokens).toBe(140);
   });
 
-  test("uses Cursor-reported output and inline history in fallback context when tokenDetails is absent", async () => {
+  test("uses Cursor-reported output and Pi context fallback when tokenDetails is absent", async () => {
     setBridgeFactoryForTests(
       (options) =>
         new FakeBridge(options, (clientMessage, fake) => {
@@ -3700,7 +3695,119 @@ describe("native streamSimple provider", () => {
     const usage = events.at(-1).message.usage;
     expect(usage.input).toBe(20);
     expect(usage.output).toBe(1_000);
-    expect(usage.totalTokens).toBeGreaterThan(1_500);
+    expect(usage.totalTokens).toBeGreaterThan(1_000);
+  });
+
+  test("initializes tool-result continuations from last Cursor context instead of tool-result estimates", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage(12_400, 200_000));
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "inspect", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [
+                { type: "toolCall", id: "tc-big", name: "read", arguments: { path: "big.txt" } },
+              ],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: { ...emptyUsage(), totalTokens: 12_345 },
+              stopReason: "toolUse",
+              timestamp: Date.now(),
+            },
+            {
+              role: "toolResult",
+              toolCallId: "tc-big",
+              toolName: "read",
+              content: [{ type: "text", text: "x".repeat(20_000) }],
+              isError: false,
+              timestamp: Date.now(),
+            },
+          ],
+        } as any,
+        { sessionId: "native-tool-result-initial-context-session" },
+      ),
+    );
+
+    expect(events[0]).toMatchObject({ type: "start" });
+    expect(events[0].partial.usage.totalTokens).toBe(12_345);
+  });
+
+  test("keeps stored Cursor context flat for toolUse fallback without tokenDetails", async () => {
+    const sessionId = "native-tooluse-missing-token-details-session";
+    let runCount = 0;
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runCount += 1;
+            setTimeout(() => {
+              if (runCount === 1) {
+                fake.emitServerMessage(makeTextDeltaMessage("checkpointed response"));
+                fake.emitServerMessage(makeCheckpointMessage(12_345, 200_000));
+                fake.emitServerMessage(
+                  makeTurnEndedMessage({
+                    inputTokens: 12_000,
+                    outputTokens: 50,
+                    cacheReadTokens: 0,
+                  }),
+                );
+                fake.close(0);
+              } else {
+                fake.emitServerMessage(makeTextDeltaMessage("preparing a tool call"));
+                fake.emitServerMessage(
+                  makeMcpExecMessage("tc-read", "read", { path: "README.md" }),
+                );
+              }
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const firstEvents = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        { messages: [{ role: "user", content: "first", timestamp: Date.now() }] } as any,
+        { sessionId },
+      ),
+    );
+    expect(firstEvents.at(-1).message.usage.totalTokens).toBe(12_345);
+
+    const secondEvents = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "first", timestamp: Date.now() },
+            firstEvents.at(-1).message,
+            { role: "user", content: "use a tool", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    const usage = secondEvents.at(-1).message.usage;
+    expect(secondEvents.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+    expect(usage.output).toBeGreaterThan(0);
+    expect(usage.totalTokens).toBe(12_345);
   });
 
   test("reports Cursor cumulative tokenDetails as active context while billing is per response", async () => {
@@ -4288,6 +4395,94 @@ describe("native streamSimple provider", () => {
     expect(execClientMessages[0].message.case).toBe("mcpResult");
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
     expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toBeTruthy();
+  });
+
+  test("native partial tool-result waits keep stored Cursor context usage", async () => {
+    const sessionId = "native-partial-tool-usage-session";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridge = new FakeBridge({
+      accessToken: "test-token",
+      rpcPath: "/agent.v1.AgentService/Run",
+    });
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-native-partial-tool-usage",
+      checkpoint: null,
+      cursorUsageCumulativeTokens: 12_345,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [
+        {
+          execId: "exec-1",
+          execMsgId: 1,
+          toolCallId: "tc1",
+          toolName: "read",
+          decodedArgs: '{"path":"package.json"}',
+        },
+        {
+          execId: "exec-2",
+          execMsgId: 2,
+          toolCallId: "tc2",
+          toolName: "read",
+          decodedArgs: '{"path":"README.md"}',
+        },
+      ],
+      currentTurn: turn("review it", [
+        toolStep("tc1", "read", { path: "package.json" }),
+        toolStep("tc2", "read", { path: "README.md" }),
+      ]),
+    });
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "review it", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [
+                { type: "toolCall", id: "tc1", name: "read", arguments: { path: "package.json" } },
+                { type: "toolCall", id: "tc2", name: "read", arguments: { path: "README.md" } },
+              ],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: emptyUsage(),
+              stopReason: "toolUse",
+              timestamp: Date.now(),
+            },
+            {
+              role: "toolResult",
+              toolCallId: "tc1",
+              toolName: "read",
+              content: [{ type: "text", text: "pkg" }],
+              isError: false,
+              timestamp: Date.now(),
+            },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+    expect(events.at(-1).message.usage.totalTokens).toBe(12_345);
+    expect(
+      events.some((event) => event.type === "toolcall_end" && event.toolCall.id === "tc2"),
+    ).toBe(true);
+    expect(
+      events.some((event) => event.type === "toolcall_end" && event.toolCall.id === "tc1"),
+    ).toBe(false);
   });
 
   test("aborting after a native tool-call pause cancels the live Cursor bridge", async () => {
@@ -5758,11 +5953,7 @@ describe("proxy integration — session handling", () => {
       { role: "user", content: [{ type: "text", text: "ask something" }] },
       { role: "assistant", content: [{ type: "text", text: "partial response text" }] },
     ]);
-    expect(runRequests[0].action.action.value.userMessage.text).toContain(
-      "<current_user_message>\ncontinue\n</current_user_message>",
-    );
-    expect(runRequests[0].action.action.value.userMessage.text).toContain("ask something");
-    expect(runRequests[0].action.action.value.userMessage.text).toContain("partial response text");
+    expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
   });
 
   test("interrupt before any new checkpoint discards prior checkpoint when resumed history includes the interrupted turn", async () => {
@@ -5938,13 +6129,7 @@ describe("proxy integration — session handling", () => {
       { role: "user", content: [{ type: "text", text: "second turn on another provider" }] },
       { role: "assistant", content: [{ type: "text", text: "Reply from another provider" }] },
     ]);
-    expect(runRequests[0].action.action.value.userMessage.text).toContain(
-      "<current_user_message>\nnow continue on cursor\n</current_user_message>",
-    );
-    expect(runRequests[0].action.action.value.userMessage.text).toContain("Hi from Cursor");
-    expect(runRequests[0].action.action.value.userMessage.text).toContain(
-      "Reply from another provider",
-    );
+    expect(runRequests[0].action.action.value.userMessage.text).toBe("now continue on cursor");
   });
 
   test("system prompt changes discard stale cursor checkpoint", async () => {

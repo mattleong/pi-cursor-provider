@@ -364,22 +364,7 @@ const VISIBLE_IDLE_TIMEOUT_MS = readTimeoutMsEnv(
   "PI_CURSOR_VISIBLE_IDLE_TIMEOUT_MS",
   DEFAULT_VISIBLE_IDLE_TIMEOUT_MS,
 );
-const DEFAULT_INLINE_HISTORY_MAX_CHARS = 200_000;
-const DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS = 20_000;
-const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = 20_000;
 const CURSOR_GENERATED_CHARS_PER_OUTPUT_TOKEN = 2.7;
-const INLINE_HISTORY_MAX_CHARS = readNonNegativeIntegerEnv(
-  "PI_CURSOR_INLINE_HISTORY_MAX_CHARS",
-  DEFAULT_INLINE_HISTORY_MAX_CHARS,
-);
-const INLINE_HISTORY_HEAD_MAX_CHARS = readNonNegativeIntegerEnv(
-  "PI_CURSOR_INLINE_HISTORY_HEAD_MAX_CHARS",
-  DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS,
-);
-const INLINE_HISTORY_SEGMENT_MAX_CHARS = readNonNegativeIntegerEnv(
-  "PI_CURSOR_INLINE_HISTORY_SEGMENT_MAX_CHARS",
-  DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS,
-);
 const defaultBridgeFactory: BridgeFactory = (options) => spawnBridge(options, debugLog);
 let bridgeFactory: BridgeFactory = defaultBridgeFactory;
 let debugRequestCounter = 0;
@@ -1181,9 +1166,17 @@ function estimateInFlightContextTokens(context: Context): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     const usage = assistantUsageForContext(messages[i]!);
     if (!usage) continue;
-    const trailingTokens = messages
-      .slice(i + 1)
-      .reduce((total, message) => total + estimateMessageTokens(message), 0);
+    const trailingMessages = messages.slice(i + 1);
+    const hasTrailingToolResult = trailingMessages.some((message) => message.role === "toolResult");
+    // Cursor tokenDetails.usedTokens is the authoritative live context count. During
+    // tool-result continuations, Pi can estimate the appended tool result text as
+    // extra context before Cursor has processed it; initializing the next assistant
+    // message with that estimate makes the footer jump up and then snap down to
+    // Cursor's real usedTokens. Keep the live starting point at the last assistant
+    // usage when trailing tool results are present.
+    const trailingTokens = hasTrailingToolResult
+      ? 0
+      : trailingMessages.reduce((total, message) => total + estimateMessageTokens(message), 0);
     return usageContextTokens(usage) + trailingTokens;
   }
   return (
@@ -1196,16 +1189,25 @@ function tokenCost(tokens: number, ratePerMillion = 0): number {
   return (tokens * ratePerMillion) / 1_000_000;
 }
 
+function usageContextSource(
+  state: StreamState,
+  reason?: "stop" | "length" | "toolUse" | "error" | "aborted",
+): "cursor_token_details" | "stored_cursor_baseline" | "fallback_estimate" {
+  if (state.cursorUsageCumulativeTokens > 0) return "cursor_token_details";
+  if (reason === "toolUse" && state.usageBaselineTokens > 0) return "stored_cursor_baseline";
+  return "fallback_estimate";
+}
+
 function applyCursorUsage(
   output: AssistantMessage,
   model: Model<Api>,
   state?: StreamState,
   fallbackTotalTokens = 0,
+  reason?: "stop" | "length" | "toolUse" | "error" | "aborted",
 ): void {
   if (!state) return;
-  const usage = computeUsage(state, fallbackTotalTokens);
-  const contextSource =
-    state.cursorUsageCumulativeTokens > 0 ? "cursor_token_details" : "fallback_estimate";
+  const usage = computeUsage(state, fallbackTotalTokens, reason);
+  const contextSource = usageContextSource(state, reason);
   const contextBaselineTokens = Math.max(0, fallbackTotalTokens, state.usageBaselineTokens);
   debugLog("usage.native_accounting", {
     ...state.debug,
@@ -1410,7 +1412,7 @@ function createNativeStreamWriter(
       if (closed) return;
       ensureStarted();
       endActiveBlock();
-      applyCursorUsage(output, model, state, initialContextTokens);
+      applyCursorUsage(output, model, state, initialContextTokens, reason);
       output.stopReason = reason;
       stream.push({ type: "done", reason, message: output });
       closed = true;
@@ -1420,7 +1422,7 @@ function createNativeStreamWriter(
       if (closed) return;
       ensureStarted();
       endActiveBlock();
-      applyCursorUsage(output, model, state, initialContextTokens);
+      applyCursorUsage(output, model, state, initialContextTokens, reason);
       output.stopReason = reason;
       output.errorMessage = message;
       stream.push({ type: "error", reason, error: output });
@@ -1619,27 +1621,6 @@ function lostToolContinuationMessage(): string {
   return "Cursor tool continuation was lost because the live upstream bridge is no longer available. Retry from before the tool call or start a new turn.";
 }
 
-function estimateInlineHistoryPromptTokens(body: ChatCompletionRequest): number {
-  try {
-    const parsed = parseMessages(body.messages, body.cursor_tool_result_images, false);
-    const sessionId = derivePiSessionId(body);
-    const convKey = deriveConversationKey(body.messages, sessionId);
-    const stored = conversationStates.get(convKey);
-    if (
-      stored?.checkpoint &&
-      stored.checkpointTurnCount === parsed.turns.length &&
-      stored.checkpointHistoryFingerprint === fingerprintCompletedTurns(parsed.turns) &&
-      stored.checkpointSystemPromptFingerprint === fingerprintSystemPrompt(parsed.systemPrompt)
-    ) {
-      return 0;
-    }
-    const historyPrompt = inlineHistoryPrompt(parsed.turns, parsed.userText);
-    return historyPrompt ? estimateTextTokens(historyPrompt) : 0;
-  } catch {
-    return 0;
-  }
-}
-
 export function createCursorNativeStream(
   config: CursorNativeStreamConfig,
 ): (
@@ -1665,9 +1646,7 @@ export function createCursorNativeStream(
           body = replacement as ChatCompletionRequest;
       }
 
-      const inFlightContextTokens = estimateInFlightContextTokens(context);
-      const inlineHistoryPromptTokens = estimateInlineHistoryPromptTokens(body);
-      const initialContextTokens = inFlightContextTokens + inlineHistoryPromptTokens;
+      const initialContextTokens = estimateInFlightContextTokens(context);
       debugLog("native.context_estimate", {
         requestId,
         sessionId: options?.sessionId,
@@ -1675,8 +1654,6 @@ export function createCursorNativeStream(
         contextWindow: model.contextWindow,
         messageCount: context.messages?.length ?? 0,
         hasSystemPrompt: Boolean(context.systemPrompt),
-        inFlightContextTokens,
-        inlineHistoryPromptTokens,
         initialContextTokens,
       });
       writer = createNativeStreamWriter(stream, model, initialContextTokens);
@@ -1833,6 +1810,7 @@ async function handleCursorNativeRequest(
   }
 
   let stored = conversationStates.get(convKey);
+  const createdConversationState = !stored;
   if (!stored) {
     stored = {
       conversationId: deterministicConversationId(convKey),
@@ -1844,6 +1822,15 @@ async function handleCursorNativeRequest(
     conversationStates.set(convKey, stored);
   }
   stored.lastAccessMs = Date.now();
+  debugLog("conversation.state_loaded", {
+    requestId,
+    bridgeKey,
+    convKey,
+    sessionId,
+    createdConversationState,
+    completedTurnCount: turns.length,
+    stored: summarizeStoredConversation(stored),
+  });
   evictStaleConversations();
   const requestCheckpoint = checkpointForRequest(
     stored,
@@ -1901,6 +1888,20 @@ async function handleCursorNativeRequest(
   const cacheReadBaselineTokens = requestCheckpoint
     ? Math.max(usageBaselineTokens, writer.initialContextTokens)
     : 0;
+  debugLog("usage.context_baseline", {
+    requestId,
+    bridgeKey,
+    convKey,
+    source: requestCheckpoint ? "stored_checkpoint" : "rebuild_without_checkpoint",
+    hasRequestCheckpoint: !!requestCheckpoint,
+    writerInitialContextTokens: writer.initialContextTokens,
+    storedCursorUsageCumulativeTokens: stored.cursorUsageCumulativeTokens,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
+    completedTurnCount: turns.length,
+    currentUserTextChars: effectiveUserText.length,
+    currentUserImageCount: effectiveUserImages.length,
+  });
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   writeNativeStream(
     bridge,
@@ -1943,11 +1944,38 @@ function createStreamState(
 }
 
 function recordCursorUsageProgress(convKey: string, state: StreamState): void {
-  if (state.cursorUsageCumulativeTokens <= 0) return;
+  if (state.cursorUsageCumulativeTokens <= 0) {
+    debugLog("usage.cursor_progress_not_recorded", {
+      ...state.debug,
+      convKey,
+      reason: "no_positive_cursor_token_details",
+      cursorUsageCumulativeTokens: state.cursorUsageCumulativeTokens,
+      usageBaselineTokens: state.usageBaselineTokens,
+      generatedOutputChars: state.generatedOutputChars,
+      generatedToolCallTokens: state.generatedToolCallTokens,
+    });
+    return;
+  }
   const stored = conversationStates.get(convKey);
-  if (!stored) return;
+  if (!stored) {
+    debugLog("usage.cursor_progress_not_recorded", {
+      ...state.debug,
+      convKey,
+      reason: "missing_conversation_state",
+      cursorUsageCumulativeTokens: state.cursorUsageCumulativeTokens,
+    });
+    return;
+  }
+  const previousCursorUsageCumulativeTokens = stored.cursorUsageCumulativeTokens;
   stored.cursorUsageCumulativeTokens = state.cursorUsageCumulativeTokens;
   stored.lastAccessMs = Date.now();
+  debugLog("usage.cursor_progress_recorded", {
+    ...state.debug,
+    convKey,
+    previousCursorUsageCumulativeTokens,
+    cursorUsageCumulativeTokens: state.cursorUsageCumulativeTokens,
+    stored: summarizeStoredConversation(stored),
+  });
 }
 
 function emitFilteredStreamText(
@@ -2260,7 +2288,19 @@ function writeNativeStream(
         systemPromptFingerprint,
       );
       if (stored && latestCheckpoint)
-        debugLog("native.stream.checkpoint_committed", { requestId, convKey, stored });
+        debugLog("native.stream.checkpoint_committed", {
+          requestId,
+          convKey,
+          stored: summarizeStoredConversation(stored),
+        });
+      else
+        debugLog("native.stream.checkpoint_not_committed", {
+          requestId,
+          convKey,
+          reason: stored ? "no_latest_checkpoint" : "missing_conversation_state",
+          stored: summarizeStoredConversation(stored),
+          cursorUsageCumulativeTokens: state.cursorUsageCumulativeTokens,
+        });
       writer.done("stop", state);
       recordCursorUsageProgress(convKey, state);
     } else {
@@ -2369,8 +2409,37 @@ function handleNativeToolResultResume(
       unresolvedExecs,
       currentTurn,
     });
-    for (const exec of unresolvedExecs) writer.toolCall(exec);
-    writer.done("toolUse");
+    const stored = conversationStates.get(convKey);
+    const usageBaselineTokens = stored?.cursorUsageCumulativeTokens ?? 0;
+    const cacheReadBaselineTokens = Math.max(usageBaselineTokens, writer.initialContextTokens);
+    const partialWaitUsageState = createStreamState(usageBaselineTokens, cacheReadBaselineTokens, {
+      requestId,
+      sessionId: options?.sessionId,
+      convKey,
+      bridgeKey,
+      modelId,
+    });
+    if (usageBaselineTokens > 0) {
+      partialWaitUsageState.cursorUsageCumulativeTokens = usageBaselineTokens;
+    }
+    for (const exec of unresolvedExecs) {
+      partialWaitUsageState.generatedToolCallTokens += estimateGeneratedToolCallTokens(exec);
+      writer.toolCall(exec);
+    }
+    debugLog("usage.context_baseline", {
+      requestId,
+      bridgeKey,
+      convKey,
+      source: "tool_resume_partial_wait",
+      writerInitialContextTokens: writer.initialContextTokens,
+      storedCursorUsageCumulativeTokens: stored?.cursorUsageCumulativeTokens,
+      usageBaselineTokens,
+      cacheReadBaselineTokens,
+      pendingExecCount: pendingExecs.length,
+      unresolvedExecCount: unresolvedExecs.length,
+      stored: summarizeStoredConversation(stored),
+    });
+    writer.done("toolUse", partialWaitUsageState);
     return;
   }
 
@@ -2382,8 +2451,21 @@ function handleNativeToolResultResume(
     requestId,
   );
 
-  const usageBaselineTokens = conversationStates.get(convKey)?.cursorUsageCumulativeTokens ?? 0;
+  const stored = conversationStates.get(convKey);
+  const usageBaselineTokens = stored?.cursorUsageCumulativeTokens ?? 0;
   const cacheReadBaselineTokens = Math.max(usageBaselineTokens, writer.initialContextTokens);
+  debugLog("usage.context_baseline", {
+    requestId,
+    bridgeKey,
+    convKey,
+    source: "tool_resume",
+    writerInitialContextTokens: writer.initialContextTokens,
+    storedCursorUsageCumulativeTokens: stored?.cursorUsageCumulativeTokens,
+    usageBaselineTokens,
+    cacheReadBaselineTokens,
+    pendingExecCount: pendingExecs.length,
+    stored: summarizeStoredConversation(stored),
+  });
   writeNativeStream(
     bridge,
     heartbeatTimer,
@@ -2510,6 +2592,25 @@ export function fingerprintCompletedTurns(turns: ParsedTurn[]): string {
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
+function summarizeStoredConversation(
+  stored: StoredConversation | undefined,
+): Record<string, unknown> {
+  if (!stored) return { exists: false };
+  return {
+    exists: true,
+    conversationId: stored.conversationId,
+    hasCheckpoint: !!stored.checkpoint,
+    checkpointBytes: stored.checkpoint?.length ?? 0,
+    checkpointTurnCount: stored.checkpointTurnCount,
+    checkpointHistoryFingerprint: stored.checkpointHistoryFingerprint,
+    checkpointSystemPromptFingerprint: stored.checkpointSystemPromptFingerprint,
+    cursorUsageCumulativeTokens: stored.cursorUsageCumulativeTokens,
+    sessionScoped: stored.sessionScoped,
+    blobCount: stored.blobStore.size,
+    lastAccessMs: stored.lastAccessMs,
+  };
+}
+
 function clearStoredCheckpoint(stored: StoredConversation, clearBlobStore = false): void {
   stored.checkpoint = null;
   delete stored.checkpointTurnCount;
@@ -2531,6 +2632,7 @@ function discardStaleCheckpointIfNeeded(
       requestId,
       convKey,
       checkpointDecision: "none",
+      stored: summarizeStoredConversation(stored),
     });
     return false;
   }
@@ -2561,6 +2663,7 @@ function discardStaleCheckpointIfNeeded(
       currentTurnCount,
       currentHistoryFingerprint,
       systemPromptFingerprint,
+      stored: summarizeStoredConversation(stored),
     });
     return true;
   }
@@ -2576,6 +2679,7 @@ function discardStaleCheckpointIfNeeded(
     currentHistoryFingerprint,
     storedCheckpointSystemPromptFingerprint,
     systemPromptFingerprint,
+    storedBeforeClear: summarizeStoredConversation(stored),
   });
   clearStoredCheckpoint(stored, true);
   return false;
@@ -2603,6 +2707,7 @@ function checkpointForRequest(
     checkpointDecision: "reuse_valid_checkpoint",
     reason: "valid_checkpoint_preserves_cursor_context",
     currentTurnCount: turns.length,
+    stored: summarizeStoredConversation(stored),
   });
   return stored.checkpoint;
 }
@@ -3063,6 +3168,15 @@ function textContent(content: OpenAIMessage["content"]): string {
     .join("\n");
 }
 
+function assistantTextContent(content: OpenAIMessage["content"]): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  return content
+    .filter((p) => p.type === "text" && p.text)
+    .map((p) => p.text!)
+    .join("");
+}
+
 interface ImageDecodeOptions {
   enforceCursorCliLimits?: boolean;
 }
@@ -3383,7 +3497,7 @@ export function parseMessages(
     if (!currentTurn) continue;
 
     if (msg.role === "assistant") {
-      const text = textContent(msg.content);
+      const text = assistantTextContent(msg.content);
       if (text) {
         if (currentTurn.sawToolResult) currentTurn.sawAssistantAfterToolResult = true;
         currentTurn.steps.push({ kind: "assistantText", text });
@@ -3580,192 +3694,6 @@ function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint
   const id = new Uint8Array(createHash("sha256").update(data).digest());
   blobStore.set(Buffer.from(id).toString("hex"), data);
   return id;
-}
-
-function transcriptImageSummary(images: ParsedImageContent[] | undefined): string {
-  if (!images?.length) return "";
-  return `\n[images: ${images.map((image) => `${image.mimeType}, ${image.data.length} bytes`).join("; ")}]`;
-}
-
-function truncateInlineHistoryText(text: string): string {
-  if (INLINE_HISTORY_SEGMENT_MAX_CHARS === 0) return `[omitted ${text.length} chars]`;
-  if (text.length <= INLINE_HISTORY_SEGMENT_MAX_CHARS) return text;
-  return `${text.slice(0, INLINE_HISTORY_SEGMENT_MAX_CHARS)}\n[truncated ${text.length - INLINE_HISTORY_SEGMENT_MAX_CHARS} chars]`;
-}
-
-function transcriptStepText(step: ParsedTurnStep): string {
-  if (step.kind === "assistantText") return `Assistant: ${truncateInlineHistoryText(step.text)}`;
-  const argsText = Object.keys(step.arguments).length ? JSON.stringify(step.arguments) : "";
-  const args = argsText ? ` ${truncateInlineHistoryText(argsText)}` : "";
-  const result = step.result
-    ? `\nTool result${step.result.isError ? " (error)" : ""}: ${truncateInlineHistoryText(step.result.content)}${transcriptImageSummary(step.result.images)}`
-    : "";
-  return `Tool call: ${step.toolName || "tool"}${args}${result}`;
-}
-
-function truncateInlineHistoryBlock(block: string, maxChars: number): string {
-  if (block.length <= maxChars) return block;
-  return `${block.slice(0, maxChars)}\n[truncated ${block.length - maxChars} chars]`;
-}
-
-function inlineHistorySearchTerms(currentUserText: string): Set<string> {
-  const terms = new Set<string>();
-  for (const match of currentUserText.matchAll(/[A-Za-z0-9_./@-]{4,}/g)) {
-    const term = match[0]!.toLowerCase();
-    if (
-      [
-        "what",
-        "when",
-        "where",
-        "which",
-        "continue",
-        "context",
-        "terms",
-        "turns",
-        "request",
-        "first",
-        "last",
-        "previous",
-      ].includes(term)
-    )
-      continue;
-    terms.add(term);
-  }
-  return terms;
-}
-
-function scoreInlineHistoryBlock(block: string, terms: Set<string>): number {
-  if (terms.size === 0) return 0;
-  const lower = block.toLowerCase();
-  let score = 0;
-  for (const term of terms) {
-    if (lower.includes(term)) score += term.includes("/") || term.includes(".") ? 3 : 1;
-  }
-  return score;
-}
-
-function inlineHistoryTurnPreview(block: string, index: number): string {
-  const userLine = block.split("\n").find((line) => line.startsWith("User: ")) ?? "User: [no text]";
-  return `Turn ${index + 1} preview: ${truncateInlineHistoryBlock(userLine, 240)}`;
-}
-
-function compressedInlineHistoryNotice(
-  turnBlocks: string[],
-  startIndex: number,
-  endIndex: number,
-): string {
-  const count = endIndex - startIndex + 1;
-  const previews: string[] = [];
-  let previewChars = 0;
-  for (let index = startIndex; index <= endIndex; index += 1) {
-    const preview = inlineHistoryTurnPreview(turnBlocks[index]!, index);
-    const nextLength = previewChars + (previews.length > 0 ? 1 : 0) + preview.length;
-    if (nextLength > 6_000) {
-      previews.push(`[${endIndex - index + 1} more compressed turn preview(s) omitted]`);
-      break;
-    }
-    previews.push(preview);
-    previewChars = nextLength;
-  }
-  return `[${count} turn(s) compressed to previews]\n${previews.join("\n")}`;
-}
-
-function selectedInlineHistoryBlocks(turnBlocks: string[], currentUserText: string): string[] {
-  const selected = new Map<number, string>();
-  let selectedLength = 0;
-  const addBlock = (index: number, block: string, maxChars: number): boolean => {
-    if (selected.has(index) || maxChars <= 0) return false;
-    const value = truncateInlineHistoryBlock(block, maxChars);
-    const separatorLength = selected.size > 0 ? 2 : 0;
-    if (selectedLength + separatorLength + value.length > INLINE_HISTORY_MAX_CHARS) return false;
-    selected.set(index, value);
-    selectedLength += separatorLength + value.length;
-    return true;
-  };
-
-  const headBudget = Number.isFinite(INLINE_HISTORY_MAX_CHARS)
-    ? Math.min(INLINE_HISTORY_HEAD_MAX_CHARS, Math.floor(INLINE_HISTORY_MAX_CHARS / 2))
-    : INLINE_HISTORY_HEAD_MAX_CHARS;
-  let headLength = 0;
-  if (headBudget > 0 && turnBlocks.length > 1) {
-    for (let index = 0; index < turnBlocks.length; index += 1) {
-      const block = turnBlocks[index]!;
-      const separatorLength = headLength > 0 ? 2 : 0;
-      const remainingHeadBudget = headBudget - headLength - separatorLength;
-      if (remainingHeadBudget <= 0) break;
-      const value = truncateInlineHistoryBlock(block, remainingHeadBudget);
-      if (!addBlock(index, value, remainingHeadBudget)) break;
-      headLength += separatorLength + value.length;
-      if (value.length < block.length) break;
-    }
-  }
-
-  const terms = inlineHistorySearchTerms(currentUserText);
-  const scored = turnBlocks
-    .map((block, index) => ({ index, score: scoreInlineHistoryBlock(block, terms) }))
-    .filter((item) => item.score > 0 && !selected.has(item.index))
-    .sort((a, b) => b.score - a.score || a.index - b.index);
-  for (const { index } of scored) {
-    const remainingBudget = INLINE_HISTORY_MAX_CHARS - selectedLength - (selected.size > 0 ? 2 : 0);
-    if (remainingBudget <= 0) break;
-    addBlock(
-      index,
-      turnBlocks[index]!,
-      Math.min(INLINE_HISTORY_SEGMENT_MAX_CHARS, remainingBudget),
-    );
-  }
-
-  for (let index = turnBlocks.length - 1; index >= 0; index -= 1) {
-    const remainingBudget = INLINE_HISTORY_MAX_CHARS - selectedLength - (selected.size > 0 ? 2 : 0);
-    if (remainingBudget <= 0) break;
-    addBlock(index, turnBlocks[index]!, remainingBudget);
-  }
-
-  if (selected.size === 0) {
-    addBlock(turnBlocks.length - 1, turnBlocks.at(-1)!, INLINE_HISTORY_MAX_CHARS);
-  }
-
-  const sorted = [...selected.entries()].sort(([a], [b]) => a - b);
-  const bodyBlocks: string[] = [];
-  let previousIndex = -1;
-  for (const [index, block] of sorted) {
-    const omitted = index - previousIndex - 1;
-    if (omitted > 0) {
-      bodyBlocks.push(compressedInlineHistoryNotice(turnBlocks, previousIndex + 1, index - 1));
-    }
-    bodyBlocks.push(block);
-    previousIndex = index;
-  }
-  const trailingOmitted = turnBlocks.length - previousIndex - 1;
-  if (trailingOmitted > 0) {
-    bodyBlocks.push(
-      compressedInlineHistoryNotice(turnBlocks, previousIndex + 1, turnBlocks.length - 1),
-    );
-  }
-  return bodyBlocks;
-}
-
-function inlineHistoryPrompt(turns: ParsedTurn[], currentUserText: string): string | undefined {
-  if (turns.length === 0 || INLINE_HISTORY_MAX_CHARS === 0) return undefined;
-  const turnBlocks = turns.map((turn, index) => {
-    const lines = [
-      `Turn ${index + 1}`,
-      `User: ${truncateInlineHistoryText(turn.userText)}${transcriptImageSummary(turn.userImages)}`,
-      ...turn.steps.map(transcriptStepText),
-    ];
-    return lines.join("\n");
-  });
-
-  const body = selectedInlineHistoryBlocks(turnBlocks, currentUserText).join("\n\n");
-  return `Prior Pi conversation context follows. This is a redundant safety copy of the full prior Pi transcript. Use it to preserve session continuity and resolve references in the current user message; the current user message is separate and comes after this context.\n\n<pi_conversation_history>\n${body}\n</pi_conversation_history>`;
-}
-
-function userTextWithInlineHistory(userText: string, historyPrompt: string | undefined): string {
-  if (!historyPrompt) return userText;
-  const currentUserText = userText.trim()
-    ? userText
-    : "[The current user message has no text. Use any attached images as the current request.]";
-  return `${historyPrompt}\n\nCurrent user message:\n<current_user_message>\n${currentUserText}\n</current_user_message>`;
 }
 
 function rootPromptBlobIds(systemPrompt: string, blobStore: Map<string, Uint8Array>): Uint8Array[] {
@@ -4080,7 +4008,6 @@ export function buildCursorRequest(
     workspaceContext,
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
-  const historyPrompt = checkpoint ? undefined : inlineHistoryPrompt(turns, userText);
   const rootPromptMessagesJson = checkpoint ? [] : rootPromptBlobIds(systemPrompt, blobStore);
   const conversationHistory = checkpoint
     ? {
@@ -4110,10 +4037,7 @@ export function buildCursorRequest(
         clientName: "pi",
       });
 
-  const userMessage = createUserMessage(
-    userTextWithInlineHistory(userText, historyPrompt),
-    userImages,
-  );
+  const userMessage = createUserMessage(userText, userImages);
   // Cursor's newer request path uses requestedModel instead of legacy modelDetails.
   // Some Cursor models (for example GPT-5.5) use requestedModel.parameters
   // for context/reasoning/fast instead of encoding everything in the model ID.
@@ -4152,7 +4076,6 @@ export function buildCursorRequest(
     conversationTurns: (conversationState as any).turns?.length ?? 0,
     rootPromptMessages: (conversationState as any).rootPromptMessagesJson?.length ?? 0,
     conversationHistory,
-    inlineHistoryChars: historyPrompt?.length ?? 0,
     requestBytes: payload.requestBytes.length,
     runRequestBytes: runRequestBytes.length,
     prefetchBytes: runRequestBytes.length - runRequestBytesWithoutPrefetch.length,
@@ -4246,6 +4169,13 @@ function processServerMessage(
         cursorTokenDeltaTokens: state.cursorTokenDeltaTokens,
       });
       onTokenDetails?.({ usedTokens, maxTokens });
+    } else {
+      debugLog("usage.cursor_token_details_missing", {
+        ...state.debug,
+        checkpointBytes: toBinary(ConversationStateStructureSchema, stateStructure).length,
+        baselineTokens: state.usageBaselineTokens,
+        cursorTokenDeltaTokens: state.cursorTokenDeltaTokens,
+      });
     }
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
@@ -4582,6 +4512,7 @@ export function cleanupSessionActiveBridge(
   const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
   const convKey = deriveConversationKeyFromSessionId(sessionId);
   const active = activeBridges.get(bridgeKey);
+  const stored = conversationStates.get(convKey);
   debugLog("session.cleanup", {
     cleanupKind: "activeBridge",
     reason,
@@ -4590,7 +4521,8 @@ export function cleanupSessionActiveBridge(
     bridgeKey,
     convKey,
     hadActiveBridge: !!active,
-    hadConversation: conversationStates.has(convKey),
+    hadConversation: !!stored,
+    stored: summarizeStoredConversation(stored),
   });
   if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
 }
@@ -4603,7 +4535,8 @@ export function cleanupSessionConversationState(
   if (!sessionId) return;
   const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
   const convKey = deriveConversationKeyFromSessionId(sessionId);
-  const hadConversation = conversationStates.has(convKey);
+  const stored = conversationStates.get(convKey);
+  const hadConversation = !!stored;
   debugLog("session.cleanup", {
     cleanupKind: "conversationState",
     reason,
@@ -4613,6 +4546,7 @@ export function cleanupSessionConversationState(
     convKey,
     hadActiveBridge: activeBridges.has(bridgeKey),
     hadConversation,
+    stored: summarizeStoredConversation(stored),
   });
   conversationStates.delete(convKey);
 }
@@ -4705,7 +4639,11 @@ function makeHeartbeatBytes(): Uint8Array {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, heartbeat));
 }
 
-function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
+function computeUsage(
+  state: StreamState,
+  fallbackTotalTokens = 0,
+  reason?: "stop" | "length" | "toolUse" | "error" | "aborted",
+) {
   const fallbackCompletionTokens =
     estimateGeneratedOutputCharTokens(state.generatedOutputChars) + state.generatedToolCallTokens;
   let completion_tokens = fallbackCompletionTokens;
@@ -4733,19 +4671,22 @@ function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
   // Pi uses usage.totalTokens for active context-window pressure. Cursor's
   // conversationCheckpointUpdate.tokenDetails.usedTokens is the only upstream
   // count for the live Cursor conversation context, so prefer it when present.
-  // If Cursor omits it, fall back to the larger of Pi-visible context and any
-  // stored Cursor cumulative baseline from a reused checkpoint, then add the best
-  // available completion count (Cursor-reported output when trustworthy,
-  // otherwise the visible-output estimate above). Never fold cache read/write
-  // billing telemetry into context pressure: cached billing can be far larger
-  // than the live prompt window.
-  const contextSource =
-    state.cursorUsageCumulativeTokens > 0 ? "cursor_token_details" : "fallback_estimate";
+  // If Cursor omits it for an intermediate tool-use handoff, keep the last
+  // authoritative Cursor baseline instead of adding estimated generated output;
+  // otherwise the footer briefly jumps above the baseline, then drops when the
+  // next partial tool wait re-emits the stored Cursor value. For non-toolUse
+  // completions, fall back to the larger of Pi-visible context and any stored
+  // Cursor cumulative baseline, then add the best available completion count.
+  // Never fold cache read/write billing telemetry into context pressure: cached
+  // billing can be far larger than the live prompt window.
+  const contextSource = usageContextSource(state, reason);
   const contextBaselineTokens = Math.max(0, fallbackTotalTokens, state.usageBaselineTokens);
   const context_tokens =
     contextSource === "cursor_token_details"
       ? state.cursorUsageCumulativeTokens
-      : contextBaselineTokens + completion_tokens;
+      : contextSource === "stored_cursor_baseline"
+        ? state.usageBaselineTokens
+        : contextBaselineTokens + completion_tokens;
 
   const prompt_tokens = state.turnEndedUsage ? state.turnEndedUsage.inputTokens : 0;
   debugLog("usage.compute", {
