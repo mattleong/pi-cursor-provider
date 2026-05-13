@@ -149,6 +149,30 @@ function summarizeContent(content: unknown): unknown {
   });
 }
 
+function summarizeUsage(usage: unknown): unknown {
+  if (!usage || typeof usage !== "object") return undefined;
+  const typed = usage as Record<string, unknown>;
+  const cost = typed.cost as Record<string, unknown> | undefined;
+  return {
+    input: typed.input,
+    output: typed.output,
+    cacheRead: typed.cacheRead,
+    cacheWrite: typed.cacheWrite,
+    totalTokens: typed.totalTokens,
+    ...(cost && typeof cost === "object"
+      ? {
+          cost: {
+            input: cost.input,
+            output: cost.output,
+            cacheRead: cost.cacheRead,
+            cacheWrite: cost.cacheWrite,
+            total: cost.total,
+          },
+        }
+      : {}),
+  };
+}
+
 function summarizeMessage(message: unknown): unknown {
   if (!message || typeof message !== "object") return message;
   const typed = message as Record<string, unknown>;
@@ -159,7 +183,189 @@ function summarizeMessage(message: unknown): unknown {
     toolName: typed.toolName,
     isError: typed.isError,
     errorMessage: typed.errorMessage,
+    usage: summarizeUsage(typed.usage),
     content: summarizeContent(typed.content),
+  };
+}
+
+function summarizeModel(model: unknown): unknown {
+  if (!model || typeof model !== "object") return model;
+  const typed = model as Record<string, unknown>;
+  return {
+    provider: typed.provider,
+    id: typed.id,
+    name: typed.name,
+    api: typed.api,
+    contextWindow: typed.contextWindow,
+    maxTokens: typed.maxTokens,
+    reasoning: typed.reasoning,
+  };
+}
+
+function summarizeRegisteredModelConfigs(models: unknown[]): unknown[] {
+  const interestingIds = new Set(["composer-2", "composer-2-fast", "gpt-5.5", "gpt-5.5-max"]);
+  return models
+    .filter((model) => {
+      if (!model || typeof model !== "object") return false;
+      const id = (model as Record<string, unknown>).id;
+      return typeof id === "string" && interestingIds.has(id);
+    })
+    .map((model) => summarizeModel(model));
+}
+
+function summarizeRegistryModel(ctx: {
+  model?: { provider?: string; id?: string };
+  modelRegistry?: { find?: (provider: string, modelId: string) => unknown };
+}): unknown {
+  const provider = ctx.model?.provider;
+  const modelId = ctx.model?.id;
+  if (!provider || !modelId) return undefined;
+  try {
+    return summarizeModel(ctx.modelRegistry?.find?.(provider, modelId));
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function summarizeModelState(ctx: {
+  model?: { provider?: string; id?: string };
+  modelRegistry?: { find?: (provider: string, modelId: string) => unknown };
+}): unknown {
+  return {
+    active: summarizeModel(ctx.model),
+    registry: summarizeRegistryModel(ctx),
+  };
+}
+
+function summarizeContextUsage(ctx: { getContextUsage?: () => unknown }): unknown {
+  try {
+    return ctx.getContextUsage?.();
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function numericField(record: Record<string, unknown>, field: string): number {
+  const value = record[field];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function usageContextTokensForPi(usage: unknown): number | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const typed = usage as Record<string, unknown>;
+  const totalTokens = numericField(typed, "totalTokens");
+  if (totalTokens > 0) return totalTokens;
+  return (
+    numericField(typed, "input") +
+    numericField(typed, "output") +
+    numericField(typed, "cacheRead") +
+    numericField(typed, "cacheWrite")
+  );
+}
+
+function compactionMirror(model: unknown, usageOrTokens: unknown, reserveTokens = 16_384): unknown {
+  const modelRecord = model && typeof model === "object" ? (model as Record<string, unknown>) : {};
+  const contextWindow = numericField(modelRecord, "contextWindow");
+  const contextTokens =
+    typeof usageOrTokens === "number" && Number.isFinite(usageOrTokens)
+      ? usageOrTokens
+      : usageContextTokensForPi(usageOrTokens);
+  const threshold = contextWindow - reserveTokens;
+  return {
+    contextTokens,
+    contextWindow,
+    reserveTokens,
+    threshold,
+    wouldCompact:
+      contextTokens !== undefined && contextWindow > 0 ? contextTokens > threshold : undefined,
+    underThreshold:
+      contextTokens !== undefined && contextWindow > 0 ? contextTokens <= threshold : undefined,
+  };
+}
+
+function summarizeCompactionPreparation(preparation: unknown): unknown {
+  if (!preparation || typeof preparation !== "object") return preparation;
+  const typed = preparation as Record<string, unknown>;
+  const settings = typed.settings as Record<string, unknown> | undefined;
+  return {
+    firstKeptEntryId: typed.firstKeptEntryId,
+    tokensBefore: typed.tokensBefore,
+    isSplitTurn: typed.isSplitTurn,
+    messagesToSummarize: Array.isArray(typed.messagesToSummarize)
+      ? typed.messagesToSummarize.length
+      : undefined,
+    turnPrefixMessages: Array.isArray(typed.turnPrefixMessages)
+      ? typed.turnPrefixMessages.length
+      : undefined,
+    settings:
+      settings && typeof settings === "object"
+        ? {
+            enabled: settings.enabled,
+            reserveTokens: settings.reserveTokens,
+            keepRecentTokens: settings.keepRecentTokens,
+          }
+        : undefined,
+  };
+}
+
+function summarizeCompactionEntry(entry: unknown): unknown {
+  if (!entry || typeof entry !== "object") return entry;
+  const typed = entry as Record<string, unknown>;
+  const summary = typeof typed.summary === "string" ? typed.summary : "";
+  return {
+    type: typed.type,
+    id: typed.id,
+    parentId: typed.parentId,
+    firstKeptEntryId: typed.firstKeptEntryId,
+    tokensBefore: typed.tokensBefore,
+    fromHook: typed.fromHook,
+    summaryChars: summary.length,
+  };
+}
+
+function lastAssistantMessage(messages: unknown[]): unknown {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (
+      message &&
+      typeof message === "object" &&
+      (message as Record<string, unknown>).role === "assistant"
+    ) {
+      return message;
+    }
+  }
+  return undefined;
+}
+
+function lastAssistantBranchEntry(ctx: {
+  sessionManager?: { getBranch?: () => unknown[] };
+}): unknown {
+  const branch = ctx.sessionManager?.getBranch?.();
+  if (!Array.isArray(branch)) return undefined;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (!entry || typeof entry !== "object") continue;
+    const typedEntry = entry as Record<string, unknown>;
+    const message = typedEntry.message;
+    if (
+      message &&
+      typeof message === "object" &&
+      (message as Record<string, unknown>).role === "assistant"
+    ) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
+function summarizeAssistantBranchEntry(entry: unknown): unknown {
+  if (!entry || typeof entry !== "object") return entry;
+  const typed = entry as Record<string, unknown>;
+  return {
+    id: typed.id,
+    parentId: typed.parentId,
+    timestamp: typed.timestamp,
+    message: summarizeMessage(typed.message),
   };
 }
 
@@ -449,11 +655,19 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
 
   pi.on("message_end", async (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
+    const message = (event as { message?: unknown }).message;
+    const usage =
+      message && typeof message === "object"
+        ? (message as Record<string, unknown>).usage
+        : undefined;
     debugExtensionLog("message.end", {
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
       model: ctx.model?.id,
-      message: summarizeMessage((event as { message?: unknown }).message),
+      modelState: summarizeModelState(ctx),
+      contextUsage: summarizeContextUsage(ctx),
+      piCompactionMirror: compactionMirror(ctx.model, usage),
+      message: summarizeMessage(message),
       branch: summarizeBranchTail(ctx),
     });
   });
@@ -476,15 +690,104 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
   pi.on("turn_end", async (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
     const typedEvent = event as { turnIndex?: number; message?: unknown; toolResults?: unknown[] };
+    const usage =
+      typedEvent.message && typeof typedEvent.message === "object"
+        ? (typedEvent.message as Record<string, unknown>).usage
+        : undefined;
     debugExtensionLog("turn.end", {
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
       model: ctx.model?.id,
+      modelState: summarizeModelState(ctx),
+      contextUsage: summarizeContextUsage(ctx),
+      piCompactionMirror: compactionMirror(ctx.model, usage),
       turnIndex: typedEvent.turnIndex,
       message: summarizeMessage(typedEvent.message),
       toolResults: Array.isArray(typedEvent.toolResults)
         ? typedEvent.toolResults.map((message) => summarizeMessage(message))
         : undefined,
+      branch: summarizeBranchTail(ctx),
+    });
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
+    if (ctx.model?.provider !== "cursor") return;
+    const typedEvent = event as { messages?: unknown[] };
+    const messages = Array.isArray(typedEvent.messages) ? typedEvent.messages : [];
+    const lastAssistant = lastAssistantMessage(messages);
+    const lastAssistantUsage =
+      lastAssistant && typeof lastAssistant === "object"
+        ? (lastAssistant as Record<string, unknown>).usage
+        : undefined;
+    debugExtensionLog("agent.end", {
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId?.(),
+      model: ctx.model?.id,
+      modelState: summarizeModelState(ctx),
+      contextUsage: summarizeContextUsage(ctx),
+      piCompactionMirror: compactionMirror(ctx.model, lastAssistantUsage),
+      messageCount: messages.length,
+      lastAssistant: summarizeMessage(lastAssistant),
+      branchLastAssistant: summarizeAssistantBranchEntry(lastAssistantBranchEntry(ctx)),
+      branch: summarizeBranchTail(ctx),
+    });
+  });
+
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (ctx.model?.provider !== "cursor") return;
+    const typedEvent = event as {
+      preparation?: unknown;
+      branchEntries?: unknown[];
+      customInstructions?: unknown;
+    };
+    const preparationRecord =
+      typedEvent.preparation && typeof typedEvent.preparation === "object"
+        ? (typedEvent.preparation as Record<string, unknown>)
+        : undefined;
+    const settings = preparationRecord?.settings as Record<string, unknown> | undefined;
+    const reserveTokens = numericField(settings ?? {}, "reserveTokens") || 16_384;
+    const mirror = compactionMirror(ctx.model, preparationRecord?.tokensBefore, reserveTokens);
+    const debugPayload = {
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId?.(),
+      model: ctx.model?.id,
+      modelState: summarizeModelState(ctx),
+      contextUsage: summarizeContextUsage(ctx),
+      piCompactionMirror: mirror,
+      branchEntryCount: Array.isArray(typedEvent.branchEntries)
+        ? typedEvent.branchEntries.length
+        : undefined,
+      customInstructions:
+        typeof typedEvent.customInstructions === "string"
+          ? truncateDebugValue(typedEvent.customInstructions)
+          : typedEvent.customInstructions,
+      preparation: summarizeCompactionPreparation(typedEvent.preparation),
+      branchLastAssistant: summarizeAssistantBranchEntry(lastAssistantBranchEntry(ctx)),
+      branch: summarizeBranchTail(ctx),
+    };
+    debugExtensionLog("compaction.before", debugPayload);
+    if ((mirror as Record<string, unknown>).underThreshold === true) {
+      debugExtensionLog("compaction.unexpected_under_threshold", debugPayload);
+    }
+  });
+
+  pi.on("session_compact", async (event, ctx) => {
+    if (ctx.model?.provider !== "cursor") return;
+    const typedEvent = event as { compactionEntry?: unknown; fromExtension?: boolean };
+    const compactionRecord =
+      typedEvent.compactionEntry && typeof typedEvent.compactionEntry === "object"
+        ? (typedEvent.compactionEntry as Record<string, unknown>)
+        : undefined;
+    debugExtensionLog("compaction.after", {
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId?.(),
+      model: ctx.model?.id,
+      modelState: summarizeModelState(ctx),
+      contextUsage: summarizeContextUsage(ctx),
+      piCompactionMirror: compactionMirror(ctx.model, compactionRecord?.tokensBefore),
+      fromExtension: typedEvent.fromExtension,
+      compactionEntry: summarizeCompactionEntry(typedEvent.compactionEntry),
+      branchLastAssistant: summarizeAssistantBranchEntry(lastAssistantBranchEntry(ctx)),
       branch: summarizeBranchTail(ctx),
     });
   });
@@ -605,6 +908,13 @@ export default async function (pi: ExtensionAPI) {
     noReasoningEffortByModelId = buildNoReasoningEffortLookup(processed);
     rawModelByEffortByModelId = buildRawModelLookup(processed);
     const modelConfigs = processed.map(modelConfig);
+    debugExtensionLog("model_registration.snapshot", {
+      rawCount: rawModels.length,
+      parameterizedCount: parameterizedModels.length,
+      processedCount: processed.length,
+      modelCount: modelConfigs.length,
+      models: summarizeRegisteredModelConfigs(modelConfigs),
+    });
 
     pi.registerProvider("cursor", {
       name: "Cursor",

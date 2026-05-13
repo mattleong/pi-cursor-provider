@@ -3506,6 +3506,82 @@ describe("native streamSimple provider", () => {
     expect(usage.totalTokens).toBe(1_250);
   });
 
+  test("maxTokens-only checkpoints do not overwrite stored cumulative context tokens", async () => {
+    const sessionId = "native-max-tokens-only-checkpoint-session";
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage(undefined, 200_000));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 90,
+                  outputTokens: 10,
+                  cacheReadTokens: 0,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-max-tokens-only-checkpoint",
+      checkpoint: toBinary(
+        ConversationStateStructureSchema,
+        decodeRunRequest(
+          buildCursorRequest("gpt-5", "system", "old", [], "conv-max-tokens-only-checkpoint", null),
+        ).conversationState,
+      ),
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns([
+        turn("old", [assistantStep("old response")]),
+      ]),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
+      cursorUsageCumulativeTokens: 1_000,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          systemPrompt: "system",
+          messages: [
+            { role: "user", content: "old", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "old response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: emptyUsage(),
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "new prompt", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.input).toBe(90);
+    expect(usage.output).toBe(10);
+    expect(usage.totalTokens).toBe(1_010);
+    expect(__testInternals.conversationStates.get(convKey)?.cursorUsageCumulativeTokens).toBe(
+      1_000,
+    );
+  });
+
   test("preserves visible output fallback when Cursor turnEnded output is zero", async () => {
     setBridgeFactoryForTests(
       (options) =>
@@ -3577,7 +3653,57 @@ describe("native streamSimple provider", () => {
     expect(usage.totalTokens).toBe(140);
   });
 
-  test("reports Cursor cumulative tokenDetails as per-segment deltas", async () => {
+  test("uses Cursor-reported output and inline history in fallback context when tokenDetails is absent", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("x"));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 20,
+                  outputTokens: 1_000,
+                  cacheReadTokens: 0,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: `prior ${"a".repeat(4_000)}`, timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "prior response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: emptyUsage(),
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "hello", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId: "native-reported-output-context-fallback-session" },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.input).toBe(20);
+    expect(usage.output).toBe(1_000);
+    expect(usage.totalTokens).toBeGreaterThan(1_500);
+  });
+
+  test("reports Cursor cumulative tokenDetails as active context while billing is per response", async () => {
     const sessionId = "native-cursor-usage-delta-session";
     let runCount = 0;
     setBridgeFactoryForTests(
@@ -3662,7 +3788,7 @@ describe("native streamSimple provider", () => {
     const usage = events.at(-1).message.usage;
     expect(usage.input).toBe(200);
     expect(usage.output).toBe(50);
-    expect(usage.cacheRead).toBe(1_000);
+    expect(usage.cacheRead).toBe(0);
     expect(usage.totalTokens).toBe(1_250);
     expect(__testInternals.conversationStates.get(convKey)?.cursorUsageCumulativeTokens).toBe(
       1_250,
@@ -3706,7 +3832,7 @@ describe("native streamSimple provider", () => {
     const nextUsage = nextEvents.at(-1).message.usage;
     expect(nextUsage.input).toBe(290);
     expect(nextUsage.output).toBe(60);
-    expect(nextUsage.cacheRead).toBe(1_250);
+    expect(nextUsage.cacheRead).toBe(0);
     expect(nextUsage.totalTokens).toBe(1_600);
     expect(usage.input + usage.output + nextUsage.input + nextUsage.output).toBe(600);
     expect(__testInternals.conversationStates.get(convKey)?.cursorUsageCumulativeTokens).toBe(
@@ -3714,7 +3840,51 @@ describe("native streamSimple provider", () => {
     );
   });
 
-  test("keeps raw cache-read usage while totalTokens reports active context", async () => {
+  test("excludes Cursor cache telemetry from Pi usage while subtracting it from non-cache input", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage(800, 200_000));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 1_000,
+                  outputTokens: 20,
+                  cacheReadTokens: 300,
+                  cacheWriteTokens: 200,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        {
+          ...nativeModel(),
+          cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
+        },
+        { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] } as any,
+        { sessionId: "native-cache-write-usage-session" },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.input).toBe(500);
+    expect(usage.output).toBe(20);
+    expect(usage.cacheRead).toBe(0);
+    expect(usage.cacheWrite).toBe(0);
+    expect(usage.totalTokens).toBe(800);
+    expect(usage.cost.cacheRead).toBeCloseTo((300 * 3) / 1_000_000);
+    expect(usage.cost.cacheWrite).toBeCloseTo((200 * 4) / 1_000_000);
+  });
+
+  test("keeps Cursor cache reads out of Pi usage while totalTokens reports active context", async () => {
     setBridgeFactoryForTests(
       (options) =>
         new FakeBridge(options, (clientMessage, fake) => {
@@ -3755,11 +3925,9 @@ describe("native streamSimple provider", () => {
     expect(usage.totalTokens).toBe(78_119);
     expect(usage.input).toBe(67_285);
     expect(usage.output).toBe(4_327);
-    expect(usage.cacheRead).toBe(939_008);
+    expect(usage.cacheRead).toBe(0);
     expect(usage.cacheWrite).toBe(0);
-    expect(usage.input + usage.output + usage.cacheRead + usage.cacheWrite).toBeGreaterThan(
-      usage.totalTokens,
-    );
+    expect(usage.input + usage.cacheRead).toBeLessThan(272_000);
     expect(usage.totalTokens).toBeLessThan(272_000 - 16_384);
     expect(observations).toContainEqual(
       expect.objectContaining({

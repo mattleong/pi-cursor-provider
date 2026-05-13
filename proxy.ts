@@ -265,6 +265,14 @@ interface CursorTurnUsage {
   cacheWriteTokens: number;
 }
 
+interface StreamDebugMetadata {
+  requestId?: string;
+  sessionId?: string;
+  convKey?: string;
+  bridgeKey?: string;
+  modelId?: string;
+}
+
 interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
@@ -282,6 +290,8 @@ interface StreamState {
   cacheReadBaselineTokens: number;
   /** Latest Cursor-reported cumulative used_tokens value observed in this response segment. */
   cursorUsageCumulativeTokens: number;
+  /** Request/session correlation for debug logs. */
+  debug: StreamDebugMetadata;
 }
 
 interface ToolResultInfo {
@@ -1194,17 +1204,71 @@ function applyCursorUsage(
 ): void {
   if (!state) return;
   const usage = computeUsage(state, fallbackTotalTokens);
+  const contextSource =
+    state.cursorUsageCumulativeTokens > 0 ? "cursor_token_details" : "fallback_estimate";
+  const contextBaselineTokens = Math.max(0, fallbackTotalTokens, state.usageBaselineTokens);
+  debugLog("usage.native_accounting", {
+    ...state.debug,
+    modelId: model.id,
+    provider: model.provider,
+    api: model.api,
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+    contextSource,
+    fallbackTotalTokens,
+    usageBaselineTokens: state.usageBaselineTokens,
+    contextBaselineTokens,
+    cursorUsageCumulativeTokens: state.cursorUsageCumulativeTokens,
+    cacheReadBaselineTokens: state.cacheReadBaselineTokens,
+    cursorTokenDeltaTokens: state.cursorTokenDeltaTokens,
+    generatedOutputChars: state.generatedOutputChars,
+    generatedToolCallTokens: state.generatedToolCallTokens,
+    turnEndedUsage: state.turnEndedUsage,
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    cacheReadTokens: usage.cache_read_tokens,
+    cacheWriteTokens: usage.cache_write_tokens,
+    billingTotalTokens: usage.total_tokens,
+    contextTokens: usage.context_tokens,
+    wouldPiFallbackContextTokens:
+      usage.prompt_tokens +
+      usage.completion_tokens +
+      usage.cache_read_tokens +
+      usage.cache_write_tokens,
+    cacheExcludedFromContextTokens: usage.cache_read_tokens + usage.cache_write_tokens,
+  });
   const costInput = tokenCost(usage.prompt_tokens, model.cost?.input);
   const costOutput = tokenCost(usage.completion_tokens, model.cost?.output);
   const costCacheRead = tokenCost(usage.cache_read_tokens, model.cost?.cacheRead);
   const costCacheWrite = tokenCost(usage.cache_write_tokens, model.cost?.cacheWrite);
+  // Pi treats usage.input + usage.cacheRead as overflow-relevant input pressure.
+  // Cursor's turnEnded cache counters are billing/cache telemetry and can dwarf the
+  // live context window even when tokenDetails.usedTokens is well under the limit,
+  // so keep raw cache billing only in debug/cost metadata, not Pi token fields.
+  const piCacheReadTokens = 0;
+  const piCacheWriteTokens = 0;
+  debugLog("usage.pi_mapping", {
+    ...state.debug,
+    modelId: model.id,
+    rawPromptTokens: usage.prompt_tokens,
+    rawCompletionTokens: usage.completion_tokens,
+    rawCacheReadTokens: usage.cache_read_tokens,
+    rawCacheWriteTokens: usage.cache_write_tokens,
+    rawBillingTotalTokens: usage.total_tokens,
+    piInputTokens: usage.prompt_tokens,
+    piOutputTokens: usage.completion_tokens,
+    piCacheReadTokens,
+    piCacheWriteTokens,
+    piTotalTokens: usage.context_tokens,
+    piOverflowInputTokens: usage.prompt_tokens + piCacheReadTokens,
+  });
   output.usage = {
     input: usage.prompt_tokens,
     output: usage.completion_tokens,
-    cacheRead: usage.cache_read_tokens,
-    cacheWrite: usage.cache_write_tokens,
-    // Pi uses totalTokens for current context-window usage, while input/output/cacheRead remain
-    // per-response billing deltas. Cursor tokenDetails.usedTokens is cumulative context.
+    cacheRead: piCacheReadTokens,
+    cacheWrite: piCacheWriteTokens,
+    // Pi uses totalTokens for current context-window usage. Cursor
+    // tokenDetails.usedTokens is cumulative active context.
     totalTokens: usage.context_tokens,
     cost: {
       input: costInput,
@@ -1592,6 +1656,7 @@ export function createCursorNativeStream(
       config,
     );
     let writer: NativeStreamWriter | undefined;
+    const requestId = nextDebugRequestId();
 
     (async () => {
       if (options?.onPayload) {
@@ -1600,8 +1665,20 @@ export function createCursorNativeStream(
           body = replacement as ChatCompletionRequest;
       }
 
-      const initialContextTokens =
-        estimateInFlightContextTokens(context) + estimateInlineHistoryPromptTokens(body);
+      const inFlightContextTokens = estimateInFlightContextTokens(context);
+      const inlineHistoryPromptTokens = estimateInlineHistoryPromptTokens(body);
+      const initialContextTokens = inFlightContextTokens + inlineHistoryPromptTokens;
+      debugLog("native.context_estimate", {
+        requestId,
+        sessionId: options?.sessionId,
+        modelId: model.id,
+        contextWindow: model.contextWindow,
+        messageCount: context.messages?.length ?? 0,
+        hasSystemPrompt: Boolean(context.systemPrompt),
+        inFlightContextTokens,
+        inlineHistoryPromptTokens,
+        initialContextTokens,
+      });
       writer = createNativeStreamWriter(stream, model, initialContextTokens);
       writer.start();
 
@@ -1614,7 +1691,7 @@ export function createCursorNativeStream(
           model,
           options as CursorNativeStreamOptions | undefined,
           writer,
-          nextDebugRequestId(),
+          requestId,
           config.onContextWindowObserved,
         );
       });
@@ -1850,6 +1927,7 @@ async function handleCursorNativeRequest(
 function createStreamState(
   usageBaselineTokens = 0,
   cacheReadBaselineTokens = usageBaselineTokens,
+  debug: StreamDebugMetadata = {},
 ): StreamState {
   return {
     toolCallIndex: 0,
@@ -1860,6 +1938,7 @@ function createStreamState(
     usageBaselineTokens: Math.max(0, usageBaselineTokens),
     cacheReadBaselineTokens: Math.max(0, cacheReadBaselineTokens),
     cursorUsageCumulativeTokens: 0,
+    debug,
   };
 }
 
@@ -1988,7 +2067,13 @@ function writeNativeStream(
     usageBaselineTokens,
     cacheReadBaselineTokens,
   });
-  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens);
+  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens, {
+    requestId,
+    sessionId: options?.sessionId,
+    convKey,
+    bridgeKey,
+    modelId,
+  });
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
@@ -4115,7 +4200,7 @@ function processServerMessage(
       const usage = turnEndedUsage(update.message.value);
       if (usage) {
         state.turnEndedUsage = usage;
-        debugLog("usage.cursor_turn_ended", { usage });
+        debugLog("usage.cursor_turn_ended", { ...state.debug, usage });
       }
     } else if (
       updateCase &&
@@ -4152,8 +4237,9 @@ function processServerMessage(
     if (tokenDetails) {
       const usedTokens = Math.max(0, Math.floor(protoIntToNumber(tokenDetails.usedTokens) ?? 0));
       const maxTokens = Math.max(0, Math.floor(protoIntToNumber(tokenDetails.maxTokens) ?? 0));
-      state.cursorUsageCumulativeTokens = usedTokens;
+      if (usedTokens > 0) state.cursorUsageCumulativeTokens = usedTokens;
       debugLog("usage.cursor_token_details", {
+        ...state.debug,
         usedTokens,
         maxTokens,
         baselineTokens: state.usageBaselineTokens,
@@ -4626,7 +4712,6 @@ function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
   let cache_read_tokens = 0;
   let cache_write_tokens = 0;
   let total_tokens = completion_tokens;
-  let context_tokens = Math.max(0, fallbackTotalTokens) + completion_tokens;
 
   if (state.turnEndedUsage) {
     const reportedOutputTokens = state.turnEndedUsage.outputTokens;
@@ -4645,11 +4730,45 @@ function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
       state.turnEndedUsage.inputTokens + completion_tokens + cache_read_tokens + cache_write_tokens;
   }
 
-  if (state.cursorUsageCumulativeTokens > 0) {
-    context_tokens = state.cursorUsageCumulativeTokens;
-  }
+  // Pi uses usage.totalTokens for active context-window pressure. Cursor's
+  // conversationCheckpointUpdate.tokenDetails.usedTokens is the only upstream
+  // count for the live Cursor conversation context, so prefer it when present.
+  // If Cursor omits it, fall back to the larger of Pi-visible context and any
+  // stored Cursor cumulative baseline from a reused checkpoint, then add the best
+  // available completion count (Cursor-reported output when trustworthy,
+  // otherwise the visible-output estimate above). Never fold cache read/write
+  // billing telemetry into context pressure: cached billing can be far larger
+  // than the live prompt window.
+  const contextSource =
+    state.cursorUsageCumulativeTokens > 0 ? "cursor_token_details" : "fallback_estimate";
+  const contextBaselineTokens = Math.max(0, fallbackTotalTokens, state.usageBaselineTokens);
+  const context_tokens =
+    contextSource === "cursor_token_details"
+      ? state.cursorUsageCumulativeTokens
+      : contextBaselineTokens + completion_tokens;
 
   const prompt_tokens = state.turnEndedUsage ? state.turnEndedUsage.inputTokens : 0;
+  debugLog("usage.compute", {
+    ...state.debug,
+    contextSource,
+    fallbackTotalTokens,
+    usageBaselineTokens: state.usageBaselineTokens,
+    contextBaselineTokens,
+    cursorUsageCumulativeTokens: state.cursorUsageCumulativeTokens,
+    cacheReadBaselineTokens: state.cacheReadBaselineTokens,
+    cursorTokenDeltaTokens: state.cursorTokenDeltaTokens,
+    generatedOutputChars: state.generatedOutputChars,
+    generatedToolCallTokens: state.generatedToolCallTokens,
+    turnEndedUsage: state.turnEndedUsage,
+    promptTokens: prompt_tokens,
+    completionTokens: completion_tokens,
+    cacheReadTokens: cache_read_tokens,
+    cacheWriteTokens: cache_write_tokens,
+    billingTotalTokens: total_tokens,
+    contextTokens: context_tokens,
+    piFallbackContextTokens:
+      prompt_tokens + completion_tokens + cache_read_tokens + cache_write_tokens,
+  });
   return {
     prompt_tokens,
     completion_tokens,
@@ -4909,7 +5028,12 @@ function writeSSEStream(
     };
   };
 
-  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens);
+  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens, {
+    requestId,
+    convKey,
+    bridgeKey,
+    modelId,
+  });
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
@@ -5267,7 +5391,12 @@ async function handleNonStreamingResponse(
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   let cancelled = false;
-  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens);
+  const state = createStreamState(usageBaselineTokens, cacheReadBaselineTokens, {
+    requestId,
+    convKey,
+    bridgeKey,
+    modelId,
+  });
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
   let nonStreamError: Error | null = null;
