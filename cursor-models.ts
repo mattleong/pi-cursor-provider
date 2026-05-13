@@ -784,23 +784,55 @@ function normalizeDisplayModel(model: CursorModel): CursorModel {
   };
 }
 
+function positiveTokenLimit(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function requestedMaxModeForMetadata(model: CursorModel): boolean {
+  return Boolean(
+    model.requestedMaxMode ??
+    model.requiresMaxMode ??
+    /(^|-)max(?:-|$)|(^|-)max-mode(?:-|$)/i.test(model.id),
+  );
+}
+
+function metadataContextWindow(
+  metadata: CursorParameterizedModel | undefined,
+  model: CursorModel,
+): number | undefined {
+  if (!metadata) return undefined;
+
+  const metadataDefault = requestedMaxModeForMetadata(model)
+    ? (positiveTokenLimit(metadata.contextTokenLimitForMaxMode) ??
+      positiveTokenLimit(metadata.contextTokenLimit))
+    : positiveTokenLimit(metadata.contextTokenLimit);
+  const explicitContext = model.parameters
+    ? parameterValue(model.parameters, "context")
+    : undefined;
+  if (explicitContext)
+    return contextWindowFromParameter(explicitContext, metadataDefault ?? model.contextWindow);
+  return metadataDefault;
+}
+
 export function augmentCursorModels(
   raw: CursorModel[],
   parameterizedModels: CursorParameterizedModel[] = [],
 ): CursorModel[] {
   const byId = new Map<string, CursorModel>();
-  const imageSupportByModelId = new Map(
-    parameterizedModels
-      .filter((model) => typeof model.supportsImages === "boolean")
-      .map((model) => [model.name, model.supportsImages!]),
-  );
+  const metadataByModelId = new Map<string, CursorParameterizedModel>();
+  for (const model of parameterizedModels) {
+    metadataByModelId.set(model.name, model);
+    if (model.serverModelName) metadataByModelId.set(model.serverModelName, model);
+  }
   for (const model of raw.map(normalizeDisplayModel)) {
     const lookupId = model.requestedModelId ?? model.id;
-    const metadataSupportsImages = imageSupportByModelId.get(lookupId);
+    const metadata = metadataByModelId.get(lookupId);
+    const resolvedContextWindow = metadataContextWindow(metadata, model);
     byId.set(model.id, {
       ...model,
-      ...(model.supportsImages === undefined && metadataSupportsImages !== undefined
-        ? { supportsImages: metadataSupportsImages }
+      ...(resolvedContextWindow !== undefined ? { contextWindow: resolvedContextWindow } : {}),
+      ...(model.supportsImages === undefined && metadata?.supportsImages !== undefined
+        ? { supportsImages: metadata.supportsImages }
         : {}),
     });
   }

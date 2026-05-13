@@ -241,6 +241,18 @@ export interface StoredConversation {
   lastAccessMs: number;
 }
 
+export interface CursorContextWindowObservation {
+  /** Pi model row that produced this request. */
+  modelId: string;
+  /** Cursor requestedModel.modelId after routing. */
+  requestedModelId: string;
+  /** Cursor-reported active context window for this exact request. */
+  contextWindow: number;
+  /** Cursor-reported active used-token count at the same checkpoint, when present. */
+  usedTokens?: number;
+  requestId?: string;
+}
+
 interface CursorTurnUsage {
   inputTokens: number;
   outputTokens: number;
@@ -994,6 +1006,7 @@ export interface CursorNativeStreamConfig {
   getAccessToken(): Promise<string>;
   getNoReasoningEffortByModelId?(): Map<string, string>;
   getRawModelRoutingByModelId?(): Map<string, CursorModelRoutingByEffort>;
+  onContextWindowObserved?(observation: CursorContextWindowObservation): void;
 }
 
 type CursorNativeStreamOptions = SimpleStreamOptions & {
@@ -1593,6 +1606,7 @@ export function createCursorNativeStream(
           options as CursorNativeStreamOptions | undefined,
           writer,
           nextDebugRequestId(),
+          config.onContextWindowObserved,
         );
       });
     })().catch((error) => {
@@ -1610,6 +1624,7 @@ async function handleCursorNativeRequest(
   options: CursorNativeStreamOptions | undefined,
   writer: NativeStreamWriter,
   requestId: string,
+  onContextWindowObserved?: CursorNativeStreamConfig["onContextWindowObserved"],
 ): Promise<void> {
   let parsedMessages: ParsedMessages;
   try {
@@ -1700,6 +1715,7 @@ async function handleCursorNativeRequest(
           writer,
           options,
           requestId,
+          onContextWindowObserved,
         );
         return;
       }
@@ -1812,6 +1828,7 @@ async function handleCursorNativeRequest(
     requestId,
     usageBaselineTokens,
     cacheReadBaselineTokens,
+    onContextWindowObserved,
   );
 }
 
@@ -1945,6 +1962,7 @@ function writeNativeStream(
   requestId?: string,
   usageBaselineTokens = 0,
   cacheReadBaselineTokens = usageBaselineTokens,
+  onContextWindowObserved?: CursorNativeStreamConfig["onContextWindowObserved"],
 ): void {
   debugLog("native.stream.start", {
     requestId,
@@ -2069,6 +2087,16 @@ function writeNativeStream(
           (checkpointBytes) => {
             latestCheckpoint = checkpointBytes;
             debugLog("native.stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
+          },
+          (tokenDetails) => {
+            if (tokenDetails.maxTokens <= 0) return;
+            onContextWindowObserved?.({
+              modelId: model.id,
+              requestedModelId: modelId,
+              contextWindow: tokenDetails.maxTokens,
+              ...(tokenDetails.usedTokens > 0 ? { usedTokens: tokenDetails.usedTokens } : {}),
+              requestId,
+            });
           },
         );
       } catch (err) {
@@ -2202,6 +2230,7 @@ function handleNativeToolResultResume(
   writer: NativeStreamWriter,
   options?: CursorNativeStreamOptions,
   requestId?: string,
+  onContextWindowObserved?: CursorNativeStreamConfig["onContextWindowObserved"],
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
   if (options?.signal?.aborted) {
@@ -2273,6 +2302,7 @@ function handleNativeToolResultResume(
     requestId,
     usageBaselineTokens,
     cacheReadBaselineTokens,
+    onContextWindowObserved,
   );
 }
 
@@ -4044,6 +4074,7 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onTokenDetails?: (tokenDetails: { usedTokens: number; maxTokens: number }) => void,
 ): void {
   const msgCase = msg.message.case;
   debugLog("server_message", { msgCase, msg });
@@ -4104,13 +4135,16 @@ function processServerMessage(
     const stateStructure = msg.message.value as ConversationStateStructure;
     const tokenDetails = (stateStructure as any).tokenDetails;
     if (tokenDetails) {
-      state.cursorUsageCumulativeTokens = tokenDetails.usedTokens ?? 0;
+      const usedTokens = Math.max(0, Math.floor(protoIntToNumber(tokenDetails.usedTokens) ?? 0));
+      const maxTokens = Math.max(0, Math.floor(protoIntToNumber(tokenDetails.maxTokens) ?? 0));
+      state.cursorUsageCumulativeTokens = usedTokens;
       debugLog("usage.cursor_token_details", {
-        usedTokens: state.cursorUsageCumulativeTokens,
-        maxTokens: tokenDetails.maxTokens,
+        usedTokens,
+        maxTokens,
         baselineTokens: state.usageBaselineTokens,
         cursorTokenDeltaTokens: state.cursorTokenDeltaTokens,
       });
+      onTokenDetails?.({ usedTokens, maxTokens });
     }
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
@@ -4576,7 +4610,7 @@ function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
   let cache_read_tokens = 0;
   let cache_write_tokens = 0;
   let total_tokens = completion_tokens;
-  let context_tokens = Math.max(fallbackTotalTokens, completion_tokens);
+  let context_tokens = Math.max(0, fallbackTotalTokens) + completion_tokens;
 
   if (state.turnEndedUsage) {
     completion_tokens = state.turnEndedUsage.outputTokens;

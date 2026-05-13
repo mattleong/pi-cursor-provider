@@ -62,6 +62,7 @@ import {
   getCursorModels,
   getCursorParameterizedModels,
   touchActiveBridgeForSession,
+  type CursorContextWindowObservation,
   type CursorModel,
   type CursorParameterizedModel,
 } from "./proxy.js";
@@ -576,6 +577,19 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
+  function observeContextWindow(observation: CursorContextWindowObservation): void {
+    // Runtime tokenDetails are useful diagnostics, but should not mutate the registered
+    // model contextWindow globally: a transient/request-specific budget could otherwise
+    // make Pi auto-compact future turns far earlier than the advertised model context.
+    debugExtensionLog("model.context_window_observed", {
+      modelId: observation.modelId,
+      requestedModelId: observation.requestedModelId,
+      observedContextWindow: observation.contextWindow,
+      usedTokens: observation.usedTokens,
+      requestId: observation.requestId,
+    });
+  }
+
   function register(
     pi: ExtensionAPI,
     rawModels: CursorModel[],
@@ -587,6 +601,7 @@ export default async function (pi: ExtensionAPI) {
       : processModels(augmentedModels);
     noReasoningEffortByModelId = buildNoReasoningEffortLookup(processed);
     rawModelByEffortByModelId = buildRawModelLookup(processed);
+    const modelConfigs = processed.map(modelConfig);
 
     pi.registerProvider("cursor", {
       name: "Cursor",
@@ -596,8 +611,9 @@ export default async function (pi: ExtensionAPI) {
         getAccessToken,
         getNoReasoningEffortByModelId: () => noReasoningEffortByModelId,
         getRawModelRoutingByModelId: () => rawModelByEffortByModelId,
+        onContextWindowObserved: observeContextWindow,
       }),
-      models: processed.map(modelConfig),
+      models: modelConfigs,
       oauth: {
         name: "Cursor",
 

@@ -629,6 +629,67 @@ describe("processModels", () => {
     expect(augmented.find((model) => model.id === "plain-text-only")?.supportsImages).toBe(false);
   });
 
+  test("AvailableModels context limits update raw discovered rows", () => {
+    const augmented = augmentCursorModels([m("plain-model", "Plain Model")], [
+      {
+        name: "plain-model",
+        clientDisplayName: "Plain Model",
+        contextTokenLimit: 512_000,
+        variants: [],
+      },
+    ] as any);
+
+    expect(augmented.find((model) => model.id === "plain-model")?.contextWindow).toBe(512_000);
+  });
+
+  test("AvailableModels max-mode context limits update routed raw max rows", () => {
+    const augmented = augmentCursorModels(
+      [
+        {
+          ...m("plain-model-max", "Plain Model Max"),
+          requestedModelId: "plain-model",
+          requestedMaxMode: true,
+        },
+      ],
+      [
+        {
+          name: "plain-model",
+          clientDisplayName: "Plain Model",
+          contextTokenLimit: 200_000,
+          contextTokenLimitForMaxMode: 1_000_000,
+          variants: [],
+        },
+      ] as any,
+    );
+
+    expect(augmented.find((model) => model.id === "plain-model-max")?.contextWindow).toBe(
+      1_000_000,
+    );
+  });
+
+  test("explicit context parameters are not downgraded by max-mode metadata", () => {
+    const augmented = augmentCursorModels(
+      [
+        {
+          ...m("gpt-5.5-max", "GPT-5.5 272K Max"),
+          requestedModelId: "gpt-5.5",
+          requestedMaxMode: true,
+          parameters: [{ id: "context", value: "272k" }],
+        },
+      ],
+      [
+        {
+          name: "gpt-5.5",
+          contextTokenLimit: 272_000,
+          contextTokenLimitForMaxMode: 1_000_000,
+          variants: [],
+        },
+      ] as any,
+    );
+
+    expect(augmented.find((model) => model.id === "gpt-5.5-max")?.contextWindow).toBe(272_000);
+  });
+
   test("metadata-driven generation covers non-GPT-5.5 parameterized models", () => {
     const generated = modelsFromParameterizedMetadata([
       {
@@ -3040,15 +3101,20 @@ function makeTokenDeltaMessage(tokens: number) {
   });
 }
 
-function makeCheckpointMessage(usedTokens?: number) {
+function makeCheckpointMessage(usedTokens?: number, maxTokens?: number) {
+  const tokenDetails =
+    usedTokens === undefined && maxTokens === undefined
+      ? undefined
+      : create(ConversationTokenDetailsSchema, {
+          ...(usedTokens !== undefined ? { usedTokens } : {}),
+          ...(maxTokens !== undefined ? { maxTokens } : {}),
+        });
   return create(AgentServerMessageSchema, {
     message: {
       case: "conversationCheckpointUpdate",
       value: create(
         ConversationStateStructureSchema,
-        usedTokens === undefined
-          ? {}
-          : { tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }) },
+        tokenDetails === undefined ? {} : { tokenDetails },
       ),
     },
   });
@@ -3439,7 +3505,7 @@ describe("native streamSimple provider", () => {
           if (clientMessage.message.case === "runRequest") {
             setTimeout(() => {
               fake.emitServerMessage(makeTextDeltaMessage("review complete"));
-              fake.emitServerMessage(makeCheckpointMessage(78_119));
+              fake.emitServerMessage(makeCheckpointMessage(78_119, 272_000));
               fake.emitServerMessage(
                 makeTurnEndedMessage({
                   inputTokens: 1_006_293,
@@ -3453,10 +3519,14 @@ describe("native streamSimple provider", () => {
         }),
     );
 
-    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const observations: any[] = [];
+    const streamSimple = createCursorNativeStream({
+      getAccessToken: async () => "test-token",
+      onContextWindowObserved: (observation) => observations.push(observation),
+    });
     const events = await collectEvents(
       streamSimple(
-        { ...nativeModel("gpt-5.5"), contextWindow: 272_000 },
+        { ...nativeModel("gpt-5.5"), contextWindow: 64_000 },
         {
           systemPrompt: "system",
           messages: [{ role: "user", content: "review the branch", timestamp: Date.now() }],
@@ -3475,6 +3545,14 @@ describe("native streamSimple provider", () => {
       usage.totalTokens,
     );
     expect(usage.totalTokens).toBeLessThan(272_000 - 16_384);
+    expect(observations).toContainEqual(
+      expect.objectContaining({
+        modelId: "gpt-5.5",
+        requestedModelId: "gpt-5.5",
+        contextWindow: 272_000,
+        usedTokens: 78_119,
+      }),
+    );
   });
 
   test("reuses valid checkpoints while carrying inline Pi context as a safety net", async () => {
