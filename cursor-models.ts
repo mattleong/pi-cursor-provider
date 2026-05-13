@@ -796,6 +796,18 @@ function requestedMaxModeForMetadata(model: CursorModel): boolean {
   );
 }
 
+function inferredContextWindowFromModelHints(model: CursorModel): number {
+  const explicitContext = model.parameters
+    ? parameterValue(model.parameters, "context")
+    : undefined;
+  if (explicitContext) return contextWindowFromParameter(explicitContext, model.contextWindow);
+
+  const text = `${model.id} ${model.name}`.toLowerCase();
+  if (/\b1\s*m\b|(?:^|-)1m(?:-|$)/.test(text)) return 1_000_000;
+  if (/\b272\s*k\b|(?:^|-)272k(?:-|$)/.test(text)) return 272_000;
+  return model.contextWindow;
+}
+
 function metadataContextWindow(
   metadata: CursorParameterizedModel | undefined,
   model: CursorModel,
@@ -827,10 +839,11 @@ export function augmentCursorModels(
   for (const model of raw.map(normalizeDisplayModel)) {
     const lookupId = model.requestedModelId ?? model.id;
     const metadata = metadataByModelId.get(lookupId);
-    const resolvedContextWindow = metadataContextWindow(metadata, model);
+    const resolvedContextWindow =
+      metadataContextWindow(metadata, model) ?? inferredContextWindowFromModelHints(model);
     byId.set(model.id, {
       ...model,
-      ...(resolvedContextWindow !== undefined ? { contextWindow: resolvedContextWindow } : {}),
+      contextWindow: resolvedContextWindow,
       ...(model.supportsImages === undefined && metadata?.supportsImages !== undefined
         ? { supportsImages: metadata.supportsImages }
         : {}),

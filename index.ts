@@ -578,13 +578,16 @@ export default async function (pi: ExtensionAPI) {
   }
 
   function observeContextWindow(observation: CursorContextWindowObservation): void {
-    // Runtime tokenDetails are useful diagnostics, but should not mutate the registered
-    // model contextWindow globally: a transient/request-specific budget could otherwise
-    // make Pi auto-compact future turns far earlier than the advertised model context.
+    // Cursor checkpoint tokenDetails.maxTokens is useful diagnostic telemetry, but
+    // it can be a request-scoped prompt budget rather than the advertised model
+    // context window. Do not mutate the registered model contextWindow from this
+    // value: shrinking causes early Pi auto-compaction, while growing can delay
+    // compaction beyond the real model limit. Startup/live model metadata remains
+    // the authoritative context-window source.
     debugExtensionLog("model.context_window_observed", {
       modelId: observation.modelId,
       requestedModelId: observation.requestedModelId,
-      observedContextWindow: observation.contextWindow,
+      observedContextWindow: Math.floor(observation.contextWindow),
       usedTokens: observation.usedTokens,
       requestId: observation.requestId,
     });

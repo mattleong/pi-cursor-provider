@@ -246,7 +246,11 @@ export interface CursorContextWindowObservation {
   modelId: string;
   /** Cursor requestedModel.modelId after routing. */
   requestedModelId: string;
-  /** Cursor-reported active context window for this exact request. */
+  /**
+   * Cursor checkpoint tokenDetails.maxTokens for this exact request.
+   * This is runtime telemetry and may be a request-scoped prompt budget rather
+   * than the advertised model context window.
+   */
   contextWindow: number;
   /** Cursor-reported active used-token count at the same checkpoint, when present. */
   usedTokens?: number;
@@ -255,7 +259,8 @@ export interface CursorContextWindowObservation {
 
 interface CursorTurnUsage {
   inputTokens: number;
-  outputTokens: number;
+  /** Undefined when Cursor omits output usage; callers should keep the visible-output fallback. */
+  outputTokens?: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
 }
@@ -263,7 +268,7 @@ interface CursorTurnUsage {
 interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
-  /** Authoritative per-turn billing usage emitted by Cursor's turnEnded update. */
+  /** Per-turn billing/cache usage emitted by Cursor's turnEnded update. */
   turnEndedUsage?: CursorTurnUsage;
   /** Visible text/thinking chars emitted by Cursor for fallback output estimation. */
   generatedOutputChars: number;
@@ -273,7 +278,7 @@ interface StreamState {
   cursorTokenDeltaTokens: number;
   /** Baseline Cursor cumulative used_tokens value at the start of this response segment. */
   usageBaselineTokens: number;
-  /** Estimated cached-prefix tokens read for fallback usage accounting. */
+  /** Diagnostic cached-prefix/context baseline; never reported as cache telemetry. */
   cacheReadBaselineTokens: number;
   /** Latest Cursor-reported cumulative used_tokens value observed in this response segment. */
   cursorUsageCumulativeTokens: number;
@@ -353,7 +358,6 @@ const DEFAULT_INLINE_HISTORY_MAX_CHARS = 200_000;
 const DEFAULT_INLINE_HISTORY_HEAD_MAX_CHARS = 20_000;
 const DEFAULT_INLINE_HISTORY_SEGMENT_MAX_CHARS = 20_000;
 const CURSOR_GENERATED_CHARS_PER_OUTPUT_TOKEN = 2.7;
-const CURSOR_TOOL_ONLY_CACHE_READ_SCALE = 0.58;
 const INLINE_HISTORY_MAX_CHARS = readNonNegativeIntegerEnv(
   "PI_CURSOR_INLINE_HISTORY_MAX_CHARS",
   DEFAULT_INLINE_HISTORY_MAX_CHARS,
@@ -1039,10 +1043,10 @@ function emptyCursorUsage(totalTokens = 0): AssistantMessage["usage"] {
 }
 
 function usageContextTokens(usage: AssistantMessage["usage"]): number {
-  // totalTokens is the active context-window size. If it is unavailable,
+  // totalTokens is the active context-window size. If it is unavailable or zero,
   // fall back only to non-cache input/output; Cursor cache read/write values
   // are billing/cache telemetry and can exceed the live context by a lot.
-  return usage.totalTokens ?? usage.input + usage.output;
+  return usage.totalTokens > 0 ? usage.totalTokens : usage.input + usage.output;
 }
 
 function estimateTextTokens(text: string): number {
@@ -1116,10 +1120,13 @@ function turnEndedUsage(value: unknown): CursorTurnUsage | undefined {
   const cacheRead = Math.max(0, Math.floor(cacheReadTokens ?? 0));
   const cacheWrite = Math.max(0, Math.floor(cacheWriteTokens ?? 0));
   // Cursor's own headless event path reports input as input - cacheRead - cacheWrite.
-  const input = Math.max(0, Math.floor(rawInputTokens ?? 0) - cacheRead - cacheWrite);
+  const input =
+    rawInputTokens === undefined
+      ? 0
+      : Math.max(0, Math.floor(rawInputTokens) - cacheRead - cacheWrite);
   return {
     inputTokens: input,
-    outputTokens: Math.max(0, Math.floor(outputTokens ?? 0)),
+    ...(outputTokens !== undefined ? { outputTokens: Math.max(0, Math.floor(outputTokens)) } : {}),
     cacheReadTokens: cacheRead,
     cacheWriteTokens: cacheWrite,
   };
@@ -1584,10 +1591,7 @@ export function createCursorNativeStream(
       options as CursorNativeStreamOptions | undefined,
       config,
     );
-    const initialContextTokens =
-      estimateInFlightContextTokens(context) + estimateInlineHistoryPromptTokens(body);
-    const writer = createNativeStreamWriter(stream, model, initialContextTokens);
-    writer.start();
+    let writer: NativeStreamWriter | undefined;
 
     (async () => {
       if (options?.onPayload) {
@@ -1596,8 +1600,13 @@ export function createCursorNativeStream(
           body = replacement as ChatCompletionRequest;
       }
 
+      const initialContextTokens =
+        estimateInFlightContextTokens(context) + estimateInlineHistoryPromptTokens(body);
+      writer = createNativeStreamWriter(stream, model, initialContextTokens);
+      writer.start();
+
       await withSessionLock(deriveRequestLockKey(body), async () => {
-        if (writer.closed) return;
+        if (!writer || writer.closed) return;
         const accessToken = await config.getAccessToken();
         await handleCursorNativeRequest(
           body,
@@ -1610,7 +1619,13 @@ export function createCursorNativeStream(
         );
       });
     })().catch((error) => {
-      writer.error(error instanceof Error ? error.message : String(error), "error");
+      const message = error instanceof Error ? error.message : String(error);
+      if (writer) writer.error(message, "error");
+      else
+        createNativeStreamWriter(stream, model, estimateInFlightContextTokens(context)).error(
+          message,
+          "error",
+        );
     });
 
     return stream;
@@ -4605,39 +4620,36 @@ function makeHeartbeatBytes(): Uint8Array {
 }
 
 function computeUsage(state: StreamState, fallbackTotalTokens = 0) {
-  let completion_tokens =
+  const fallbackCompletionTokens =
     estimateGeneratedOutputCharTokens(state.generatedOutputChars) + state.generatedToolCallTokens;
+  let completion_tokens = fallbackCompletionTokens;
   let cache_read_tokens = 0;
   let cache_write_tokens = 0;
   let total_tokens = completion_tokens;
   let context_tokens = Math.max(0, fallbackTotalTokens) + completion_tokens;
 
   if (state.turnEndedUsage) {
-    completion_tokens = state.turnEndedUsage.outputTokens;
+    const reportedOutputTokens = state.turnEndedUsage.outputTokens;
+    // Cursor sometimes emits turnEnded cache/input usage without output usage (or with a
+    // spurious zero) even though visible text/thinking/tool-call deltas were streamed.
+    // Keep Cursor's positive output count when present, otherwise preserve our visible
+    // output fallback so Pi's footer/session totals do not lose output tokens.
+    completion_tokens =
+      reportedOutputTokens !== undefined &&
+      (reportedOutputTokens > 0 || fallbackCompletionTokens === 0)
+        ? reportedOutputTokens
+        : fallbackCompletionTokens;
     cache_read_tokens = state.turnEndedUsage.cacheReadTokens;
     cache_write_tokens = state.turnEndedUsage.cacheWriteTokens;
     total_tokens =
       state.turnEndedUsage.inputTokens + completion_tokens + cache_read_tokens + cache_write_tokens;
-  } else {
-    const cacheReadScale = state.generatedOutputChars > 0 ? 1 : CURSOR_TOOL_ONLY_CACHE_READ_SCALE;
-    cache_read_tokens =
-      completion_tokens > 0 ? Math.round(state.cacheReadBaselineTokens * cacheReadScale) : 0;
   }
 
   if (state.cursorUsageCumulativeTokens > 0) {
     context_tokens = state.cursorUsageCumulativeTokens;
-    if (!state.turnEndedUsage) {
-      const deltaTokens = state.cursorUsageCumulativeTokens - state.usageBaselineTokens;
-      total_tokens = Math.max(
-        completion_tokens,
-        deltaTokens >= 0 ? deltaTokens : state.cursorUsageCumulativeTokens,
-      );
-    }
   }
 
-  const prompt_tokens = state.turnEndedUsage
-    ? state.turnEndedUsage.inputTokens
-    : Math.max(0, total_tokens - completion_tokens);
+  const prompt_tokens = state.turnEndedUsage ? state.turnEndedUsage.inputTokens : 0;
   return {
     prompt_tokens,
     completion_tokens,
@@ -4872,14 +4884,28 @@ function writeSSEStream(
   });
 
   const makeUsageChunk = () => {
-    const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
+    const {
+      prompt_tokens,
+      completion_tokens,
+      total_tokens,
+      cache_read_tokens,
+      cache_write_tokens,
+      context_tokens,
+    } = computeUsage(state);
     return {
       id: completionId,
       object: "chat.completion.chunk",
       created,
       model: modelId,
       choices: [],
-      usage: { prompt_tokens, completion_tokens, total_tokens },
+      usage: {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        context_tokens,
+      },
     };
   };
 

@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
 import { spawnBridge } from "./bridge.ts";
-import {
+import cursorProviderExtension, {
   applyNoReasoningEffort,
   buildEffortMap,
   buildNoReasoningEffortLookup,
@@ -640,6 +640,20 @@ describe("processModels", () => {
     ] as any);
 
     expect(augmented.find((model) => model.id === "plain-model")?.contextWindow).toBe(512_000);
+  });
+
+  test("fallback 1M labels are inferred as 1M context when live metadata is unavailable", () => {
+    const augmented = augmentCursorModels([
+      m("claude-4-sonnet-1m", "Sonnet 4 1M"),
+      m("claude-4.6-sonnet-medium", "Sonnet 4.6 1M"),
+    ]);
+
+    expect(augmented.find((model) => model.id === "claude-4-sonnet-1m")?.contextWindow).toBe(
+      1_000_000,
+    );
+    expect(augmented.find((model) => model.id === "claude-4.6-sonnet-medium")?.contextWindow).toBe(
+      1_000_000,
+    );
   });
 
   test("AvailableModels max-mode context limits update routed raw max rows", () => {
@@ -3134,14 +3148,16 @@ function encodeVarint(value: number | bigint): Uint8Array {
 
 function makeTurnEndedMessage(usage: {
   inputTokens: number;
-  outputTokens: number;
+  outputTokens?: number;
   cacheReadTokens: number;
   cacheWriteTokens?: number;
 }) {
   const value = create(TurnEndedUpdateSchema, {}) as any;
   value.$unknown = [
     { no: 1, wireType: 0, data: encodeVarint(usage.inputTokens) },
-    { no: 2, wireType: 0, data: encodeVarint(usage.outputTokens) },
+    ...(usage.outputTokens !== undefined
+      ? [{ no: 2, wireType: 0, data: encodeVarint(usage.outputTokens) }]
+      : []),
     { no: 3, wireType: 0, data: encodeVarint(usage.cacheReadTokens) },
     { no: 4, wireType: 0, data: encodeVarint(usage.cacheWriteTokens ?? 0) },
   ];
@@ -3305,9 +3321,12 @@ describe("native streamSimple provider", () => {
       ),
     );
 
+    const usage = events.at(-1).message.usage;
     expect(events[0]).toMatchObject({ type: "start" });
-    expect(events.at(-1).message.usage.input).toBe(0);
-    expect(events.at(-1).message.usage.totalTokens).toBeGreaterThanOrEqual(40_000);
+    expect(usage.input).toBe(0);
+    expect(usage.cacheRead).toBe(0);
+    expect(usage.cacheWrite).toBe(0);
+    expect(usage.totalTokens).toBeGreaterThanOrEqual(40_000);
   });
 
   test("estimates in-flight context from input/output only when totalTokens is unavailable", async () => {
@@ -3359,6 +3378,203 @@ describe("native streamSimple provider", () => {
     expect(events[0]).toMatchObject({ type: "start" });
     expect(events[0].partial.usage.totalTokens).toBeGreaterThanOrEqual(1_050);
     expect(events[0].partial.usage.totalTokens).toBeLessThan(2_000);
+  });
+
+  test("estimates in-flight context from input/output when totalTokens is zero", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage());
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const priorUsage = {
+      input: 1_000,
+      output: 50,
+      cacheRead: 500_000,
+      cacheWrite: 25_000,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    } as any;
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          messages: [
+            { role: "user", content: "previous prompt", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "previous response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: priorUsage,
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "new prompt", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId: "native-inflight-zero-total-usage-session" },
+      ),
+    );
+
+    expect(events[0]).toMatchObject({ type: "start" });
+    expect(events[0].partial.usage.totalTokens).toBeGreaterThanOrEqual(1_050);
+    expect(events[0].partial.usage.totalTokens).toBeLessThan(2_000);
+  });
+
+  test("does not turn Cursor tokenDetails context deltas into billable fallback input", async () => {
+    const sessionId = "native-token-details-without-turn-ended-session";
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage(1_250));
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-token-details-without-turn-ended",
+      checkpoint: toBinary(
+        ConversationStateStructureSchema,
+        decodeRunRequest(
+          buildCursorRequest(
+            "gpt-5",
+            "system",
+            "old",
+            [],
+            "conv-token-details-without-turn-ended",
+            null,
+          ),
+        ).conversationState,
+      ),
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: __testInternals.fingerprintCompletedTurns([
+        turn("old", [assistantStep("old response")]),
+      ]),
+      checkpointSystemPromptFingerprint: __testInternals.fingerprintSystemPrompt("system"),
+      cursorUsageCumulativeTokens: 1_000,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        {
+          systemPrompt: "system",
+          messages: [
+            { role: "user", content: "old", timestamp: Date.now() },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "old response" }],
+              api: "cursor-native",
+              provider: "cursor",
+              model: "gpt-5",
+              usage: emptyUsage(),
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+            { role: "user", content: "new prompt", timestamp: Date.now() },
+          ],
+        } as any,
+        { sessionId },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.input).toBe(0);
+    expect(usage.cacheRead).toBe(0);
+    expect(usage.cacheWrite).toBe(0);
+    expect(usage.output).toBeGreaterThan(0);
+    expect(usage.totalTokens).toBe(1_250);
+  });
+
+  test("preserves visible output fallback when Cursor turnEnded output is zero", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("visible output still counts"));
+              fake.emitServerMessage(makeCheckpointMessage(125, 200_000));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 100,
+                  outputTokens: 0,
+                  cacheReadTokens: 0,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] } as any,
+        { sessionId: "native-zero-output-turn-ended-session" },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.input).toBe(100);
+    expect(usage.output).toBeGreaterThan(0);
+    expect(usage.totalTokens).toBe(125);
+  });
+
+  test("preserves visible output fallback when Cursor turnEnded omits output", async () => {
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("omitted output still counts"));
+              fake.emitServerMessage(makeCheckpointMessage(140, 200_000));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 120,
+                  cacheReadTokens: 0,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const streamSimple = createCursorNativeStream({ getAccessToken: async () => "test-token" });
+    const events = await collectEvents(
+      streamSimple(
+        nativeModel(),
+        { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] } as any,
+        { sessionId: "native-omitted-output-turn-ended-session" },
+      ),
+    );
+
+    const usage = events.at(-1).message.usage;
+    expect(usage.input).toBe(120);
+    expect(usage.output).toBeGreaterThan(0);
+    expect(usage.totalTokens).toBe(140);
   });
 
   test("reports Cursor cumulative tokenDetails as per-segment deltas", async () => {
@@ -3552,6 +3768,130 @@ describe("native streamSimple provider", () => {
         contextWindow: 272_000,
         usedTokens: 78_119,
       }),
+    );
+  });
+
+  test("larger observed Cursor maxTokens does not re-register the active Pi model context window", async () => {
+    const previousOffline = process.env.PI_OFFLINE;
+    process.env.PI_OFFLINE = "1";
+    const providers: Array<{ name: string; config: any }> = [];
+    const pi = {
+      on: () => {},
+      registerProvider: (name: string, config: any) => providers.push({ name, config }),
+    } as any;
+
+    try {
+      await cursorProviderExtension(pi);
+    } finally {
+      if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+      else process.env.PI_OFFLINE = previousOffline;
+    }
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage(100, 512_000));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 90,
+                  outputTokens: 10,
+                  cacheReadTokens: 0,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const initialProvider = providers.at(-1)?.config;
+    initialProvider.oauth.getApiKey({
+      access: "test-token",
+      refresh: "refresh",
+      expires: Date.now() + 60_000,
+    });
+    expect(
+      initialProvider?.models.find((model: any) => model.id === "gpt-5-mini")?.contextWindow,
+    ).toBe(200_000);
+
+    await collectEvents(
+      initialProvider.streamSimple(
+        nativeModel("gpt-5-mini"),
+        { messages: [{ role: "user", content: "observe context", timestamp: Date.now() }] } as any,
+        { sessionId: "native-observed-context-window-session" },
+      ),
+    );
+
+    const latestProvider = providers.at(-1)?.config;
+    expect(providers).toHaveLength(1);
+    expect(
+      latestProvider?.models.find((model: any) => model.id === "gpt-5-mini")?.contextWindow,
+    ).toBe(200_000);
+  });
+
+  test("smaller observed Cursor maxTokens does not shrink the active Pi model context window", async () => {
+    const previousOffline = process.env.PI_OFFLINE;
+    process.env.PI_OFFLINE = "1";
+    const providers: Array<{ name: string; config: any }> = [];
+    const pi = {
+      on: () => {},
+      registerProvider: (name: string, config: any) => providers.push({ name, config }),
+    } as any;
+
+    try {
+      await cursorProviderExtension(pi);
+    } finally {
+      if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+      else process.env.PI_OFFLINE = previousOffline;
+    }
+
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            setTimeout(() => {
+              fake.emitServerMessage(makeTextDeltaMessage("ok"));
+              fake.emitServerMessage(makeCheckpointMessage(75_488, 91_000));
+              fake.emitServerMessage(
+                makeTurnEndedMessage({
+                  inputTokens: 90,
+                  outputTokens: 10,
+                  cacheReadTokens: 0,
+                }),
+              );
+              fake.close(0);
+            }, 0);
+          }
+        }),
+    );
+
+    const initialProvider = providers.at(-1)?.config;
+    initialProvider.oauth.getApiKey({
+      access: "test-token",
+      refresh: "refresh",
+      expires: Date.now() + 60_000,
+    });
+    expect(
+      initialProvider?.models.find((model: any) => model.id === "gpt-5.5")?.contextWindow,
+    ).toBe(272_000);
+
+    await collectEvents(
+      initialProvider.streamSimple(
+        nativeModel("gpt-5.5"),
+        {
+          messages: [{ role: "user", content: "observe smaller budget", timestamp: Date.now() }],
+        } as any,
+        { sessionId: "native-observed-smaller-context-window-session" },
+      ),
+    );
+
+    const latestProvider = providers.at(-1)?.config;
+    expect(providers).toHaveLength(1);
+    expect(latestProvider?.models.find((model: any) => model.id === "gpt-5.5")?.contextWindow).toBe(
+      272_000,
     );
   });
 
@@ -4752,6 +5092,73 @@ describe("proxy integration — session handling", () => {
 
     const stored = __testInternals.conversationStates.get(convKey);
     expect(stored?.checkpoint).toBeTruthy();
+  });
+
+  test("streaming SSE usage includes authoritative cache read/write tokens", async () => {
+    const sessionId = "session-sse-usage-cache";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const writes: string[] = [];
+    const req = new EventEmitter() as any;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = (chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    };
+    res.end = () => {
+      res.headersSent = true;
+      return res;
+    };
+
+    const bridge = new FakeBridge({
+      accessToken: "test-token",
+      rpcPath: "/agent.v1.AgentService/Run",
+    });
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "gpt-5",
+      bridgeKey,
+      convKey,
+      completedTurns: [],
+      currentTurn: turn("report usage"),
+      req,
+      res,
+    });
+
+    bridge.emitServerMessage(makeTextDeltaMessage("ok"));
+    bridge.emitServerMessage(makeCheckpointMessage(600, 200_000));
+    bridge.emitServerMessage(
+      makeTurnEndedMessage({
+        inputTokens: 500,
+        outputTokens: 10,
+        cacheReadTokens: 300,
+        cacheWriteTokens: 50,
+      }),
+    );
+    bridge.close(0);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const dataObjects = writes
+      .join("")
+      .split("\n\n")
+      .filter((block) => block.startsWith("data: ") && block !== "data: [DONE]")
+      .map((block) => JSON.parse(block.slice("data: ".length)));
+    const usageChunk = dataObjects.find((chunk) => chunk.usage);
+
+    expect(usageChunk?.usage).toMatchObject({
+      prompt_tokens: 150,
+      completion_tokens: 10,
+      cache_read_tokens: 300,
+      cache_write_tokens: 50,
+      total_tokens: 510,
+      context_tokens: 600,
+    });
   });
 
   test("tool-call pause closes the SSE without cancelling the live bridge", async () => {
